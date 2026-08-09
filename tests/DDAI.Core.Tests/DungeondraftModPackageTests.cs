@@ -25,7 +25,7 @@ public sealed class DungeondraftModPackageTests
         Assert.Contains("user://ddai", script, StringComparison.Ordinal);
         Assert.Contains("unsupported_command", script, StringComparison.Ordinal);
         Assert.Contains("malformed_request", script, StringComparison.Ordinal);
-        Assert.Contains("_write_failed_record(claim, validation_error)", script, StringComparison.Ordinal);
+        Assert.Contains("return _fail_claim_without_loss(claim, validation_error)", script, StringComparison.Ordinal);
         Assert.DoesNotContain("_can_correlate_failure", script, StringComparison.Ordinal);
         Assert.Contains("request.payload == null", script, StringComparison.Ordinal);
         Assert.Contains("_is_wire_timestamp", script, StringComparison.Ordinal);
@@ -76,6 +76,33 @@ public sealed class DungeondraftModPackageTests
         Assert.Contains("zone_hour_value > 14", validator, StringComparison.Ordinal);
         Assert.Contains("zone_hour_value == 14 and zone_minute_value != 0", validator, StringComparison.Ordinal);
         Assert.Contains("fraction.length() > 16", validator, StringComparison.Ordinal);
+        Assert.Contains("zone_kind = \"local\"", validator, StringComparison.Ordinal);
+        Assert.Contains("is_minimum_value and zone_kind != \"local\" and zone_hour_value == 0 and zone_minute_value == 0", validator, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Gdscript_FailsClosedWhenReconciliationOrFailurePublicationCannotCommit()
+    {
+        var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
+        var advance = FunctionBody(script, "_advance_claim_state");
+        var reconcile = FunctionBody(script, "_reconcile_request_duplicate");
+        var failClaim = FunctionBody(script, "_fail_claim_without_loss");
+        var writeFailed = FunctionBody(script, "_write_failed_record");
+        var moveFailed = FunctionBody(script, "_move_to_unique_failed");
+        var remove = FunctionBody(script, "_remove_file");
+
+        Assert.Contains("var reconciliation_result = _reconcile_request_duplicate", advance, StringComparison.Ordinal);
+        Assert.Contains("if reconciliation_result != \"reconciled\"", advance, StringComparison.Ordinal);
+        Assert.True(
+            advance.IndexOf("if reconciliation_result != \"reconciled\"", StringComparison.Ordinal) <
+            advance.IndexOf("_write_json_atomically(journal_path", StringComparison.Ordinal));
+        Assert.Contains("return _fail_claim_without_loss", advance, StringComparison.Ordinal);
+        Assert.Contains("return \"blocked\"", reconcile, StringComparison.Ordinal);
+        Assert.Contains("if failed_result != \"created\"", failClaim, StringComparison.Ordinal);
+        Assert.Contains("var remove_result = _remove_file(claim.path)", failClaim, StringComparison.Ordinal);
+        Assert.Contains("return _write_json_atomically", writeFailed, StringComparison.Ordinal);
+        Assert.Contains("return \"move_failed\"", moveFailed, StringComparison.Ordinal);
+        Assert.Contains("return \"remove_failed\"", remove, StringComparison.Ordinal);
     }
 
     private static string FunctionBody(string script, string functionName)

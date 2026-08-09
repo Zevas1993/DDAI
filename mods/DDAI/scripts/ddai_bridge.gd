@@ -70,23 +70,19 @@ func _advance_claim_state(claim):
 
 	var read_result = _read_bounded_text(claim.path)
 	if not read_result.ok:
-		_write_failed_record(claim, read_result.error)
-		_remove_file(claim.path)
-		return "invalid_claim_failed"
+		return _fail_claim_without_loss(claim, read_result.error)
 	var parsed = JSON.parse(read_result.text)
 	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
-		_write_failed_record(claim, _error("malformed_request", "Request JSON must contain an object envelope.", ""))
-		_remove_file(claim.path)
-		return "invalid_claim_failed"
+		return _fail_claim_without_loss(claim, _error("malformed_request", "Request JSON must contain an object envelope.", ""))
 	var request = parsed.result
 	var validation_error = _validate_request(request, claim.file_name)
 	if not validation_error.empty():
-		_write_failed_record(claim, validation_error)
-		_remove_file(claim.path)
-		return "invalid_claim_failed"
+		return _fail_claim_without_loss(claim, validation_error)
 
 	var canonical_request_text = _canonical_request_text(request)
-	_reconcile_request_duplicate(claim.file_name, canonical_request_text)
+	var reconciliation_result = _reconcile_request_duplicate(claim.file_name, canonical_request_text)
+	if reconciliation_result != "reconciled":
+		return "blocked"
 	var request_fingerprint = canonical_request_text.sha256_text()
 	if not directory.file_exists(journal_path):
 		var response = _prepare_response(request)
@@ -100,12 +96,16 @@ func _advance_claim_state(claim):
 		if journal_result == "created":
 			return "journal_created"
 		if journal_result != "existing":
-			_write_failed_record(claim, _error("journal_write_failed", "Prepared response journal could not be published; claim retained.", "request_id"))
+			var journal_failure_result = _write_failed_record(claim, _error("journal_write_failed", "Prepared response journal could not be published; claim retained.", "request_id"))
+			if journal_failure_result != "created":
+				return "blocked"
 			return "blocked"
 
 	var journal_result = _read_validated_journal(journal_path, request, request_fingerprint)
 	if not journal_result.ok:
-		_move_to_unique_failed(journal_path, key, "invalid-journal")
+		var invalid_journal_result = _move_to_unique_failed(journal_path, key, "invalid-journal")
+		if invalid_journal_result != "moved" and invalid_journal_result != "missing":
+			return "blocked"
 		return "invalid_journal_failed"
 	var journal = journal_result.journal
 	if not directory.file_exists(response_path):
@@ -113,11 +113,13 @@ func _advance_claim_state(claim):
 			return "response_published"
 		return "blocked"
 	if not _response_text_matches(response_path, journal.response_text):
-		_write_failed_record(claim, _error("response_conflict", "Existing response differs from the exact journaled response; claim retained.", "request_id"))
+		var response_conflict_result = _write_failed_record(claim, _error("response_conflict", "Existing response differs from the exact journaled response; claim retained.", "request_id"))
+		if response_conflict_result != "created":
+			return "blocked"
 		return "blocked"
 
-	_remove_file(claim.path)
-	return "claim_deleted"
+	var claim_remove_result = _remove_file(claim.path)
+	return "claim_deleted" if claim_remove_result == "removed" or claim_remove_result == "missing" else "blocked"
 
 
 func _recover_processing_claims():
@@ -197,25 +199,30 @@ func _is_wire_timestamp(value):
 	if zone_index < 19:
 		zone_index = value.rfind("-")
 	var main = value
+	var zone_kind = "local"
+	var zone_hour_value = 0
+	var zone_minute_value = 0
 	if value.ends_with("Z"):
+		zone_kind = "utc"
 		main = value.substr(0, value.length() - 1)
 	elif zone_index >= 19 and value.length() - zone_index == 6 and value[zone_index + 3] == ":":
 		var zone_hour = value.substr(zone_index + 1, 2)
 		var zone_minute = value.substr(zone_index + 4, 2)
 		if not zone_hour.is_valid_integer() or not zone_minute.is_valid_integer():
 			return false
-		var zone_hour_value = int(zone_hour)
-		var zone_minute_value = int(zone_minute)
+		zone_kind = "explicit"
+		zone_hour_value = int(zone_hour)
+		zone_minute_value = int(zone_minute)
 		if zone_hour_value > 14 or zone_minute_value > 59 or (zone_hour_value == 14 and zone_minute_value != 0):
 			return false
 		main = value.substr(0, zone_index)
-	else:
-		return false
 	var decimal_index = main.find(".")
+	var fraction_nonzero = false
 	if decimal_index != -1:
 		var fraction = main.substr(decimal_index + 1, main.length() - decimal_index - 1)
 		if fraction == "" or fraction.length() > 16 or not fraction.is_valid_integer():
 			return false
+		fraction_nonzero = int(fraction) != 0
 		main = main.substr(0, decimal_index)
 	if main.length() != 19 or main[4] != "-" or main[7] != "-" or main[10] != "T" or main[13] != ":" or main[16] != ":":
 		return false
@@ -228,6 +235,9 @@ func _is_wire_timestamp(value):
 	var hour = int(main.substr(11, 2))
 	var minute = int(main.substr(14, 2))
 	var second = int(main.substr(17, 2))
+	var is_minimum_value = year == 1 and month == 1 and day == 1 and hour == 0 and minute == 0 and second == 0 and not fraction_nonzero
+	if is_minimum_value and zone_kind != "local" and zone_hour_value == 0 and zone_minute_value == 0:
+		return false
 	return year >= 1 and month >= 1 and month <= 12 and day >= 1 and day <= _days_in_month(year, month) and hour <= 23 and minute <= 59 and second <= 59
 
 
@@ -255,16 +265,29 @@ func _reconcile_request_duplicate(file_name, canonical_processing_text):
 	var request_path = MAILBOX_ROOT + "/requests/" + file_name
 	var directory = Directory.new()
 	if not directory.file_exists(request_path):
-		return
+		return "reconciled"
 	var duplicate_read = _read_bounded_text(request_path)
 	if duplicate_read.ok:
 		var duplicate_parsed = JSON.parse(duplicate_read.text)
 		if duplicate_parsed.error == OK and typeof(duplicate_parsed.result) == TYPE_DICTIONARY:
 			var duplicate = duplicate_parsed.result
 			if _validate_request(duplicate, file_name).empty() and _canonical_request_text(duplicate) == canonical_processing_text:
-				_remove_file(request_path)
-				return
-	_move_to_unique_failed(request_path, file_name.get_basename(), "duplicate-conflict")
+				var remove_result = _remove_file(request_path)
+				if remove_result == "removed" or remove_result == "missing":
+					return "reconciled"
+				return "blocked"
+	var move_result = _move_to_unique_failed(request_path, file_name.get_basename(), "duplicate-conflict")
+	if move_result == "moved" or move_result == "missing":
+		return "reconciled"
+	return "blocked"
+
+
+func _fail_claim_without_loss(claim, error):
+	var failed_result = _write_failed_record(claim, error)
+	if failed_result != "created":
+		return "blocked"
+	var remove_result = _remove_file(claim.path)
+	return "invalid_claim_failed" if remove_result == "removed" or remove_result == "missing" else "blocked"
 
 
 func _prepare_response(request):
@@ -368,8 +391,8 @@ func _cleanup_stale_journal(file_name):
 		return "blocked"
 	if not _response_text_matches(response_path, journal.response_text):
 		return "blocked"
-	_remove_file(journal_path)
-	return "journal_deleted"
+	var journal_remove_result = _remove_file(journal_path)
+	return "journal_deleted" if journal_remove_result == "removed" or journal_remove_result == "missing" else "blocked"
 
 
 func _status_payload():
@@ -441,7 +464,9 @@ func _write_runtime_receipt():
 func _write_heartbeat():
 	var heartbeat_path = MAILBOX_ROOT + "/runtime-heartbeats/heartbeat-slot-" + str(_heartbeat_slot) + ".json"
 	_heartbeat_slot = (_heartbeat_slot + 1) % 8
-	_remove_file(heartbeat_path)
+	var heartbeat_remove_result = _remove_file(heartbeat_path)
+	if heartbeat_remove_result != "removed" and heartbeat_remove_result != "missing":
+		return
 	_write_json_atomically(heartbeat_path, {
 		"schema_version": MAILBOX_SCHEMA_VERSION,
 		"session_id": _session_id,
@@ -459,7 +484,7 @@ func _write_failed_record(claim, error):
 		"source_file": claim.file_name,
 		"error": error,
 	}
-	_write_json_atomically(_unique_failed_path(safe_name, error.code), record)
+	return _write_json_atomically(_unique_failed_path(safe_name, error.code), record)
 
 
 func _write_json_atomically(destination_path, payload):
@@ -487,9 +512,11 @@ func _write_text_atomically(destination_path, text):
 func _move_to_unique_failed(source_path, safe_name, reason):
 	var directory = Directory.new()
 	if not directory.file_exists(source_path):
-		return false
+		return "missing"
 	var destination = _unique_failed_path(safe_name, reason)
-	return directory.rename(source_path, destination) == OK
+	if directory.rename(source_path, destination) == OK:
+		return "moved"
+	return "move_failed"
 
 
 func _unique_failed_path(safe_name, reason):
@@ -505,8 +532,11 @@ func _unique_failed_path(safe_name, reason):
 
 func _remove_file(path):
 	var directory = Directory.new()
-	if directory.file_exists(path):
-		directory.remove(path)
+	if not directory.file_exists(path):
+		return "missing"
+	if directory.remove(path) == OK:
+		return "removed"
+	return "remove_failed"
 
 
 func _error(code, message, path):

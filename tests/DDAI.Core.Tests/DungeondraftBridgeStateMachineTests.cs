@@ -201,6 +201,49 @@ public sealed class DungeondraftBridgeStateMachineTests
         Assert.Empty(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "journal"), "*.json"));
     }
 
+    [Fact]
+    public void IdenticalDuplicateDeleteFailure_RetainsBothFilesAndDoesNotJournal()
+    {
+        using var sandbox = new BridgeSandbox("duplicate-delete-fault", writeRequestDuplicate: true);
+        var bridge = sandbox.CreateBridge(_ => SuccessResponse(sandbox.Request, FirstResponseTimestamp, "ready"));
+        using var lockFile = new FileStream(sandbox.RequestPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+
+        Assert.ThrowsAny<IOException>(() => bridge.AdvanceClaim(sandbox.FileName));
+
+        Assert.True(File.Exists(sandbox.RequestPath));
+        Assert.True(File.Exists(sandbox.ProcessingPath));
+        Assert.False(File.Exists(sandbox.JournalPath));
+    }
+
+    [Fact]
+    public void ConflictingDuplicateMoveFailure_RetainsBothFilesAndDoesNotJournal()
+    {
+        using var sandbox = new BridgeSandbox("duplicate-move-fault", writeRequestDuplicate: true, duplicateJson: RequestJson("duplicate-move-fault", "other"));
+        var bridge = sandbox.CreateBridge(_ => SuccessResponse(sandbox.Request, FirstResponseTimestamp, "ready"));
+        using var lockFile = new FileStream(sandbox.RequestPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+
+        Assert.ThrowsAny<IOException>(() => bridge.AdvanceClaim(sandbox.FileName));
+
+        Assert.True(File.Exists(sandbox.RequestPath));
+        Assert.True(File.Exists(sandbox.ProcessingPath));
+        Assert.False(File.Exists(sandbox.JournalPath));
+    }
+
+    [Fact]
+    public void InvalidClaimFailurePublicationFault_RetainsOnlySourceClaim()
+    {
+        using var sandbox = new RawBridgeSandbox("invalid-claim-fault", "{ malformed");
+        var bridge = new DungeondraftBridgeStateMachine(sandbox.Root, _ => throw new InvalidOperationException());
+        var failedDirectory = Path.Combine(sandbox.Root, "failed");
+        Directory.Delete(failedDirectory);
+        File.WriteAllText(failedDirectory, "blocks failed-record directory recreation");
+
+        Assert.ThrowsAny<IOException>(() => bridge.AdvanceClaim(sandbox.FileName));
+
+        Assert.True(File.Exists(sandbox.ProcessingPath));
+        Assert.False(File.Exists(Path.Combine(sandbox.Root, "journal", sandbox.FileName)));
+    }
+
     private static string RequestJson(string requestId, string command, string timestamp = "2026-08-09T12:00:00Z") =>
         $"{{\"schema_version\":\"1.0\",\"request_id\":\"{requestId}\",\"command\":\"{command}\",\"timestamp\":\"{timestamp}\",\"payload\":{{}}}}";
 
