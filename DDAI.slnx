@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/DDAI.Core/DDAI.Core.csproj" />
+  <Project Path="tests/DDAI.Core.Tests/DDAI.Core.Tests.csproj" />
+</Solution>
