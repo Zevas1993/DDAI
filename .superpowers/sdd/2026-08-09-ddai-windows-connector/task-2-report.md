@@ -8,7 +8,9 @@ The protocol has versioned request and response envelopes, correlation by reques
 
 ## Commit
 
-`feat: add atomic local mailbox harness` (the commit containing this report)
+Initial implementation: `ef18b5c feat: add atomic local mailbox harness`.
+
+Review fixes: `fix: harden atomic mailbox response boundaries` (the commit containing this report update).
 
 ## Red-green evidence
 
@@ -37,3 +39,19 @@ Coverage also exercises temporary partial-write invisibility, ordinary duplicate
 
 - This task validates the protocol against the fake mod only; no Dungeondraft binary, asset, or runtime interaction was introduced or exercised.
 - The timeout wait uses short polling because the mailbox must remain portable for the target mod environment; a later runtime integration can replace or supplement this with a platform-aware change signal if required.
+
+## Review fix round 1
+
+Added response-boundary enforcement and adversarial regressions for every review finding:
+
+- Response publication is byte-capped before its atomic write, and response reads use a bounded stream read before deserialization.
+- Recovery removes a stranded processing claim when a valid, correlated response is already durable, avoiding a repeated publish collision after a late crash.
+- Response publication verifies the claim's canonical `processing/<request-key>.json` path and presence before it can write or delete anything.
+- Response envelopes are validated on publication and read: schema, request ID, command, timestamp, payload, success/error invariant, and awaited-ID correlation.
+
+Observed red evidence before these fixes: the focused suite reported seven failures across oversize response publication, oversize inbound response, late-crash recovery, forged claim deletion, invalid success/error state, and invalid response correlation/error state. The corrected focused suite passed 8/8; after additional response-schema coverage, the final Release suite passed 32/32.
+
+Final verification for this round:
+
+- `dotnet test DDAI.slnx -c Release --no-restore` — 32 passed, 0 failed, 0 skipped.
+- `dotnet build DDAI.slnx -c Release --no-restore` — succeeded with 0 warnings and 0 errors.

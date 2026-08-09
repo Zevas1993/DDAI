@@ -39,10 +39,7 @@ public sealed class AtomicMailbox
     {
         ArgumentNullException.ThrowIfNull(request);
         ValidateRequest(request);
-        if (JsonSerializer.SerializeToUtf8Bytes(request, JsonOptions).LongLength > MaximumMessageBytes)
-        {
-            throw new ArgumentOutOfRangeException(nameof(request), "Serialized requests must not exceed 1 MiB.");
-        }
+        EnsureMaximumMessageSize(request, nameof(request));
 
         var key = MessageKey(request.RequestId);
         if (ExistsInAnyState(key))
@@ -85,7 +82,7 @@ public sealed class AtomicMailbox
 
             try
             {
-                var json = File.ReadAllText(processingPath, Encoding.UTF8);
+                var json = ReadBoundedText(processingPath);
                 var request = JsonSerializer.Deserialize<MailboxRequest>(json, JsonOptions)
                     ?? throw new JsonException("Request JSON cannot be null.");
                 ValidateRequest(request);
@@ -113,16 +110,44 @@ public sealed class AtomicMailbox
     {
         ArgumentNullException.ThrowIfNull(claim);
         ArgumentNullException.ThrowIfNull(response);
+        ValidateRequest(claim.Request);
+        var key = MessageKey(claim.Request.RequestId);
+        var expectedProcessingPath = MessagePath(_processingDirectory, key);
+        if (!Path.GetFullPath(claim.ProcessingPath).Equals(expectedProcessingPath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException("Claim must refer to its canonical mailbox processing path.", nameof(claim));
+        }
+
+        if (!File.Exists(expectedProcessingPath))
+        {
+            throw new InvalidOperationException("Claim is no longer present in the mailbox processing directory.");
+        }
+
+        ValidateResponse(response);
         if (!StringComparer.Ordinal.Equals(claim.Request.RequestId, response.RequestId) ||
             !StringComparer.Ordinal.Equals(claim.Request.Command, response.Command))
         {
             throw new ArgumentException("Response must correlate to the claimed request.", nameof(response));
         }
 
-        var key = MessageKey(response.RequestId);
-        WriteAtomically(_responsesDirectory, key, response);
-        WriteAtomically(_journalDirectory, key + ".response", new JournalEntry(response.RequestId, "responded", response.Timestamp));
-        File.Delete(claim.ProcessingPath);
+        EnsureMaximumMessageSize(response, nameof(response));
+        var responsePath = MessagePath(_responsesDirectory, key);
+        if (File.Exists(responsePath))
+        {
+            var existing = ReadValidatedResponse(responsePath, claim.Request.RequestId);
+            if (!StringComparer.Ordinal.Equals(existing.Command, response.Command) ||
+                !StringComparer.Ordinal.Equals(JsonSerializer.Serialize(existing, JsonOptions), JsonSerializer.Serialize(response, JsonOptions)))
+            {
+                throw new IOException("A different response has already been published for this request.");
+            }
+        }
+        else
+        {
+            WriteAtomically(_responsesDirectory, key, response);
+        }
+
+        WriteJournalIfAbsent(key + ".response", new JournalEntry(response.RequestId, "responded", response.Timestamp));
+        File.Delete(expectedProcessingPath);
     }
 
     public MailboxResponse? WaitForResponse(string requestId, TimeSpan timeout)
@@ -139,9 +164,7 @@ public sealed class AtomicMailbox
         {
             if (File.Exists(path))
             {
-                var json = File.ReadAllText(path, Encoding.UTF8);
-                return JsonSerializer.Deserialize<MailboxResponse>(json, JsonOptions)
-                    ?? throw new JsonException("Response JSON cannot be null.");
+                return ReadValidatedResponse(path, requestId);
             }
 
             Thread.Sleep(10);
@@ -155,6 +178,12 @@ public sealed class AtomicMailbox
         var recovered = 0;
         foreach (var processingPath in Directory.EnumerateFiles(_processingDirectory, "*.json"))
         {
+            if (HasCompletedCorrelatedResponse(processingPath))
+            {
+                File.Delete(processingPath);
+                continue;
+            }
+
             var requestPath = Path.Combine(_requestsDirectory, Path.GetFileName(processingPath));
             try
             {
@@ -199,18 +228,164 @@ public sealed class AtomicMailbox
             throw new ArgumentException("Unsupported request schema version.", nameof(request));
         }
 
-        ArgumentException.ThrowIfNullOrWhiteSpace(request.RequestId);
-        if (request.RequestId.Contains(Path.DirectorySeparatorChar) ||
-            request.RequestId.Contains(Path.AltDirectorySeparatorChar) ||
-            request.RequestId is "." or "..")
-        {
-            throw new ArgumentException("Request ID must not contain a path traversal segment.", nameof(request));
-        }
+        ValidateRequestId(request.RequestId, nameof(request));
 
         ArgumentException.ThrowIfNullOrWhiteSpace(request.Command);
         if (request.Payload.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
         {
             throw new ArgumentException("Request payload is required.", nameof(request));
+        }
+    }
+
+    private static void ValidateResponse(MailboxResponse response)
+    {
+        if (!StringComparer.Ordinal.Equals(response.SchemaVersion, MailboxRequest.CurrentSchemaVersion))
+        {
+            throw new ArgumentException("Unsupported response schema version.", nameof(response));
+        }
+
+        ValidateRequestId(response.RequestId, nameof(response));
+        ArgumentException.ThrowIfNullOrWhiteSpace(response.Command);
+        if (response.Timestamp == default)
+        {
+            throw new ArgumentException("Response timestamp is required.", nameof(response));
+        }
+
+        if (response.Payload.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
+        {
+            throw new ArgumentException("Response payload is required.", nameof(response));
+        }
+
+        if (response.Success && response.Error is not null)
+        {
+            throw new ArgumentException("Successful responses cannot carry an error.", nameof(response));
+        }
+
+        if (!response.Success &&
+            (response.Error is null || string.IsNullOrWhiteSpace(response.Error.Code) || string.IsNullOrWhiteSpace(response.Error.Message)))
+        {
+            throw new ArgumentException("Failed responses require structured error details.", nameof(response));
+        }
+    }
+
+    private static void ValidateRequestId(string requestId, string parameterName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(requestId);
+        if (requestId.Contains(Path.DirectorySeparatorChar) ||
+            requestId.Contains(Path.AltDirectorySeparatorChar) ||
+            requestId is "." or "..")
+        {
+            throw new ArgumentException("Request ID must not contain a path traversal segment.", parameterName);
+        }
+    }
+
+    private static void EnsureMaximumMessageSize<T>(T message, string parameterName)
+    {
+        if (JsonSerializer.SerializeToUtf8Bytes(message, JsonOptions).LongLength > MaximumMessageBytes)
+        {
+            throw new ArgumentOutOfRangeException(parameterName, "Serialized messages must not exceed 1 MiB.");
+        }
+    }
+
+    private MailboxResponse ReadValidatedResponse(string path, string awaitedRequestId)
+    {
+        try
+        {
+            var response = JsonSerializer.Deserialize<MailboxResponse>(ReadBoundedText(path), JsonOptions)
+                ?? throw new JsonException("Response JSON cannot be null.");
+            ValidateResponse(response);
+            if (!StringComparer.Ordinal.Equals(response.RequestId, awaitedRequestId))
+            {
+                throw new JsonException("Response request ID does not match the awaited request.");
+            }
+
+            return response;
+        }
+        catch (ArgumentException exception)
+        {
+            throw new JsonException("Response envelope is invalid.", exception);
+        }
+    }
+
+    private bool HasCompletedCorrelatedResponse(string processingPath)
+    {
+        try
+        {
+            var request = JsonSerializer.Deserialize<MailboxRequest>(ReadBoundedText(processingPath), JsonOptions)
+                ?? throw new JsonException("Request JSON cannot be null.");
+            ValidateRequest(request);
+            var key = MessageKey(request.RequestId);
+            if (!Path.GetFileNameWithoutExtension(processingPath).Equals(key, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            var responsePath = MessagePath(_responsesDirectory, key);
+            if (!File.Exists(responsePath))
+            {
+                return false;
+            }
+
+            var response = ReadValidatedResponse(responsePath, request.RequestId);
+            return StringComparer.Ordinal.Equals(response.Command, request.Command);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (InvalidDataException)
+        {
+            return false;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static string ReadBoundedText(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        if (stream.Length > MaximumMessageBytes)
+        {
+            throw new InvalidDataException("Mailbox messages must not exceed 1 MiB.");
+        }
+
+        var bytes = new byte[checked((int)stream.Length)];
+        var offset = 0;
+        while (offset < bytes.Length)
+        {
+            var count = stream.Read(bytes, offset, bytes.Length - offset);
+            if (count == 0)
+            {
+                throw new InvalidDataException("Mailbox message ended before its advertised length.");
+            }
+
+            offset += count;
+        }
+
+        if (stream.ReadByte() != -1)
+        {
+            throw new InvalidDataException("Mailbox message grew beyond its bounded length while being read.");
+        }
+
+        return Encoding.UTF8.GetString(bytes);
+    }
+
+    private void WriteJournalIfAbsent(string key, JournalEntry entry)
+    {
+        var path = MessagePath(_journalDirectory, key);
+        if (File.Exists(path))
+        {
+            return;
+        }
+
+        try
+        {
+            WriteAtomically(_journalDirectory, key, entry);
+        }
+        catch (IOException) when (File.Exists(path))
+        {
         }
     }
 

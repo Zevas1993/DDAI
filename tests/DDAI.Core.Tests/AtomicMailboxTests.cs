@@ -156,6 +156,160 @@ public sealed class AtomicMailboxTests
         Assert.True(restartedMailbox.WaitForResponse("recovery-001", TimeSpan.FromMilliseconds(100))!.Success);
     }
 
+    [Fact]
+    public void PublishResponse_RejectsPayloadOverOneMiBBeforeMakingResponseVisible()
+    {
+        using var sandbox = new MailboxSandbox();
+        var mailbox = new AtomicMailbox(sandbox.Root);
+        mailbox.PublishRequest(MailboxRequest.CreateStatus("response-too-large-001", Timestamp));
+        var claim = Assert.IsType<ClaimedMailboxRequest>(mailbox.ClaimNextRequest());
+        var response = SuccessResponse(claim.Request, new string('x', checked((int)AtomicMailbox.MaximumMessageBytes)));
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => mailbox.PublishResponse(claim, response));
+        Assert.Empty(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "responses")));
+        Assert.Single(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "processing")));
+    }
+
+    [Fact]
+    public void WaitForResponse_RejectsOversizeInboundResponseBeforeReadingIt()
+    {
+        using var sandbox = new MailboxSandbox();
+        var mailbox = new AtomicMailbox(sandbox.Root);
+        var responsePath = PublishCompletedStatusResponse(mailbox, sandbox.Root, "oversize-inbound-001");
+        File.WriteAllText(responsePath, new string('x', checked((int)AtomicMailbox.MaximumMessageBytes + 1)));
+
+        Assert.Throws<InvalidDataException>(() => mailbox.WaitForResponse("oversize-inbound-001", TimeSpan.FromMilliseconds(100)));
+    }
+
+    [Fact]
+    public void RecoverProcessingRequests_DiscardsLateClaimWhenCorrelatedResponseAlreadyExists()
+    {
+        using var sandbox = new MailboxSandbox();
+        var mailbox = new AtomicMailbox(sandbox.Root);
+        var request = MailboxRequest.CreateStatus("late-crash-001", Timestamp);
+        mailbox.PublishRequest(request);
+        var claim = Assert.IsType<ClaimedMailboxRequest>(mailbox.ClaimNextRequest());
+        mailbox.PublishResponse(claim, SuccessResponse(request, "ready"));
+        var responsePath = Assert.Single(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "responses")));
+        File.WriteAllText(
+            Path.Combine(sandbox.Root, "processing", Path.GetFileName(responsePath)),
+            JsonSerializer.Serialize(request, WireJsonOptions));
+
+        var restartedMailbox = new AtomicMailbox(sandbox.Root);
+
+        Assert.Equal(0, restartedMailbox.RecoverProcessingRequests());
+        Assert.Empty(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "processing")));
+        Assert.Empty(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "requests")));
+        Assert.True(restartedMailbox.WaitForResponse("late-crash-001", TimeSpan.FromMilliseconds(100))!.Success);
+    }
+
+    [Fact]
+    public void PublishResponse_RejectsForgedClaimWithoutTouchingOutsideSentinel()
+    {
+        using var sandbox = new MailboxSandbox();
+        var mailbox = new AtomicMailbox(sandbox.Root);
+        var sentinel = Path.Combine(Path.GetDirectoryName(sandbox.Root)!, "mailbox-sentinel.txt");
+        File.WriteAllText(sentinel, "do not delete");
+        var request = MailboxRequest.CreateStatus("forged-claim-001", Timestamp);
+        var forgedClaim = new ClaimedMailboxRequest(request, sentinel);
+
+        Assert.Throws<ArgumentException>(() => mailbox.PublishResponse(forgedClaim, SuccessResponse(request, "ready")));
+        Assert.True(File.Exists(sentinel));
+        Assert.Empty(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "responses")));
+        File.Delete(sentinel);
+    }
+
+    [Fact]
+    public void PublishResponse_RejectsSuccessResponseWithStructuredError()
+    {
+        using var sandbox = new MailboxSandbox();
+        var mailbox = new AtomicMailbox(sandbox.Root);
+        mailbox.PublishRequest(MailboxRequest.CreateStatus("error-in-success-001", Timestamp));
+        var claim = Assert.IsType<ClaimedMailboxRequest>(mailbox.ClaimNextRequest());
+        var invalid = SuccessResponse(claim.Request, "ready") with
+        {
+            Error = new MailboxErrorDetails("unexpected", "Success responses must not carry errors."),
+        };
+
+        Assert.Throws<ArgumentException>(() => mailbox.PublishResponse(claim, invalid));
+        Assert.Empty(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "responses")));
+    }
+
+    [Fact]
+    public void PublishResponse_RejectsUnsupportedSchemaVersion()
+    {
+        using var sandbox = new MailboxSandbox();
+        var mailbox = new AtomicMailbox(sandbox.Root);
+        mailbox.PublishRequest(MailboxRequest.CreateStatus("response-schema-001", Timestamp));
+        var claim = Assert.IsType<ClaimedMailboxRequest>(mailbox.ClaimNextRequest());
+        var invalid = SuccessResponse(claim.Request, "ready") with { SchemaVersion = "2.0" };
+
+        Assert.Throws<ArgumentException>(() => mailbox.PublishResponse(claim, invalid));
+        Assert.Empty(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "responses")));
+    }
+
+    [Fact]
+    public void WaitForResponse_RejectsResponseWhoseEmbeddedRequestIdDoesNotMatchAwaitedId()
+    {
+        using var sandbox = new MailboxSandbox();
+        var mailbox = new AtomicMailbox(sandbox.Root);
+        var responsePath = PublishCompletedStatusResponse(mailbox, sandbox.Root, "correlation-001");
+        var wrongCorrelation = SuccessResponse(MailboxRequest.CreateStatus("other-request", Timestamp), "ready");
+        File.WriteAllText(responsePath, JsonSerializer.Serialize(wrongCorrelation, WireJsonOptions));
+
+        Assert.Throws<JsonException>(() => mailbox.WaitForResponse("correlation-001", TimeSpan.FromMilliseconds(100)));
+    }
+
+    [Fact]
+    public void WaitForResponse_RejectsFailureResponseWithoutStructuredError()
+    {
+        using var sandbox = new MailboxSandbox();
+        var mailbox = new AtomicMailbox(sandbox.Root);
+        var responsePath = PublishCompletedStatusResponse(mailbox, sandbox.Root, "failure-invariant-001");
+        var invalid = SuccessResponse(MailboxRequest.CreateStatus("failure-invariant-001", Timestamp), "") with { Success = false };
+        File.WriteAllText(responsePath, JsonSerializer.Serialize(invalid, WireJsonOptions));
+
+        Assert.Throws<JsonException>(() => mailbox.WaitForResponse("failure-invariant-001", TimeSpan.FromMilliseconds(100)));
+    }
+
+    [Fact]
+    public void WaitForResponse_RejectsUnsupportedResponseSchema()
+    {
+        using var sandbox = new MailboxSandbox();
+        var mailbox = new AtomicMailbox(sandbox.Root);
+        var responsePath = PublishCompletedStatusResponse(mailbox, sandbox.Root, "read-schema-001");
+        var invalid = SuccessResponse(MailboxRequest.CreateStatus("read-schema-001", Timestamp), "ready") with { SchemaVersion = "2.0" };
+        File.WriteAllText(responsePath, JsonSerializer.Serialize(invalid, WireJsonOptions));
+
+        Assert.Throws<JsonException>(() => mailbox.WaitForResponse("read-schema-001", TimeSpan.FromMilliseconds(100)));
+    }
+
+    private static readonly DateTimeOffset Timestamp = DateTimeOffset.Parse("2026-08-09T12:00:00Z");
+
+    private static readonly JsonSerializerOptions WireJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+    };
+
+    private static MailboxResponse SuccessResponse(MailboxRequest request, string state) => new()
+    {
+        SchemaVersion = MailboxRequest.CurrentSchemaVersion,
+        RequestId = request.RequestId,
+        Command = request.Command,
+        Timestamp = Timestamp,
+        Success = true,
+        Payload = JsonSerializer.SerializeToElement(new { state }),
+    };
+
+    private static string PublishCompletedStatusResponse(AtomicMailbox mailbox, string root, string requestId)
+    {
+        var request = MailboxRequest.CreateStatus(requestId, Timestamp);
+        mailbox.PublishRequest(request);
+        var claim = Assert.IsType<ClaimedMailboxRequest>(mailbox.ClaimNextRequest());
+        mailbox.PublishResponse(claim, SuccessResponse(request, "ready"));
+        return Assert.Single(Directory.EnumerateFiles(Path.Combine(root, "responses")));
+    }
+
     private sealed class MailboxSandbox : IDisposable
     {
         public MailboxSandbox()
