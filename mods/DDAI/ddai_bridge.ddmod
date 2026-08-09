@@ -1,0 +1,8 @@
+{
+  "name": "DDAI Status Bridge",
+  "unique_id": "org.ddai.status_bridge",
+  "version": "0.1.0",
+  "author": "DDAI contributors",
+  "description": "Local filesystem mailbox status bridge for Dungeondraft. No network listener.",
+  "dd_version": "1.2.0.1"
+}
