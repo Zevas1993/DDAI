@@ -79,6 +79,8 @@ public sealed class DungeondraftModPackageTests
         Assert.Contains("fraction.substr(0, min(7, fraction.length()))", validator, StringComparison.Ordinal);
         Assert.Contains("zone_kind = \"local\"", validator, StringComparison.Ordinal);
         Assert.Contains("var zone_sign = 0", validator, StringComparison.Ordinal);
+        Assert.Contains("if zone_hour_value == 0 and zone_minute_value == 0:", validator, StringComparison.Ordinal);
+        Assert.Contains("zone_sign = 0", validator[validator.IndexOf("if zone_hour_value == 0 and zone_minute_value == 0:", StringComparison.Ordinal)..], StringComparison.Ordinal);
         Assert.Contains("var local_seconds = hour * 3600 + minute * 60 + second", validator, StringComparison.Ordinal);
         Assert.Contains("var offset_seconds = zone_hour_value * 3600 + zone_minute_value * 60", validator, StringComparison.Ordinal);
         Assert.Contains("local_seconds < offset_seconds", validator, StringComparison.Ordinal);

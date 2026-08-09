@@ -217,6 +217,8 @@ func _is_wire_timestamp(value):
 		zone_minute_value = int(zone_minute)
 		if zone_hour_value > 14 or zone_minute_value > 59 or (zone_hour_value == 14 and zone_minute_value != 0):
 			return false
+		if zone_hour_value == 0 and zone_minute_value == 0:
+			zone_sign = 0
 		main = value.substr(0, zone_index)
 	var decimal_index = main.find(".")
 	var fraction_nonzero = false
