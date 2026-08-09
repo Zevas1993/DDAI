@@ -1,0 +1,24 @@
+.worktrees/
+.vs/
+**/bin/
+**/obj/
+artifacts/
+TestResults/
+coverage/
+*.user
+*.suo
+*.nupkg
+*.snupkg
+
+# Never commit purchased Dungeondraft software or user-owned content.
+Dungeondraft/
+vendor/dungeondraft/
+*.pck
+*.dungeondraft_map
+*.dungeondraft_pack
+
+# Local DDAI runtime state and generated/private assets.
+.ddai/
+generated-assets/
+secrets/
+
