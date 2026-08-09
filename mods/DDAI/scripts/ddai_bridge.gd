@@ -12,12 +12,14 @@ const SUPPORTED_COMMANDS = ["status"]
 var _poll_elapsed = POLL_INTERVAL_SECONDS
 var _heartbeat_elapsed = HEARTBEAT_INTERVAL_SECONDS
 var _session_id = ""
+var _heartbeat_slot = 0
 
 
 # Called by Dungeondraft after the mod is loaded.
 func start():
 	_ensure_mailbox_directories()
 	_session_id = str(OS.get_unix_time()) + "-" + str(OS.get_ticks_msec())
+	_recover_processing_claims()
 	_write_runtime_receipt()
 	_write_heartbeat()
 
@@ -67,10 +69,10 @@ func _process_one_request():
 
 	if request.command == "status":
 		var status_result = _write_response(request.request_id, request.command, true, _status_payload(), {})
-		if status_result == "response_conflict":
-			_write_failed_record(claim, _error("response_conflict", "A non-equivalent response already occupies this request key.", "request_id"))
+		if status_result == "created" or status_result == "verified_idempotent":
 			_remove_file(claim.path)
-			return
+		else:
+			_write_failed_record(claim, _error(status_result, "Response publication did not complete; claim retained for recovery.", "request_id"))
 	else:
 		var error_result = _write_response(
 			request.request_id,
@@ -78,11 +80,36 @@ func _process_one_request():
 			false,
 			{},
 			_error("unsupported_command", "This mod currently supports only the status command.", "command"))
-		if error_result == "response_conflict":
-			_write_failed_record(claim, _error("response_conflict", "A non-equivalent response already occupies this request key.", "request_id"))
+		if error_result == "created" or error_result == "verified_idempotent":
 			_remove_file(claim.path)
-			return
-	_remove_file(claim.path)
+		else:
+			_write_failed_record(claim, _error(error_result, "Response publication did not complete; claim retained for recovery.", "request_id"))
+
+
+func _recover_processing_claims():
+	var directory = Directory.new()
+	if directory.open(MAILBOX_ROOT + "/processing") != OK:
+		return
+	directory.list_dir_begin(true, true)
+	var file_name = directory.get_next()
+	while file_name != "":
+		if not directory.current_is_dir() and file_name.ends_with(".json"):
+			var path = MAILBOX_ROOT + "/processing/" + file_name
+			var read_result = _read_bounded_text(path)
+			if not read_result.ok:
+				_write_failed_record({"file_name": file_name}, read_result.error)
+				_remove_file(path)
+			else:
+				var parsed = JSON.parse(read_result.text)
+				if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY or not _validate_request(parsed.result, file_name).empty():
+					_write_failed_record({"file_name": file_name}, _error("malformed_request", "Processing claim is invalid.", ""))
+					_remove_file(path)
+				else:
+					var request_path = MAILBOX_ROOT + "/requests/" + file_name
+					if not directory.file_exists(request_path):
+						directory.rename(path, request_path)
+		file_name = directory.get_next()
+	directory.list_dir_end()
 
 
 func _claim_next_request():
@@ -244,30 +271,15 @@ func _write_runtime_receipt():
 
 
 func _write_heartbeat():
-	_write_json_atomically(MAILBOX_ROOT + "/runtime-heartbeats/" + _session_id + "-" + str(OS.get_unix_time()) + "-" + str(OS.get_ticks_msec()) + ".json", {
+	var heartbeat_path = MAILBOX_ROOT + "/runtime-heartbeats/heartbeat-slot-" + str(_heartbeat_slot) + ".json"
+	_heartbeat_slot = (_heartbeat_slot + 1) % 8
+	_remove_file(heartbeat_path)
+	_write_json_atomically(heartbeat_path, {
 		"schema_version": MAILBOX_SCHEMA_VERSION,
 		"session_id": _session_id,
 		"mod_version": MOD_VERSION,
 		"timestamp": _iso_timestamp(),
 	})
-	_prune_heartbeats()
-
-
-func _prune_heartbeats():
-	var directory = Directory.new()
-	if directory.open(MAILBOX_ROOT + "/runtime-heartbeats") != OK:
-		return
-	directory.list_dir_begin(true, true)
-	var files = []
-	var name = directory.get_next()
-	while name != "":
-		if not directory.current_is_dir() and name.ends_with(".json"):
-			files.append(name)
-		name = directory.get_next()
-	directory.list_dir_end()
-	files.sort()
-	while files.size() > 8:
-		directory.remove(MAILBOX_ROOT + "/runtime-heartbeats/" + files.pop_front())
 
 
 func _write_response(request_id, command, success, payload, error):
@@ -284,9 +296,11 @@ func _write_response(request_id, command, success, payload, error):
 	var response_path = MAILBOX_ROOT + "/responses/" + request_id.sha256_text() + ".json"
 	var write_result = _write_json_atomically(response_path, response)
 	if write_result == "existing" and _response_matches(response_path, response):
-		return "idempotent"
+		return "verified_idempotent"
 	if write_result == "created":
 		return "created"
+	if write_result == "write_failed":
+		return "write_failed"
 	return "response_conflict"
 
 

@@ -52,3 +52,11 @@ The active Dungeondraft window is an unsaved `Tabula Rasa*` map. The newly insta
 - Heartbeats use a bounded flat set (maximum eight files). Diagnosis reads only the newest eight nonrecursive files and rejects timestamps more than five seconds in the future or older than 30 seconds.
 - RED tests covered timer ordering and future heartbeat misclassification; final Release tests passed `45/45` and the build had `0` warnings/errors.
 - Reinstalled only `D:\DungeonDraft\Dungeondraft\mods\DDAI` through staged owned-folder replacement; backup: `C:\Users\ChrisBoyd\AppData\Roaming\Dungeondraft\ddai\mod-backups\DDAI-20260809T2226479314321-c3753691c32e49f19bef31d9c2a6ea41`. Diagnosis remains `installed_not_observed` / `runtime_heartbeat_missing` pending a user-approved UI reload.
+
+## Fix round 3
+
+- A processing claim is removed only for `created` or `verified_idempotent` response results. `response_conflict` and `write_failed` produce diagnostics while retaining the canonical claim for recovery.
+- Startup recovery validates stranded processing envelopes, routes invalid claims to `failed`, and atomically requeues valid unresolved claims without overwriting existing request files.
+- Heartbeats rotate through eight fixed monotonic slots rather than wall-clock-derived retention ordering. Diagnosis remains bounded to eight flat records and validates freshness/future skew.
+- RED static contract check failed before the response/recovery/slot changes; Release verification after the changes passed `45/45` tests and the build had `0` warnings/errors.
+- Reinstalled only the DDAI-owned folder; backup: `C:\Users\ChrisBoyd\AppData\Roaming\Dungeondraft\ddai\mod-backups\DDAI-20260809T2233063611179-bdf7e6ded4764086b10e483d00ff24af`. Diagnosis is still `installed_not_observed` / `runtime_heartbeat_missing` pending normal UI reload.

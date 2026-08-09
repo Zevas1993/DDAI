@@ -34,7 +34,11 @@ public sealed class DungeondraftModPackageTests
         Assert.True(script.IndexOf("_heartbeat_elapsed += delta", StringComparison.Ordinal) < script.IndexOf("if _poll_elapsed < POLL_INTERVAL_SECONDS", StringComparison.Ordinal));
         Assert.Contains("_response_matches", script, StringComparison.Ordinal);
         Assert.Contains("response_conflict", script, StringComparison.Ordinal);
-        Assert.Contains("_prune_heartbeats", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("func _prune_heartbeats():", script, StringComparison.Ordinal);
+        Assert.Contains("status_result == \"created\" or status_result == \"verified_idempotent\"", script, StringComparison.Ordinal);
+        Assert.Contains("func _recover_processing_claims():", script, StringComparison.Ordinal);
+        Assert.Contains("heartbeat-slot-", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("runtime-heartbeats/\" + _session_id + \"-\" + str(OS.get_unix_time())", script, StringComparison.Ordinal);
         Assert.DoesNotContain("TCPServer", script, StringComparison.Ordinal);
         Assert.DoesNotContain("HTTPClient", script, StringComparison.Ordinal);
         Assert.DoesNotContain("PacketPeer", script, StringComparison.Ordinal);
