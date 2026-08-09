@@ -123,4 +123,22 @@ public sealed class MapPlanValidatorTests
         ],
             result.Issues.Select(issue => issue.Code));
     }
+
+    [Fact]
+    public void Validate_ReportsNullCanvasAsStableIssue()
+    {
+        var plan = new MapPlan
+        {
+            SchemaVersion = MapPlan.CurrentSchemaVersion,
+            RequestId = "request-007",
+            BaseRevision = 0,
+            Mode = MapOperationMode.Add,
+            Canvas = null!,
+        };
+
+        var result = MapPlanValidator.Validate(plan);
+
+        var issue = Assert.Single(result.Issues);
+        Assert.Equal(("invalid_canvas", "canvas"), (issue.Code, issue.Path));
+    }
 }

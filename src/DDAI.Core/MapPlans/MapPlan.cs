@@ -17,9 +17,9 @@ public sealed record MapPlan
 
     public required string RequestId { get; init; }
 
-    public long BaseRevision { get; init; }
+    public required long BaseRevision { get; init; }
 
-    public MapOperationMode Mode { get; init; }
+    public required MapOperationMode Mode { get; init; }
 
     public required MapCanvas Canvas { get; init; }
 }

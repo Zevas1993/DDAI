@@ -28,7 +28,15 @@ public static class MapPlanJson
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(json);
 
-        return JsonSerializer.Deserialize<MapPlan>(json, SerializerOptions)
+        var plan = JsonSerializer.Deserialize<MapPlan>(json, SerializerOptions)
             ?? throw new JsonException("The map plan payload cannot be JSON null.");
+
+        var validationResult = MapPlanValidator.Validate(plan);
+        if (!validationResult.IsValid)
+        {
+            throw new MapPlanValidationException(validationResult.Issues);
+        }
+
+        return plan;
     }
 }

@@ -2,6 +2,17 @@ namespace DDAI.Core.MapPlans;
 
 public sealed record MapPlanValidationIssue(string Code, string Path, string Message);
 
+public sealed class MapPlanValidationException : Exception
+{
+    public MapPlanValidationException(IReadOnlyList<MapPlanValidationIssue> issues)
+        : base("The map plan payload is invalid.")
+    {
+        Issues = issues ?? throw new ArgumentNullException(nameof(issues));
+    }
+
+    public IReadOnlyList<MapPlanValidationIssue> Issues { get; }
+}
+
 public sealed record MapPlanValidationResult(IReadOnlyList<MapPlanValidationIssue> Issues)
 {
     public bool IsValid => Issues.Count == 0;
@@ -42,20 +53,30 @@ public static class MapPlanValidator
                 "Base revision cannot be negative."));
         }
 
-        if (plan.Canvas.Width <= 0)
+        if (plan.Canvas is null)
         {
             issues.Add(new MapPlanValidationIssue(
-                "invalid_canvas_width",
-                "canvas.width",
-                "Canvas width must be greater than zero."));
+                "invalid_canvas",
+                "canvas",
+                "Canvas is required."));
         }
-
-        if (plan.Canvas.Height <= 0)
+        else
         {
-            issues.Add(new MapPlanValidationIssue(
-                "invalid_canvas_height",
-                "canvas.height",
-                "Canvas height must be greater than zero."));
+            if (plan.Canvas.Width <= 0)
+            {
+                issues.Add(new MapPlanValidationIssue(
+                    "invalid_canvas_width",
+                    "canvas.width",
+                    "Canvas width must be greater than zero."));
+            }
+
+            if (plan.Canvas.Height <= 0)
+            {
+                issues.Add(new MapPlanValidationIssue(
+                    "invalid_canvas_height",
+                    "canvas.height",
+                    "Canvas height must be greater than zero."));
+            }
         }
 
         return new MapPlanValidationResult(issues);
