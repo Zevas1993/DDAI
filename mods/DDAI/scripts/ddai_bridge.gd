@@ -206,10 +206,10 @@ func _is_wire_timestamp(value):
 	if value.ends_with("Z"):
 		zone_kind = "utc"
 		main = value.substr(0, value.length() - 1)
-	elif zone_index >= 19 and value.length() - zone_index == 6 and value[zone_index + 3] == ":":
+	elif zone_index >= 16 and (value.length() - zone_index == 3 or (value.length() - zone_index == 6 and value[zone_index + 3] == ":")):
 		var zone_hour = value.substr(zone_index + 1, 2)
-		var zone_minute = value.substr(zone_index + 4, 2)
-		if not zone_hour.is_valid_integer() or not zone_minute.is_valid_integer():
+		var zone_minute = "00" if value.length() - zone_index == 3 else value.substr(zone_index + 4, 2)
+		if not _is_ascii_decimal_digits(zone_hour) or not _is_ascii_decimal_digits(zone_minute):
 			return false
 		zone_kind = "explicit"
 		zone_sign = 1 if value[zone_index] == "+" else -1
@@ -224,16 +224,22 @@ func _is_wire_timestamp(value):
 	var fraction_nonzero = false
 	if decimal_index != -1:
 		var fraction = main.substr(decimal_index + 1, main.length() - decimal_index - 1)
-		if fraction == "" or fraction.length() > 16 or not fraction.is_valid_integer():
+		if fraction == "" or fraction.length() > 16 or not _is_ascii_decimal_digits(fraction):
 			return false
 		# DateTimeOffset precision is 100 ns; System.Text.Json accepts additional
 		# digits but they do not move the represented value past the first 7.
 		fraction_nonzero = int(fraction.substr(0, min(7, fraction.length()))) != 0
 		main = main.substr(0, decimal_index)
-	if main.length() != 19 or main[4] != "-" or main[7] != "-" or main[10] != "T" or main[13] != ":" or main[16] != ":":
+	if main.length() != 16 and main.length() != 19:
+		return false
+	if main[4] != "-" or main[7] != "-" or main[10] != "T" or main[13] != ":":
+		return false
+	if main.length() == 16:
+		main += ":00"
+	elif main[16] != ":":
 		return false
 	var digits = main.substr(0, 4) + main.substr(5, 2) + main.substr(8, 2) + main.substr(11, 2) + main.substr(14, 2) + main.substr(17, 2)
-	if not digits.is_valid_integer():
+	if not _is_ascii_decimal_digits(digits):
 		return false
 	var year = int(main.substr(0, 4))
 	var month = int(main.substr(5, 2))
@@ -262,6 +268,16 @@ func _is_wire_timestamp(value):
 	var maximum_date = year == 9999 and month == 12 and day == 31
 	if maximum_date and zone_kind == "explicit" and zone_sign < 0 and local_seconds + offset_seconds >= 86400:
 		return false
+	return true
+
+
+func _is_ascii_decimal_digits(value):
+	if value.length() == 0:
+		return false
+	for index in range(value.length()):
+		var code = value.ord_at(index)
+		if code < 48 or code > 57:
+			return false
 	return true
 
 

@@ -90,6 +90,34 @@ public sealed class DungeondraftModPackageTests
     }
 
     [Fact]
+    public void Gdscript_TimestampValidatorRequiresAsciiDecimalDigitsBeforeConversion()
+    {
+        var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
+        var validator = FunctionBody(script, "_is_wire_timestamp");
+        var digitCheck = FunctionBody(script, "_is_ascii_decimal_digits");
+
+        Assert.DoesNotContain(".is_valid_integer()", validator, StringComparison.Ordinal);
+        Assert.Contains("_is_ascii_decimal_digits(zone_hour)", validator, StringComparison.Ordinal);
+        Assert.Contains("_is_ascii_decimal_digits(zone_minute)", validator, StringComparison.Ordinal);
+        Assert.Contains("_is_ascii_decimal_digits(fraction)", validator, StringComparison.Ordinal);
+        Assert.Contains("_is_ascii_decimal_digits(digits)", validator, StringComparison.Ordinal);
+        Assert.Contains("value.length() - zone_index == 3", validator, StringComparison.Ordinal);
+        Assert.Contains("zone_minute = \"00\"", validator, StringComparison.Ordinal);
+        Assert.Contains("main.length() != 16 and main.length() != 19", validator, StringComparison.Ordinal);
+        Assert.True(
+            validator.IndexOf("_is_ascii_decimal_digits(zone_hour)", StringComparison.Ordinal) <
+            validator.IndexOf("int(zone_hour)", StringComparison.Ordinal));
+        Assert.True(
+            validator.IndexOf("_is_ascii_decimal_digits(fraction)", StringComparison.Ordinal) <
+            validator.IndexOf("int(fraction.substr", StringComparison.Ordinal));
+        Assert.True(
+            validator.IndexOf("_is_ascii_decimal_digits(digits)", StringComparison.Ordinal) <
+            validator.IndexOf("int(main.substr(0, 4))", StringComparison.Ordinal));
+        Assert.Contains("var code = value.ord_at(index)", digitCheck, StringComparison.Ordinal);
+        Assert.Contains("code < 48 or code > 57", digitCheck, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Gdscript_FailsClosedWhenReconciliationOrFailurePublicationCannotCommit()
     {
         var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
