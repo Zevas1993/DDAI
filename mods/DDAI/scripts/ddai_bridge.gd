@@ -6,15 +6,20 @@ const MAILBOX_SCHEMA_VERSION = "1.0"
 const MAILBOX_ROOT = "user://ddai"
 const MAXIMUM_MESSAGE_BYTES = 1048576
 const POLL_INTERVAL_SECONDS = 0.25
+const HEARTBEAT_INTERVAL_SECONDS = 10.0
 const SUPPORTED_COMMANDS = ["status"]
 
 var _poll_elapsed = POLL_INTERVAL_SECONDS
+var _heartbeat_elapsed = HEARTBEAT_INTERVAL_SECONDS
+var _session_id = ""
 
 
 # Called by Dungeondraft after the mod is loaded.
 func start():
 	_ensure_mailbox_directories()
+	_session_id = str(OS.get_unix_time()) + "-" + str(OS.get_ticks_msec())
 	_write_runtime_receipt()
+	_write_heartbeat()
 
 
 # Called by Dungeondraft every frame. This is a filesystem poller, never a network listener.
@@ -24,11 +29,15 @@ func update(delta):
 		return
 	_poll_elapsed = 0.0
 	_process_one_request()
+	_heartbeat_elapsed += delta
+	if _heartbeat_elapsed >= HEARTBEAT_INTERVAL_SECONDS:
+		_heartbeat_elapsed = 0.0
+		_write_heartbeat()
 
 
 func _ensure_mailbox_directories():
 	var directory = Directory.new()
-	for name in ["requests", "processing", "responses", "failed", "journal"]:
+	for name in ["requests", "processing", "responses", "failed", "journal", "runtime-receipts", "runtime-heartbeats"]:
 		directory.make_dir_recursive(MAILBOX_ROOT + "/" + name)
 
 
@@ -52,10 +61,7 @@ func _process_one_request():
 	var request = parsed.result
 	var validation_error = _validate_request(request, claim.file_name)
 	if not validation_error.empty():
-		if _can_correlate_failure(request):
-			_write_response(request.request_id, request.command, false, {}, validation_error)
-		else:
-			_write_failed_record(claim, validation_error)
+		_write_failed_record(claim, validation_error)
 		_remove_file(claim.path)
 		return
 
@@ -111,17 +117,52 @@ func _validate_request(request, file_name):
 		return _error("malformed_request", "Request file name does not match request_id.", "request_id")
 	if not request.has("command") or typeof(request.command) != TYPE_STRING or request.command.strip_edges() == "":
 		return _error("malformed_request", "command is required.", "command")
-	if not request.has("timestamp") or typeof(request.timestamp) != TYPE_STRING or request.timestamp.strip_edges() == "":
+	if not request.has("timestamp") or typeof(request.timestamp) != TYPE_STRING or not _is_wire_timestamp(request.timestamp):
 		return _error("malformed_request", "timestamp is required.", "timestamp")
-	if not request.has("payload"):
+	if not request.has("payload") or request.payload == null:
 		return _error("malformed_request", "payload is required.", "payload")
 	return {}
 
 
-func _can_correlate_failure(request):
-	return request.has("request_id") and request.has("command") and \
-		typeof(request.request_id) == TYPE_STRING and _is_safe_request_id(request.request_id) and \
-		typeof(request.command) == TYPE_STRING and request.command.strip_edges() != ""
+func _is_wire_timestamp(value):
+	var zone_index = value.rfind("+")
+	if zone_index < 19:
+		zone_index = value.rfind("-")
+	var main = value
+	if value.ends_with("Z"):
+		main = value.substr(0, value.length() - 1)
+	elif zone_index >= 19 and value.length() - zone_index == 6 and value[zone_index + 3] == ":":
+		var zone_hour = value.substr(zone_index + 1, 2)
+		var zone_minute = value.substr(zone_index + 4, 2)
+		if not zone_hour.is_valid_integer() or not zone_minute.is_valid_integer() or int(zone_hour) > 23 or int(zone_minute) > 59:
+			return false
+		main = value.substr(0, zone_index)
+	else:
+		return false
+	var decimal_index = main.find(".")
+	if decimal_index != -1:
+		var fraction = main.substr(decimal_index + 1, main.length() - decimal_index - 1)
+		if fraction == "" or not fraction.is_valid_integer():
+			return false
+		main = main.substr(0, decimal_index)
+	if main.length() != 19 or main[4] != "-" or main[7] != "-" or main[10] != "T" or main[13] != ":" or main[16] != ":":
+		return false
+	var digits = main.substr(0, 4) + main.substr(5, 2) + main.substr(8, 2) + main.substr(11, 2) + main.substr(14, 2) + main.substr(17, 2)
+	if not digits.is_valid_integer():
+		return false
+	var year = int(main.substr(0, 4))
+	var month = int(main.substr(5, 2))
+	var day = int(main.substr(8, 2))
+	var hour = int(main.substr(11, 2))
+	var minute = int(main.substr(14, 2))
+	var second = int(main.substr(17, 2))
+	return year >= 1 and month >= 1 and month <= 12 and day >= 1 and day <= _days_in_month(year, month) and hour <= 23 and minute <= 59 and second <= 59
+
+
+func _days_in_month(year, month):
+	if month == 2:
+		return 29 if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 28
+	return 30 if month == 4 or month == 6 or month == 9 or month == 11 else 31
 
 
 func _is_safe_request_id(request_id):
@@ -183,13 +224,23 @@ func _safe_property(target, property_name):
 
 
 func _write_runtime_receipt():
-	_write_json_atomically(MAILBOX_ROOT + "/runtime-receipt.json", {
+	_write_json_atomically(MAILBOX_ROOT + "/runtime-receipts/" + _session_id + ".json", {
 		"schema_version": MAILBOX_SCHEMA_VERSION,
 		"event": "started",
 		"mod_version": MOD_VERSION,
 		"target_dungeondraft_version": TARGET_DUNGEONDRAFT_VERSION,
 		"timestamp": _iso_timestamp(),
+		"session_id": _session_id,
 		"supported_commands": SUPPORTED_COMMANDS,
+	})
+
+
+func _write_heartbeat():
+	_write_json_atomically(MAILBOX_ROOT + "/runtime-heartbeats/" + _session_id + "/" + str(OS.get_unix_time()) + "-" + str(OS.get_ticks_msec()) + ".json", {
+		"schema_version": MAILBOX_SCHEMA_VERSION,
+		"session_id": _session_id,
+		"mod_version": MOD_VERSION,
+		"timestamp": _iso_timestamp(),
 	})
 
 

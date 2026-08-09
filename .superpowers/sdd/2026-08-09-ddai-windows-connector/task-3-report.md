@@ -35,3 +35,12 @@ Build succeeded. 0 Warning(s), 0 Error(s)
 ## Remaining live-test blocker
 
 The active Dungeondraft window is an unsaved `Tabula Rasa*` map. The newly installed mod cannot write its start receipt or service a status request until the user saves as appropriate and reloads/restarts Dungeondraft through normal UI controls. No live status round trip is claimed.
+
+## Fix round 1 (review findings closed)
+
+- Invalid or noncanonical envelopes now always write a structured `failed` record and never publish a correlated response. The GDScript validates the canonical SHA-256 filename before any status handling, rejects `payload: null`, and accepts only valid RFC 3339-compatible timestamps.
+- Start receipts are unique session records and the mod writes atomically published session heartbeats every ten seconds. Diagnostics call the mod `running` only for a matching heartbeat newer than 30 seconds; stale, missing, malformed, or mismatched heartbeat data remains `installed_not_observed`.
+- The installer compares the owned target file set exactly. A valid owned target with an extra `.gd` now undergoes staged replacement and is moved to a recoverable backup under `user-data\ddai\mod-backups`; no target-only executable script survives the replacement.
+- RED: four focused review tests failed against the original bridge/installer (canonical response path, fresh/stale heartbeat behavior, and target-only script). GREEN: focused static/integration tests passed 6/6; three real `AtomicMailbox` conformance cases cover filename mismatch, null payload, and invalid timestamp.
+- Final fix-round verification: Release tests passed `44/44`; Release build passed with `0` warnings/errors.
+- Reinstalled only `D:\DungeonDraft\Dungeondraft\mods\DDAI`; installer returned `state=repaired` with backup `C:\Users\ChrisBoyd\AppData\Roaming\Dungeondraft\ddai\mod-backups\DDAI-20260809T2220438229517-5b4e3dbd99d14140aeebaeb691c0338f`. Diagnostics now return `installed_not_observed` / `runtime_heartbeat_missing` until a normal UI reload occurs.

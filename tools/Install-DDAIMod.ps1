@@ -64,7 +64,13 @@ function Test-SourceMatchesTarget {
         [Parameter(Mandatory = $true)][string]$TargetDirectory
     )
 
-    foreach ($sourceFile in Get-ChildItem -LiteralPath $SourceDirectory -Recurse -File) {
+    $sourceFiles = @(Get-ChildItem -LiteralPath $SourceDirectory -Recurse -File)
+    $targetFiles = @(Get-ChildItem -LiteralPath $TargetDirectory -Recurse -File)
+    if ($sourceFiles.Count -ne $targetFiles.Count) {
+        return $false
+    }
+
+    foreach ($sourceFile in $sourceFiles) {
         $relative = $sourceFile.FullName.Substring($SourceDirectory.Length).TrimStart([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
         $targetFile = Join-Path $TargetDirectory $relative
         if (-not (Test-Path -LiteralPath $targetFile -PathType Leaf)) {
@@ -78,29 +84,55 @@ function Test-SourceMatchesTarget {
     return $true
 }
 
-function Install-DDAIStatusBridge {
+function Copy-SourceToNewTarget {
     param(
         [Parameter(Mandatory = $true)][string]$SourceDirectory,
         [Parameter(Mandatory = $true)][string]$TargetDirectory
+    )
+
+    New-Item -ItemType Directory -Path $TargetDirectory -Force | Out-Null
+    foreach ($sourceFile in Get-ChildItem -LiteralPath $SourceDirectory -Recurse -File) {
+        $relative = $sourceFile.FullName.Substring($SourceDirectory.Length).TrimStart([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+        $targetFile = Join-Path $TargetDirectory $relative
+        New-Item -ItemType Directory -Path ([System.IO.Path]::GetDirectoryName($targetFile)) -Force | Out-Null
+        Copy-Item -LiteralPath $sourceFile.FullName -Destination $targetFile -Force
+    }
+}
+
+function Install-DDAIStatusBridge {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceDirectory,
+        [Parameter(Mandatory = $true)][string]$TargetDirectory,
+        [Parameter(Mandatory = $true)][string]$BackupRoot
     )
 
     if (Test-Path -LiteralPath $TargetDirectory) {
         # A uniquely named target may only be updated when it is demonstrably ours.
         Get-ValidatedManifest -ModDirectory $TargetDirectory | Out-Null
         if (Test-SourceMatchesTarget -SourceDirectory $SourceDirectory -TargetDirectory $TargetDirectory) {
-            return 'already_current'
+            return @{ State = 'already_current'; Backup = $null }
         }
     }
 
-    foreach ($sourceFile in Get-ChildItem -LiteralPath $SourceDirectory -Recurse -File) {
-        $relative = $sourceFile.FullName.Substring($SourceDirectory.Length).TrimStart([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
-        $targetFile = Join-Path $TargetDirectory $relative
-        $targetParent = [System.IO.Path]::GetDirectoryName($targetFile)
-        New-Item -ItemType Directory -Path $targetParent -Force | Out-Null
-        Copy-Item -LiteralPath $sourceFile.FullName -Destination $targetFile -Force
+    $stageDirectory = Join-Path ([System.IO.Path]::GetDirectoryName($TargetDirectory)) ('.DDAI-stage-' + [Guid]::NewGuid().ToString('N'))
+    Copy-SourceToNewTarget -SourceDirectory $SourceDirectory -TargetDirectory $stageDirectory
+    if (-not (Test-Path -LiteralPath $TargetDirectory)) {
+        Move-Item -LiteralPath $stageDirectory -Destination $TargetDirectory
+        return @{ State = 'installed'; Backup = $null }
     }
 
-    return 'installed'
+    New-Item -ItemType Directory -Path $BackupRoot -Force | Out-Null
+    $backupDirectory = Join-Path $BackupRoot ('DDAI-' + [DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffffff') + '-' + [Guid]::NewGuid().ToString('N'))
+    Move-Item -LiteralPath $TargetDirectory -Destination $backupDirectory
+    try {
+        Move-Item -LiteralPath $stageDirectory -Destination $TargetDirectory
+    }
+    catch {
+        Move-Item -LiteralPath $backupDirectory -Destination $TargetDirectory
+        throw
+    }
+
+    return @{ State = 'repaired'; Backup = $backupDirectory }
 }
 
 function Get-Diagnosis {
@@ -114,29 +146,38 @@ function Get-Diagnosis {
     }
 
     $manifest = Get-ValidatedManifest -ModDirectory $TargetDirectory
-    $receiptPath = Join-Path $UserDirectory 'ddai\runtime-receipt.json'
-    if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+    $heartbeatRoot = Join-Path $UserDirectory 'ddai\runtime-heartbeats'
+    $heartbeatFiles = @()
+    if (Test-Path -LiteralPath $heartbeatRoot -PathType Container) {
+        $heartbeatFiles = @(Get-ChildItem -LiteralPath $heartbeatRoot -Recurse -File -Filter '*.json')
+    }
+    if ($heartbeatFiles.Count -eq 0) {
         return @{
             state = 'installed_not_observed'
-            code = 'runtime_receipt_missing'
+            code = 'runtime_heartbeat_missing'
             runtime_receipt_present = $false
             target = $TargetDirectory
-            message = 'The mod is installed but has not written a runtime receipt. It may be disabled, or Dungeondraft has not loaded/reloaded it yet.'
+            message = 'The mod is installed but has not written a runtime heartbeat. It may be disabled, or Dungeondraft has not loaded/reloaded it yet.'
         }
     }
 
-    try {
-        $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
-    }
-    catch {
-        return @{ state = 'installed_not_observed'; code = 'runtime_receipt_malformed'; runtime_receipt_present = $true; target = $TargetDirectory }
-    }
-
-    if ($receipt.mod_version -ne $manifest.version) {
-        return @{ state = 'installed_not_observed'; code = 'runtime_receipt_version_mismatch'; runtime_receipt_present = $true; target = $TargetDirectory }
+    $freshest = $null
+    foreach ($heartbeatFile in $heartbeatFiles) {
+        try { $heartbeat = Get-Content -LiteralPath $heartbeatFile.FullName -Raw | ConvertFrom-Json; $when = [DateTimeOffset]::Parse($heartbeat.timestamp) } catch { continue }
+        if ($heartbeat.session_id -and $heartbeat.mod_version -eq $manifest.version -and ($null -eq $freshest -or $when -gt $freshest.When)) {
+            $freshest = @{ When = $when; SessionId = $heartbeat.session_id }
+        }
     }
 
-    return @{ state = 'running'; code = 'runtime_receipt_present'; runtime_receipt_present = $true; target = $TargetDirectory }
+    if ($null -eq $freshest) {
+        return @{ state = 'installed_not_observed'; code = 'runtime_heartbeat_malformed_or_mismatched'; runtime_receipt_present = $false; target = $TargetDirectory }
+    }
+
+    if ($freshest.When -lt [DateTimeOffset]::UtcNow.AddSeconds(-30)) {
+        return @{ state = 'installed_not_observed'; code = 'runtime_heartbeat_stale'; runtime_receipt_present = $false; target = $TargetDirectory; session_id = $freshest.SessionId }
+    }
+
+    return @{ state = 'running'; code = 'runtime_heartbeat_fresh'; runtime_receipt_present = $false; target = $TargetDirectory; session_id = $freshest.SessionId }
 }
 
 try {
@@ -151,8 +192,8 @@ try {
         exit 0
     }
 
-    $state = Install-DDAIStatusBridge -SourceDirectory $sourceDirectory -TargetDirectory $targetDirectory
-    Write-Result @{ state = $state; target = $targetDirectory; unique_id = 'org.ddai.status_bridge'; changed_only = 'DDAI-owned mod files' }
+    $install = Install-DDAIStatusBridge -SourceDirectory $sourceDirectory -TargetDirectory $targetDirectory -BackupRoot (Join-Path $UserDataDirectory 'ddai\mod-backups')
+    Write-Result @{ state = $install.State; target = $targetDirectory; backup = $install.Backup; unique_id = 'org.ddai.status_bridge'; changed_only = 'DDAI-owned mod files' }
     exit 0
 }
 catch {

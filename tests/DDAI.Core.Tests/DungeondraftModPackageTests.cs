@@ -25,6 +25,12 @@ public sealed class DungeondraftModPackageTests
         Assert.Contains("user://ddai", script, StringComparison.Ordinal);
         Assert.Contains("unsupported_command", script, StringComparison.Ordinal);
         Assert.Contains("malformed_request", script, StringComparison.Ordinal);
+        Assert.Contains("_write_failed_record(claim, validation_error)", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("_can_correlate_failure", script, StringComparison.Ordinal);
+        Assert.Contains("request.payload == null", script, StringComparison.Ordinal);
+        Assert.Contains("_is_wire_timestamp", script, StringComparison.Ordinal);
+        Assert.Contains("runtime-heartbeats", script, StringComparison.Ordinal);
+        Assert.Contains("func _write_heartbeat():", script, StringComparison.Ordinal);
         Assert.DoesNotContain("TCPServer", script, StringComparison.Ordinal);
         Assert.DoesNotContain("HTTPClient", script, StringComparison.Ordinal);
         Assert.DoesNotContain("PacketPeer", script, StringComparison.Ordinal);

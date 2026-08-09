@@ -34,11 +34,65 @@ public sealed class DungeondraftModInstallerTests
 
         var diagnosis = RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory, diagnose: true);
 
-        Assert.Equal(0, diagnosis.ExitCode);
+        Assert.True(diagnosis.ExitCode == 0, $"Diagnosis failed: {diagnosis.StandardOutput} {diagnosis.StandardError}");
         var json = ReadJson(diagnosis.StandardOutput);
         Assert.Equal("installed_not_observed", json.GetProperty("state").GetString());
-        Assert.Equal("runtime_receipt_missing", json.GetProperty("code").GetString());
+        Assert.Equal("runtime_heartbeat_missing", json.GetProperty("code").GetString());
         Assert.False(json.GetProperty("runtime_receipt_present").GetBoolean());
+    }
+
+    [Fact]
+    public void Install_ReplacesOwnedTargetWhenAnUnexpectedScriptIsPresent()
+    {
+        using var sandbox = new InstallerSandbox();
+        Assert.Equal(0, RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory).ExitCode);
+        var unexpectedScript = Path.Combine(sandbox.ModsDirectory, "DDAI", "scripts", "unexpected.gd");
+        File.WriteAllText(unexpectedScript, "var script_class = \"tool\"");
+
+        var repair = RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory);
+
+        Assert.Equal(0, repair.ExitCode);
+        var json = ReadJson(repair.StandardOutput);
+        Assert.Equal("repaired", json.GetProperty("state").GetString());
+        Assert.False(File.Exists(unexpectedScript));
+        Assert.True(Directory.Exists(json.GetProperty("backup").GetString()!));
+    }
+
+    [Fact]
+    public void Diagnose_ReportsRunningOnlyForAFreshHeartbeatFromTheInstalledMod()
+    {
+        using var sandbox = new InstallerSandbox();
+        Assert.Equal(0, RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory).ExitCode);
+        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow, "0.1.0");
+
+        var diagnosis = RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory, diagnose: true);
+
+        Assert.True(diagnosis.ExitCode == 0, $"Diagnosis failed: {diagnosis.StandardOutput} {diagnosis.StandardError}");
+        var json = ReadJson(diagnosis.StandardOutput);
+        Assert.Equal("running", json.GetProperty("state").GetString());
+        Assert.Equal("runtime_heartbeat_fresh", json.GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public void Diagnose_DoesNotCallAStaleHeartbeatRunning()
+    {
+        using var sandbox = new InstallerSandbox();
+        Assert.Equal(0, RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory).ExitCode);
+        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow.AddMinutes(-2), "0.1.0");
+
+        var diagnosis = RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory, diagnose: true);
+
+        Assert.True(diagnosis.ExitCode == 0, $"Diagnosis failed: {diagnosis.StandardOutput} {diagnosis.StandardError}");
+        var json = ReadJson(diagnosis.StandardOutput);
+        Assert.Equal("installed_not_observed", json.GetProperty("state").GetString());
+        Assert.Equal("runtime_heartbeat_stale", json.GetProperty("code").GetString());
+    }
+
+    private static void WriteHeartbeat(string userDataDirectory, DateTimeOffset timestamp, string modVersion)
+    {
+        var heartbeatPath = Path.Combine(userDataDirectory, "ddai", "runtime-heartbeats", "test-session", "heartbeat.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(heartbeatPath)!);
+        File.WriteAllText(heartbeatPath, JsonSerializer.Serialize(new { session_id = "test-session", timestamp, mod_version = modVersion }));
     }
 
     private static ProcessResult RunInstaller(string repositoryRoot, string modsDirectory, string userDataDirectory, bool diagnose = false)
