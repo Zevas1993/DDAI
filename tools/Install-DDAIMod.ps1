@@ -149,7 +149,7 @@ function Get-Diagnosis {
     $heartbeatRoot = Join-Path $UserDirectory 'ddai\runtime-heartbeats'
     $heartbeatFiles = @()
     if (Test-Path -LiteralPath $heartbeatRoot -PathType Container) {
-        $heartbeatFiles = @(Get-ChildItem -LiteralPath $heartbeatRoot -Recurse -File -Filter '*.json')
+        $heartbeatFiles = @(Get-ChildItem -LiteralPath $heartbeatRoot -File -Filter '*.json' | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 8)
     }
     if ($heartbeatFiles.Count -eq 0) {
         return @{
@@ -164,7 +164,7 @@ function Get-Diagnosis {
     $freshest = $null
     foreach ($heartbeatFile in $heartbeatFiles) {
         try { $heartbeat = Get-Content -LiteralPath $heartbeatFile.FullName -Raw | ConvertFrom-Json; $when = [DateTimeOffset]::Parse($heartbeat.timestamp) } catch { continue }
-        if ($heartbeat.session_id -and $heartbeat.mod_version -eq $manifest.version -and ($null -eq $freshest -or $when -gt $freshest.When)) {
+        if ($heartbeat.session_id -and $heartbeat.mod_version -eq $manifest.version -and $when -le [DateTimeOffset]::UtcNow.AddSeconds(5) -and ($null -eq $freshest -or $when -gt $freshest.When)) {
             $freshest = @{ When = $when; SessionId = $heartbeat.session_id }
         }
     }

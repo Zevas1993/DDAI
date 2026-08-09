@@ -88,9 +88,20 @@ public sealed class DungeondraftModInstallerTests
         Assert.Equal("runtime_heartbeat_stale", json.GetProperty("code").GetString());
     }
 
+    [Fact]
+    public void Diagnose_DoesNotCallAFutureHeartbeatRunning()
+    {
+        using var sandbox = new InstallerSandbox();
+        Assert.Equal(0, RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory).ExitCode);
+        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow.AddMinutes(2), "0.1.0");
+        var diagnosis = RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory, diagnose: true);
+        Assert.True(diagnosis.ExitCode == 0, $"Diagnosis failed: {diagnosis.StandardOutput} {diagnosis.StandardError}");
+        Assert.Equal("installed_not_observed", ReadJson(diagnosis.StandardOutput).GetProperty("state").GetString());
+    }
+
     private static void WriteHeartbeat(string userDataDirectory, DateTimeOffset timestamp, string modVersion)
     {
-        var heartbeatPath = Path.Combine(userDataDirectory, "ddai", "runtime-heartbeats", "test-session", "heartbeat.json");
+        var heartbeatPath = Path.Combine(userDataDirectory, "ddai", "runtime-heartbeats", "test-session-heartbeat.json");
         Directory.CreateDirectory(Path.GetDirectoryName(heartbeatPath)!);
         File.WriteAllText(heartbeatPath, JsonSerializer.Serialize(new { session_id = "test-session", timestamp, mod_version = modVersion }));
     }

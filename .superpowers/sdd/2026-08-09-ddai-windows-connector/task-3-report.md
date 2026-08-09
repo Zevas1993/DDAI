@@ -44,3 +44,11 @@ The active Dungeondraft window is an unsaved `Tabula Rasa*` map. The newly insta
 - RED: four focused review tests failed against the original bridge/installer (canonical response path, fresh/stale heartbeat behavior, and target-only script). GREEN: focused static/integration tests passed 6/6; three real `AtomicMailbox` conformance cases cover filename mismatch, null payload, and invalid timestamp.
 - Final fix-round verification: Release tests passed `44/44`; Release build passed with `0` warnings/errors.
 - Reinstalled only `D:\DungeonDraft\Dungeondraft\mods\DDAI`; installer returned `state=repaired` with backup `C:\Users\ChrisBoyd\AppData\Roaming\Dungeondraft\ddai\mod-backups\DDAI-20260809T2220438229517-5b4e3dbd99d14140aeebaeb691c0338f`. Diagnostics now return `installed_not_observed` / `runtime_heartbeat_missing` until a normal UI reload occurs.
+
+## Fix round 2
+
+- Heartbeat elapsed time advances on every `update(delta)` call; the 10-second cadence is inside the 30-second diagnostic freshness window.
+- Response publication distinguishes `created`, verified byte-equivalent `idempotent`, and `response_conflict`; conflicts leave the preoccupied response untouched and move the claim to a structured failed record.
+- Heartbeats use a bounded flat set (maximum eight files). Diagnosis reads only the newest eight nonrecursive files and rejects timestamps more than five seconds in the future or older than 30 seconds.
+- RED tests covered timer ordering and future heartbeat misclassification; final Release tests passed `45/45` and the build had `0` warnings/errors.
+- Reinstalled only `D:\DungeonDraft\Dungeondraft\mods\DDAI` through staged owned-folder replacement; backup: `C:\Users\ChrisBoyd\AppData\Roaming\Dungeondraft\ddai\mod-backups\DDAI-20260809T2226479314321-c3753691c32e49f19bef31d9c2a6ea41`. Diagnosis remains `installed_not_observed` / `runtime_heartbeat_missing` pending a user-approved UI reload.

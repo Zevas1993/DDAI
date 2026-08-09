@@ -24,15 +24,15 @@ func start():
 
 # Called by Dungeondraft every frame. This is a filesystem poller, never a network listener.
 func update(delta):
+	_heartbeat_elapsed += delta
+	if _heartbeat_elapsed >= HEARTBEAT_INTERVAL_SECONDS:
+		_heartbeat_elapsed = 0.0
+		_write_heartbeat()
 	_poll_elapsed += delta
 	if _poll_elapsed < POLL_INTERVAL_SECONDS:
 		return
 	_poll_elapsed = 0.0
 	_process_one_request()
-	_heartbeat_elapsed += delta
-	if _heartbeat_elapsed >= HEARTBEAT_INTERVAL_SECONDS:
-		_heartbeat_elapsed = 0.0
-		_write_heartbeat()
 
 
 func _ensure_mailbox_directories():
@@ -66,14 +66,22 @@ func _process_one_request():
 		return
 
 	if request.command == "status":
-		_write_response(request.request_id, request.command, true, _status_payload(), {})
+		var status_result = _write_response(request.request_id, request.command, true, _status_payload(), {})
+		if status_result == "response_conflict":
+			_write_failed_record(claim, _error("response_conflict", "A non-equivalent response already occupies this request key.", "request_id"))
+			_remove_file(claim.path)
+			return
 	else:
-		_write_response(
+		var error_result = _write_response(
 			request.request_id,
 			request.command,
 			false,
 			{},
 			_error("unsupported_command", "This mod currently supports only the status command.", "command"))
+		if error_result == "response_conflict":
+			_write_failed_record(claim, _error("response_conflict", "A non-equivalent response already occupies this request key.", "request_id"))
+			_remove_file(claim.path)
+			return
 	_remove_file(claim.path)
 
 
@@ -236,12 +244,30 @@ func _write_runtime_receipt():
 
 
 func _write_heartbeat():
-	_write_json_atomically(MAILBOX_ROOT + "/runtime-heartbeats/" + _session_id + "/" + str(OS.get_unix_time()) + "-" + str(OS.get_ticks_msec()) + ".json", {
+	_write_json_atomically(MAILBOX_ROOT + "/runtime-heartbeats/" + _session_id + "-" + str(OS.get_unix_time()) + "-" + str(OS.get_ticks_msec()) + ".json", {
 		"schema_version": MAILBOX_SCHEMA_VERSION,
 		"session_id": _session_id,
 		"mod_version": MOD_VERSION,
 		"timestamp": _iso_timestamp(),
 	})
+	_prune_heartbeats()
+
+
+func _prune_heartbeats():
+	var directory = Directory.new()
+	if directory.open(MAILBOX_ROOT + "/runtime-heartbeats") != OK:
+		return
+	directory.list_dir_begin(true, true)
+	var files = []
+	var name = directory.get_next()
+	while name != "":
+		if not directory.current_is_dir() and name.ends_with(".json"):
+			files.append(name)
+		name = directory.get_next()
+	directory.list_dir_end()
+	files.sort()
+	while files.size() > 8:
+		directory.remove(MAILBOX_ROOT + "/runtime-heartbeats/" + files.pop_front())
 
 
 func _write_response(request_id, command, success, payload, error):
@@ -255,7 +281,21 @@ func _write_response(request_id, command, success, payload, error):
 	}
 	if not success:
 		response.error = error
-	_write_json_atomically(MAILBOX_ROOT + "/responses/" + request_id.sha256_text() + ".json", response)
+	var response_path = MAILBOX_ROOT + "/responses/" + request_id.sha256_text() + ".json"
+	var write_result = _write_json_atomically(response_path, response)
+	if write_result == "existing" and _response_matches(response_path, response):
+		return "idempotent"
+	if write_result == "created":
+		return "created"
+	return "response_conflict"
+
+
+func _response_matches(path, response):
+	var result = _read_bounded_text(path)
+	if not result.ok:
+		return false
+	var parsed = JSON.parse(result.text)
+	return parsed.error == OK and typeof(parsed.result) == TYPE_DICTIONARY and to_json(parsed.result) == to_json(response)
 
 
 func _write_failed_record(claim, error):
@@ -274,18 +314,18 @@ func _write_json_atomically(destination_path, payload):
 	var directory = Directory.new()
 	directory.make_dir_recursive(destination_path.get_base_dir())
 	if directory.file_exists(destination_path):
-		return true
+		return "existing"
 	var temporary_path = destination_path + "." + str(OS.get_ticks_msec()) + ".tmp"
 	var file = File.new()
 	if file.open(temporary_path, File.WRITE) != OK:
-		return false
+		return "write_failed"
 	file.store_string(to_json(payload))
 	file.flush()
 	file.close()
 	if directory.rename(temporary_path, destination_path) == OK:
-		return true
+		return "created"
 	directory.remove(temporary_path)
-	return false
+	return "write_failed"
 
 
 func _remove_file(path):
