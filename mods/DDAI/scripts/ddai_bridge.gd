@@ -47,43 +47,77 @@ func _process_one_request():
 	var claim = _claim_next_request()
 	if claim.empty():
 		return
+	_run_claim_state_machine(claim)
+
+
+func _run_claim_state_machine(claim):
+	# Each iteration crosses at most one durable boundary. Re-entry after any
+	# boundary follows the same route during ordinary polling and startup recovery.
+	for _step in range(5):
+		var transition = _advance_claim_state(claim)
+		if transition == "blocked" or transition == "no_work" or transition == "journal_deleted" or transition == "invalid_claim_failed":
+			return transition
+	return "bounded_transition_limit"
+
+
+func _advance_claim_state(claim):
+	var directory = Directory.new()
+	var key = claim.file_name.get_basename()
+	var journal_path = MAILBOX_ROOT + "/journal/" + claim.file_name
+	var response_path = MAILBOX_ROOT + "/responses/" + claim.file_name
+	if not directory.file_exists(claim.path):
+		return _cleanup_stale_journal(claim.file_name)
 
 	var read_result = _read_bounded_text(claim.path)
 	if not read_result.ok:
 		_write_failed_record(claim, read_result.error)
 		_remove_file(claim.path)
-		return
-
+		return "invalid_claim_failed"
 	var parsed = JSON.parse(read_result.text)
 	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
 		_write_failed_record(claim, _error("malformed_request", "Request JSON must contain an object envelope.", ""))
 		_remove_file(claim.path)
-		return
-
+		return "invalid_claim_failed"
 	var request = parsed.result
 	var validation_error = _validate_request(request, claim.file_name)
 	if not validation_error.empty():
 		_write_failed_record(claim, validation_error)
 		_remove_file(claim.path)
-		return
+		return "invalid_claim_failed"
 
-	if request.command == "status":
-		var status_result = _write_response(request.request_id, request.command, true, _status_payload(), {})
-		if status_result == "created" or status_result == "verified_idempotent":
-			_remove_file(claim.path)
-		else:
-			_write_failed_record(claim, _error(status_result, "Response publication did not complete; claim retained for recovery.", "request_id"))
-	else:
-		var error_result = _write_response(
-			request.request_id,
-			request.command,
-			false,
-			{},
-			_error("unsupported_command", "This mod currently supports only the status command.", "command"))
-		if error_result == "created" or error_result == "verified_idempotent":
-			_remove_file(claim.path)
-		else:
-			_write_failed_record(claim, _error(error_result, "Response publication did not complete; claim retained for recovery.", "request_id"))
+	var canonical_request_text = _canonical_request_text(request)
+	_reconcile_request_duplicate(claim.file_name, canonical_request_text)
+	var request_fingerprint = canonical_request_text.sha256_text()
+	if not directory.file_exists(journal_path):
+		var response = _prepare_response(request)
+		var response_text = to_json(response)
+		var journal_result = _write_json_atomically(journal_path, {
+			"schema_version": MAILBOX_SCHEMA_VERSION,
+			"request_id": request.request_id,
+			"request_fingerprint": request_fingerprint,
+			"response_text": response_text,
+		})
+		if journal_result == "created":
+			return "journal_created"
+		if journal_result != "existing":
+			_write_failed_record(claim, _error("journal_write_failed", "Prepared response journal could not be published; claim retained.", "request_id"))
+			return "blocked"
+
+	var journal_result = _read_validated_journal(journal_path, request, request_fingerprint)
+	if not journal_result.ok:
+		_move_to_unique_failed(journal_path, key, "invalid-journal")
+		return "invalid_journal_failed"
+	var journal = journal_result.journal
+	if not directory.file_exists(response_path):
+		if _write_text_atomically(response_path, journal.response_text) == "created":
+			return "response_published"
+		return "blocked"
+	if not _response_text_matches(response_path, journal.response_text):
+		_write_failed_record(claim, _error("response_conflict", "Existing response differs from the exact journaled response; claim retained.", "request_id"))
+		return "blocked"
+
+	_remove_file(claim.path)
+	return "claim_deleted"
 
 
 func _recover_processing_claims():
@@ -95,19 +129,18 @@ func _recover_processing_claims():
 	while file_name != "":
 		if not directory.current_is_dir() and file_name.ends_with(".json"):
 			var path = MAILBOX_ROOT + "/processing/" + file_name
-			var read_result = _read_bounded_text(path)
-			if not read_result.ok:
-				_write_failed_record({"file_name": file_name}, read_result.error)
-				_remove_file(path)
-			else:
-				var parsed = JSON.parse(read_result.text)
-				if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY or not _validate_request(parsed.result, file_name).empty():
-					_write_failed_record({"file_name": file_name}, _error("malformed_request", "Processing claim is invalid.", ""))
-					_remove_file(path)
-				else:
-					var request_path = MAILBOX_ROOT + "/requests/" + file_name
-					if not directory.file_exists(request_path):
-						directory.rename(path, request_path)
+			_run_claim_state_machine({"file_name": file_name, "path": path})
+		file_name = directory.get_next()
+	directory.list_dir_end()
+
+	# A crash after claim deletion leaves only journal + verified response.
+	if directory.open(MAILBOX_ROOT + "/journal") != OK:
+		return
+	directory.list_dir_begin(true, true)
+	file_name = directory.get_next()
+	while file_name != "":
+		if not directory.current_is_dir() and file_name.ends_with(".json"):
+			_cleanup_stale_journal(file_name)
 		file_name = directory.get_next()
 	directory.list_dir_end()
 
@@ -169,7 +202,11 @@ func _is_wire_timestamp(value):
 	elif zone_index >= 19 and value.length() - zone_index == 6 and value[zone_index + 3] == ":":
 		var zone_hour = value.substr(zone_index + 1, 2)
 		var zone_minute = value.substr(zone_index + 4, 2)
-		if not zone_hour.is_valid_integer() or not zone_minute.is_valid_integer() or int(zone_hour) > 23 or int(zone_minute) > 59:
+		if not zone_hour.is_valid_integer() or not zone_minute.is_valid_integer():
+			return false
+		var zone_hour_value = int(zone_hour)
+		var zone_minute_value = int(zone_minute)
+		if zone_hour_value > 14 or zone_minute_value > 59 or (zone_hour_value == 14 and zone_minute_value != 0):
 			return false
 		main = value.substr(0, zone_index)
 	else:
@@ -177,7 +214,7 @@ func _is_wire_timestamp(value):
 	var decimal_index = main.find(".")
 	if decimal_index != -1:
 		var fraction = main.substr(decimal_index + 1, main.length() - decimal_index - 1)
-		if fraction == "" or not fraction.is_valid_integer():
+		if fraction == "" or fraction.length() > 16 or not fraction.is_valid_integer():
 			return false
 		main = main.substr(0, decimal_index)
 	if main.length() != 19 or main[4] != "-" or main[7] != "-" or main[10] != "T" or main[13] != ":" or main[16] != ":":
@@ -202,6 +239,137 @@ func _days_in_month(year, month):
 
 func _is_safe_request_id(request_id):
 	return request_id.strip_edges() != "" and request_id.find("/") == -1 and request_id.find("\\") == -1 and request_id != "." and request_id != ".."
+
+
+func _canonical_request_text(request):
+	return to_json({
+		"schema_version": request.schema_version,
+		"request_id": request.request_id,
+		"command": request.command,
+		"timestamp": request.timestamp,
+		"payload": request.payload,
+	})
+
+
+func _reconcile_request_duplicate(file_name, canonical_processing_text):
+	var request_path = MAILBOX_ROOT + "/requests/" + file_name
+	var directory = Directory.new()
+	if not directory.file_exists(request_path):
+		return
+	var duplicate_read = _read_bounded_text(request_path)
+	if duplicate_read.ok:
+		var duplicate_parsed = JSON.parse(duplicate_read.text)
+		if duplicate_parsed.error == OK and typeof(duplicate_parsed.result) == TYPE_DICTIONARY:
+			var duplicate = duplicate_parsed.result
+			if _validate_request(duplicate, file_name).empty() and _canonical_request_text(duplicate) == canonical_processing_text:
+				_remove_file(request_path)
+				return
+	_move_to_unique_failed(request_path, file_name.get_basename(), "duplicate-conflict")
+
+
+func _prepare_response(request):
+	if request.command == "status":
+		return {
+			"schema_version": MAILBOX_SCHEMA_VERSION,
+			"request_id": request.request_id,
+			"command": request.command,
+			"timestamp": _iso_timestamp(),
+			"success": true,
+			"payload": _status_payload(),
+		}
+	return {
+		"schema_version": MAILBOX_SCHEMA_VERSION,
+		"request_id": request.request_id,
+		"command": request.command,
+		"timestamp": _iso_timestamp(),
+		"success": false,
+		"payload": {},
+		"error": _error("unsupported_command", "This mod currently supports only the status command.", "command"),
+	}
+
+
+func _read_validated_journal(path, request, expected_fingerprint):
+	var result = _read_journal_envelope(path)
+	if not result.ok:
+		return result
+	var journal = result.journal
+	if journal.request_id != request.request_id or journal.request_fingerprint != expected_fingerprint:
+		return {"ok": false}
+	var parsed_response = JSON.parse(journal.response_text)
+	if parsed_response.error != OK or typeof(parsed_response.result) != TYPE_DICTIONARY or not _validate_response(parsed_response.result, request.request_id, request.command):
+		return {"ok": false}
+	return result
+
+
+func _read_journal_envelope(path):
+	var read_result = _read_bounded_text(path)
+	if not read_result.ok:
+		return {"ok": false}
+	var parsed = JSON.parse(read_result.text)
+	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+		return {"ok": false}
+	var journal = parsed.result
+	if not journal.has("schema_version") or journal.schema_version != MAILBOX_SCHEMA_VERSION:
+		return {"ok": false}
+	if not journal.has("request_id") or typeof(journal.request_id) != TYPE_STRING or not _is_safe_request_id(journal.request_id):
+		return {"ok": false}
+	if not journal.has("request_fingerprint") or typeof(journal.request_fingerprint) != TYPE_STRING or journal.request_fingerprint.length() != 64:
+		return {"ok": false}
+	if not journal.has("response_text") or typeof(journal.response_text) != TYPE_STRING or journal.response_text == "" or journal.response_text.to_utf8().size() > MAXIMUM_MESSAGE_BYTES:
+		return {"ok": false}
+	return {"ok": true, "journal": journal}
+
+
+func _validate_response(response, expected_request_id, expected_command):
+	if not response.has("schema_version") or response.schema_version != MAILBOX_SCHEMA_VERSION:
+		return false
+	if not response.has("request_id") or response.request_id != expected_request_id:
+		return false
+	if not response.has("command") or typeof(response.command) != TYPE_STRING or response.command != expected_command or response.command.strip_edges() == "":
+		return false
+	if not response.has("timestamp") or typeof(response.timestamp) != TYPE_STRING or not _is_wire_timestamp(response.timestamp):
+		return false
+	if not response.has("success") or typeof(response.success) != TYPE_BOOL:
+		return false
+	if not response.has("payload") or response.payload == null:
+		return false
+	if response.success:
+		return not response.has("error")
+	return response.has("error") and typeof(response.error) == TYPE_DICTIONARY and response.error.has("code") and typeof(response.error.code) == TYPE_STRING and response.error.code.strip_edges() != "" and response.error.has("message") and typeof(response.error.message) == TYPE_STRING and response.error.message.strip_edges() != ""
+
+
+func _response_text_matches(path, expected_response_text):
+	var result = _read_bounded_text(path)
+	if not result.ok:
+		return false
+	if result.text == expected_response_text:
+		return true
+	var existing = JSON.parse(result.text)
+	var expected = JSON.parse(expected_response_text)
+	return existing.error == OK and expected.error == OK and typeof(existing.result) == TYPE_DICTIONARY and typeof(expected.result) == TYPE_DICTIONARY and to_json(existing.result) == to_json(expected.result)
+
+
+func _cleanup_stale_journal(file_name):
+	var journal_path = MAILBOX_ROOT + "/journal/" + file_name
+	var response_path = MAILBOX_ROOT + "/responses/" + file_name
+	var directory = Directory.new()
+	if not directory.file_exists(journal_path):
+		return "no_work"
+	var result = _read_journal_envelope(journal_path)
+	if not result.ok:
+		return "blocked"
+	var journal = result.journal
+	if journal.request_id.sha256_text() != file_name.get_basename() or not directory.file_exists(response_path):
+		return "blocked"
+	var response = JSON.parse(journal.response_text)
+	if response.error != OK or typeof(response.result) != TYPE_DICTIONARY or not response.result.has("command"):
+		return "blocked"
+	if not _validate_response(response.result, journal.request_id, response.result.command):
+		return "blocked"
+	if not _response_text_matches(response_path, journal.response_text):
+		return "blocked"
+	_remove_file(journal_path)
+	return "journal_deleted"
 
 
 func _status_payload():
@@ -282,36 +450,6 @@ func _write_heartbeat():
 	})
 
 
-func _write_response(request_id, command, success, payload, error):
-	var response = {
-		"schema_version": MAILBOX_SCHEMA_VERSION,
-		"request_id": request_id,
-		"command": command,
-		"timestamp": _iso_timestamp(),
-		"success": success,
-		"payload": payload,
-	}
-	if not success:
-		response.error = error
-	var response_path = MAILBOX_ROOT + "/responses/" + request_id.sha256_text() + ".json"
-	var write_result = _write_json_atomically(response_path, response)
-	if write_result == "existing" and _response_matches(response_path, response):
-		return "verified_idempotent"
-	if write_result == "created":
-		return "created"
-	if write_result == "write_failed":
-		return "write_failed"
-	return "response_conflict"
-
-
-func _response_matches(path, response):
-	var result = _read_bounded_text(path)
-	if not result.ok:
-		return false
-	var parsed = JSON.parse(result.text)
-	return parsed.error == OK and typeof(parsed.result) == TYPE_DICTIONARY and to_json(parsed.result) == to_json(response)
-
-
 func _write_failed_record(claim, error):
 	var safe_name = claim.file_name.get_basename()
 	var record = {
@@ -321,10 +459,14 @@ func _write_failed_record(claim, error):
 		"source_file": claim.file_name,
 		"error": error,
 	}
-	_write_json_atomically(MAILBOX_ROOT + "/failed/" + safe_name + "." + error.code + ".json", record)
+	_write_json_atomically(_unique_failed_path(safe_name, error.code), record)
 
 
 func _write_json_atomically(destination_path, payload):
+	return _write_text_atomically(destination_path, to_json(payload))
+
+
+func _write_text_atomically(destination_path, text):
 	var directory = Directory.new()
 	directory.make_dir_recursive(destination_path.get_base_dir())
 	if directory.file_exists(destination_path):
@@ -333,13 +475,32 @@ func _write_json_atomically(destination_path, payload):
 	var file = File.new()
 	if file.open(temporary_path, File.WRITE) != OK:
 		return "write_failed"
-	file.store_string(to_json(payload))
+	file.store_string(text)
 	file.flush()
 	file.close()
 	if directory.rename(temporary_path, destination_path) == OK:
 		return "created"
 	directory.remove(temporary_path)
 	return "write_failed"
+
+
+func _move_to_unique_failed(source_path, safe_name, reason):
+	var directory = Directory.new()
+	if not directory.file_exists(source_path):
+		return false
+	var destination = _unique_failed_path(safe_name, reason)
+	return directory.rename(source_path, destination) == OK
+
+
+func _unique_failed_path(safe_name, reason):
+	var directory = Directory.new()
+	var suffix = str(OS.get_unix_time()) + "-" + str(OS.get_ticks_msec())
+	var candidate = MAILBOX_ROOT + "/failed/" + safe_name + "." + reason + "." + suffix + ".json"
+	var collision = 0
+	while directory.file_exists(candidate):
+		collision += 1
+		candidate = MAILBOX_ROOT + "/failed/" + safe_name + "." + reason + "." + suffix + "-" + str(collision) + ".json"
+	return candidate
 
 
 func _remove_file(path):

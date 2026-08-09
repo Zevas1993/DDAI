@@ -149,7 +149,14 @@ function Get-Diagnosis {
     $heartbeatRoot = Join-Path $UserDirectory 'ddai\runtime-heartbeats'
     $heartbeatFiles = @()
     if (Test-Path -LiteralPath $heartbeatRoot -PathType Container) {
-        $heartbeatFiles = @(Get-ChildItem -LiteralPath $heartbeatRoot -File -Filter '*.json' | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 8)
+        # Diagnosis intentionally reads only the eight names emitted by the mod.
+        # Legacy, foreign, and attacker-created JSON files never enter the candidate set.
+        foreach ($slot in 0..7) {
+            $slotPath = Join-Path $heartbeatRoot ("heartbeat-slot-$slot.json")
+            if (Test-Path -LiteralPath $slotPath -PathType Leaf) {
+                $heartbeatFiles += Get-Item -LiteralPath $slotPath
+            }
+        }
     }
     if ($heartbeatFiles.Count -eq 0) {
         return @{
@@ -163,8 +170,19 @@ function Get-Diagnosis {
 
     $freshest = $null
     foreach ($heartbeatFile in $heartbeatFiles) {
-        try { $heartbeat = Get-Content -LiteralPath $heartbeatFile.FullName -Raw | ConvertFrom-Json; $when = [DateTimeOffset]::Parse($heartbeat.timestamp) } catch { continue }
-        if ($heartbeat.session_id -and $heartbeat.mod_version -eq $manifest.version -and $when -le [DateTimeOffset]::UtcNow.AddSeconds(5) -and ($null -eq $freshest -or $when -gt $freshest.When)) {
+        try { $heartbeat = Get-Content -LiteralPath $heartbeatFile.FullName -Raw | ConvertFrom-Json } catch { continue }
+        if ($heartbeat.schema_version -ne '1.0' -or -not $heartbeat.session_id -or $heartbeat.mod_version -ne $manifest.version) {
+            continue
+        }
+        $timestampText = [string]$heartbeat.timestamp
+        if ($timestampText -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?(?:Z|[+-]\d{2}:\d{2})$') {
+            continue
+        }
+        $when = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParse($timestampText, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$when)) {
+            continue
+        }
+        if ($when -le [DateTimeOffset]::UtcNow.AddSeconds(5) -and ($null -eq $freshest -or $when -gt $freshest.When)) {
             $freshest = @{ When = $when; SessionId = $heartbeat.session_id }
         }
     }

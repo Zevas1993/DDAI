@@ -99,11 +99,49 @@ public sealed class DungeondraftModInstallerTests
         Assert.Equal("installed_not_observed", ReadJson(diagnosis.StandardOutput).GetProperty("state").GetString());
     }
 
-    private static void WriteHeartbeat(string userDataDirectory, DateTimeOffset timestamp, string modVersion)
+    [Fact]
+    public void Diagnose_IgnoresUnlimitedLegacyFilesAndFindsFreshCanonicalSlot()
     {
-        var heartbeatPath = Path.Combine(userDataDirectory, "ddai", "runtime-heartbeats", "test-session-heartbeat.json");
+        using var sandbox = new InstallerSandbox();
+        Assert.Equal(0, RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory).ExitCode);
+        var heartbeatDirectory = Path.Combine(sandbox.UserDataDirectory, "ddai", "runtime-heartbeats");
+        Directory.CreateDirectory(heartbeatDirectory);
+        for (var index = 0; index < 32; index++)
+        {
+            var legacy = Path.Combine(heartbeatDirectory, $"legacy-attacker-{index:D2}.json");
+            File.WriteAllText(legacy, "{ malformed");
+            File.SetLastWriteTimeUtc(legacy, DateTime.UtcNow.AddMinutes(5));
+        }
+        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow, "0.1.0");
+
+        var diagnosis = RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory, diagnose: true);
+
+        Assert.True(diagnosis.ExitCode == 0, $"Diagnosis failed: {diagnosis.StandardOutput} {diagnosis.StandardError}");
+        var json = ReadJson(diagnosis.StandardOutput);
+        Assert.Equal("running", json.GetProperty("state").GetString());
+        Assert.Equal("runtime_heartbeat_fresh", json.GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public void Diagnose_RejectsCanonicalSlotWithMismatchedSchema()
+    {
+        using var sandbox = new InstallerSandbox();
+        Assert.Equal(0, RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory).ExitCode);
+        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow, "0.1.0", schemaVersion: "2.0");
+
+        var diagnosis = RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory, diagnose: true);
+
+        Assert.True(diagnosis.ExitCode == 0, $"Diagnosis failed: {diagnosis.StandardOutput} {diagnosis.StandardError}");
+        var json = ReadJson(diagnosis.StandardOutput);
+        Assert.Equal("installed_not_observed", json.GetProperty("state").GetString());
+        Assert.Equal("runtime_heartbeat_malformed_or_mismatched", json.GetProperty("code").GetString());
+    }
+
+    private static void WriteHeartbeat(string userDataDirectory, DateTimeOffset timestamp, string modVersion, string schemaVersion = "1.0")
+    {
+        var heartbeatPath = Path.Combine(userDataDirectory, "ddai", "runtime-heartbeats", "heartbeat-slot-0.json");
         Directory.CreateDirectory(Path.GetDirectoryName(heartbeatPath)!);
-        File.WriteAllText(heartbeatPath, JsonSerializer.Serialize(new { session_id = "test-session", timestamp, mod_version = modVersion }));
+        File.WriteAllText(heartbeatPath, JsonSerializer.Serialize(new { schema_version = schemaVersion, session_id = "test-session", timestamp, mod_version = modVersion }));
     }
 
     private static ProcessResult RunInstaller(string repositoryRoot, string modsDirectory, string userDataDirectory, bool diagnose = false)

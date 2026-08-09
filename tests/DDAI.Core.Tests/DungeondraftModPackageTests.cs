@@ -32,16 +32,59 @@ public sealed class DungeondraftModPackageTests
         Assert.Contains("runtime-heartbeats", script, StringComparison.Ordinal);
         Assert.Contains("func _write_heartbeat():", script, StringComparison.Ordinal);
         Assert.True(script.IndexOf("_heartbeat_elapsed += delta", StringComparison.Ordinal) < script.IndexOf("if _poll_elapsed < POLL_INTERVAL_SECONDS", StringComparison.Ordinal));
-        Assert.Contains("_response_matches", script, StringComparison.Ordinal);
+        Assert.Contains("_response_text_matches", script, StringComparison.Ordinal);
         Assert.Contains("response_conflict", script, StringComparison.Ordinal);
         Assert.DoesNotContain("func _prune_heartbeats():", script, StringComparison.Ordinal);
-        Assert.Contains("status_result == \"created\" or status_result == \"verified_idempotent\"", script, StringComparison.Ordinal);
+        Assert.Contains("func _prepare_response(request):", script, StringComparison.Ordinal);
         Assert.Contains("func _recover_processing_claims():", script, StringComparison.Ordinal);
         Assert.Contains("heartbeat-slot-", script, StringComparison.Ordinal);
         Assert.DoesNotContain("runtime-heartbeats/\" + _session_id + \"-\" + str(OS.get_unix_time())", script, StringComparison.Ordinal);
         Assert.DoesNotContain("TCPServer", script, StringComparison.Ordinal);
         Assert.DoesNotContain("HTTPClient", script, StringComparison.Ordinal);
         Assert.DoesNotContain("PacketPeer", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Gdscript_RoutesPollingAndStartupRecoveryThroughJournaledStateMachine()
+    {
+        var scriptPath = Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd");
+        var script = File.ReadAllText(scriptPath);
+        var processBody = FunctionBody(script, "_process_one_request");
+        var recoveryBody = FunctionBody(script, "_recover_processing_claims");
+        var advanceBody = FunctionBody(script, "_advance_claim_state");
+
+        Assert.Contains("_run_claim_state_machine(claim)", processBody, StringComparison.Ordinal);
+        Assert.Contains("_run_claim_state_machine({\"file_name\": file_name, \"path\": path})", recoveryBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("directory.rename(path, request_path)", recoveryBody, StringComparison.Ordinal);
+        Assert.Contains("_reconcile_request_duplicate", advanceBody, StringComparison.Ordinal);
+        Assert.Contains("request_fingerprint", advanceBody, StringComparison.Ordinal);
+        Assert.Contains("response_text", advanceBody, StringComparison.Ordinal);
+        Assert.Contains("_write_text_atomically(response_path, journal.response_text)", advanceBody, StringComparison.Ordinal);
+        Assert.Contains("_response_text_matches(response_path, journal.response_text)", advanceBody, StringComparison.Ordinal);
+        Assert.True(
+            advanceBody.IndexOf("_response_text_matches(response_path, journal.response_text)", StringComparison.Ordinal) <
+            advanceBody.LastIndexOf("_remove_file(claim.path)", StringComparison.Ordinal),
+            "The processing claim may only be removed after the exact journaled response is verified.");
+    }
+
+    [Fact]
+    public void Gdscript_TimestampValidatorCapsOffsetsAtFourteenHours()
+    {
+        var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
+        var validator = FunctionBody(script, "_is_wire_timestamp");
+
+        Assert.Contains("zone_hour_value > 14", validator, StringComparison.Ordinal);
+        Assert.Contains("zone_hour_value == 14 and zone_minute_value != 0", validator, StringComparison.Ordinal);
+        Assert.Contains("fraction.length() > 16", validator, StringComparison.Ordinal);
+    }
+
+    private static string FunctionBody(string script, string functionName)
+    {
+        var marker = "func " + functionName + "(";
+        var start = script.IndexOf(marker, StringComparison.Ordinal);
+        Assert.True(start >= 0, $"Expected GDScript function {functionName}.");
+        var next = script.IndexOf("\nfunc ", start + marker.Length, StringComparison.Ordinal);
+        return next < 0 ? script[start..] : script[start..next];
     }
 
     private static string FindRepositoryRoot()

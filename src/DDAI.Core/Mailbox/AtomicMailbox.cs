@@ -56,7 +56,6 @@ public sealed class AtomicMailbox
             return false;
         }
 
-        WriteAtomically(_journalDirectory, key, new JournalEntry(request.RequestId, "published", request.Timestamp));
         return true;
     }
 
@@ -154,7 +153,6 @@ public sealed class AtomicMailbox
             WriteAtomically(_responsesDirectory, key, response);
         }
 
-        WriteJournalIfAbsent(key + ".response", new JournalEntry(response.RequestId, "responded", response.Timestamp));
         File.Delete(expectedProcessingPath);
     }
 
@@ -400,23 +398,6 @@ public sealed class AtomicMailbox
         return Encoding.UTF8.GetString(bytes);
     }
 
-    private void WriteJournalIfAbsent(string key, JournalEntry entry)
-    {
-        var path = MessagePath(_journalDirectory, key);
-        if (File.Exists(path))
-        {
-            return;
-        }
-
-        try
-        {
-            WriteAtomically(_journalDirectory, key, entry);
-        }
-        catch (IOException) when (File.Exists(path))
-        {
-        }
-    }
-
     private static void WriteAtomically<T>(string directory, string key, T message)
     {
         var destination = MessagePath(directory, key);
@@ -445,6 +426,4 @@ public sealed class AtomicMailbox
         var failedName = $"{Path.GetFileNameWithoutExtension(sourcePath)}.{reason}.{Guid.NewGuid():N}.json";
         File.Move(sourcePath, Path.Combine(_failedDirectory, failedName), overwrite: false);
     }
-
-    private sealed record JournalEntry(string RequestId, string State, DateTimeOffset Timestamp);
 }
