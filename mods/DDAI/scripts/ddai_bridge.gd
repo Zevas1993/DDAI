@@ -200,6 +200,7 @@ func _is_wire_timestamp(value):
 		zone_index = value.rfind("-")
 	var main = value
 	var zone_kind = "local"
+	var zone_sign = 0
 	var zone_hour_value = 0
 	var zone_minute_value = 0
 	if value.ends_with("Z"):
@@ -211,6 +212,7 @@ func _is_wire_timestamp(value):
 		if not zone_hour.is_valid_integer() or not zone_minute.is_valid_integer():
 			return false
 		zone_kind = "explicit"
+		zone_sign = 1 if value[zone_index] == "+" else -1
 		zone_hour_value = int(zone_hour)
 		zone_minute_value = int(zone_minute)
 		if zone_hour_value > 14 or zone_minute_value > 59 or (zone_hour_value == 14 and zone_minute_value != 0):
@@ -222,7 +224,9 @@ func _is_wire_timestamp(value):
 		var fraction = main.substr(decimal_index + 1, main.length() - decimal_index - 1)
 		if fraction == "" or fraction.length() > 16 or not fraction.is_valid_integer():
 			return false
-		fraction_nonzero = int(fraction) != 0
+		# DateTimeOffset precision is 100 ns; System.Text.Json accepts additional
+		# digits but they do not move the represented value past the first 7.
+		fraction_nonzero = int(fraction.substr(0, min(7, fraction.length()))) != 0
 		main = main.substr(0, decimal_index)
 	if main.length() != 19 or main[4] != "-" or main[7] != "-" or main[10] != "T" or main[13] != ":" or main[16] != ":":
 		return false
@@ -235,10 +239,28 @@ func _is_wire_timestamp(value):
 	var hour = int(main.substr(11, 2))
 	var minute = int(main.substr(14, 2))
 	var second = int(main.substr(17, 2))
-	var is_minimum_value = year == 1 and month == 1 and day == 1 and hour == 0 and minute == 0 and second == 0 and not fraction_nonzero
-	if is_minimum_value and zone_kind != "local" and zone_hour_value == 0 and zone_minute_value == 0:
+	var calendar_valid = year >= 1 and month >= 1 and month <= 12 and day >= 1 and day <= _days_in_month(year, month) and hour <= 23 and minute <= 59 and second <= 59
+	if not calendar_valid:
 		return false
-	return year >= 1 and month >= 1 and month <= 12 and day >= 1 and day <= _days_in_month(year, month) and hour <= 23 and minute <= 59 and second <= 59
+	# System.Text.Json accepts timezone-less values using the local offset. Keep
+	# that canonical behavior; only explicit offsets need deterministic UTC bounds.
+	if zone_kind == "local":
+		return true
+	var local_seconds = hour * 3600 + minute * 60 + second
+	var offset_seconds = zone_hour_value * 3600 + zone_minute_value * 60
+	var minimum_date = year == 1 and month == 1 and day == 1
+	if minimum_date:
+		if zone_kind == "utc" and local_seconds == 0 and not fraction_nonzero:
+			return false
+		if zone_kind == "explicit" and zone_sign >= 0:
+			if local_seconds < offset_seconds:
+				return false
+			if local_seconds == offset_seconds and not fraction_nonzero:
+				return false
+	var maximum_date = year == 9999 and month == 12 and day == 31
+	if maximum_date and zone_kind == "explicit" and zone_sign < 0 and local_seconds + offset_seconds >= 86400:
+		return false
+	return true
 
 
 func _days_in_month(year, month):

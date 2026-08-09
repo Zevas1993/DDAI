@@ -76,8 +76,15 @@ public sealed class DungeondraftModPackageTests
         Assert.Contains("zone_hour_value > 14", validator, StringComparison.Ordinal);
         Assert.Contains("zone_hour_value == 14 and zone_minute_value != 0", validator, StringComparison.Ordinal);
         Assert.Contains("fraction.length() > 16", validator, StringComparison.Ordinal);
+        Assert.Contains("fraction.substr(0, min(7, fraction.length()))", validator, StringComparison.Ordinal);
         Assert.Contains("zone_kind = \"local\"", validator, StringComparison.Ordinal);
-        Assert.Contains("is_minimum_value and zone_kind != \"local\" and zone_hour_value == 0 and zone_minute_value == 0", validator, StringComparison.Ordinal);
+        Assert.Contains("var zone_sign = 0", validator, StringComparison.Ordinal);
+        Assert.Contains("var local_seconds = hour * 3600 + minute * 60 + second", validator, StringComparison.Ordinal);
+        Assert.Contains("var offset_seconds = zone_hour_value * 3600 + zone_minute_value * 60", validator, StringComparison.Ordinal);
+        Assert.Contains("local_seconds < offset_seconds", validator, StringComparison.Ordinal);
+        Assert.Contains("local_seconds == offset_seconds and not fraction_nonzero", validator, StringComparison.Ordinal);
+        Assert.Contains("local_seconds + offset_seconds >= 86400", validator, StringComparison.Ordinal);
+        Assert.Contains("if zone_kind == \"local\"", validator, StringComparison.Ordinal);
     }
 
     [Fact]
