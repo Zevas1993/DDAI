@@ -18,16 +18,9 @@ public enum BridgeTransition
 
 public static class BridgeWireJson
 {
-    public static JsonSerializerOptions Options { get; } = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-        WriteIndented = false,
-    };
+    public static JsonSerializerOptions Options => MailboxWireJson.Options;
 
-    public static JsonSerializerOptions OptionsIndented { get; } = new(Options)
-    {
-        WriteIndented = true,
-    };
+    public static JsonSerializerOptions OptionsIndented => MailboxWireJson.OptionsIndented;
 }
 
 /// <summary>
@@ -229,7 +222,7 @@ public sealed class DungeondraftBridgeStateMachine
         }
 
         ArgumentException.ThrowIfNullOrWhiteSpace(request.Command);
-        if (request.Timestamp == default)
+        if (!WireTimestampJsonConverter.IsValid(request.Timestamp))
         {
             throw new ArgumentException("Request timestamp is required.");
         }
@@ -268,7 +261,7 @@ public sealed class DungeondraftBridgeStateMachine
             if (!StringComparer.Ordinal.Equals(response.SchemaVersion, MailboxRequest.CurrentSchemaVersion) ||
                 !StringComparer.Ordinal.Equals(response.RequestId, expectedRequestId) ||
                 string.IsNullOrWhiteSpace(response.Command) ||
-                response.Timestamp == default ||
+                !WireTimestampJsonConverter.IsValid(response.Timestamp) ||
                 response.Payload.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined ||
                 (response.Success && response.Error is not null) ||
                 (!response.Success && (response.Error is null || string.IsNullOrWhiteSpace(response.Error.Code) || string.IsNullOrWhiteSpace(response.Error.Message))))

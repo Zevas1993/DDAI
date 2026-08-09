@@ -195,23 +195,20 @@ func _validate_request(request, file_name):
 
 
 func _is_wire_timestamp(value):
-	var zone_index = value.rfind("+")
-	if zone_index < 19:
-		zone_index = value.rfind("-")
-	var main = value
-	var zone_kind = "local"
+	if value.length() < 20:
+		return false
+	var zone_index = value.length() - 1
 	var zone_sign = 0
 	var zone_hour_value = 0
 	var zone_minute_value = 0
-	if value.ends_with("Z"):
-		zone_kind = "utc"
-		main = value.substr(0, value.length() - 1)
-	elif zone_index >= 16 and (value.length() - zone_index == 3 or (value.length() - zone_index == 6 and value[zone_index + 3] == ":")):
+	if not value.ends_with("Z"):
+		zone_index = value.length() - 6
+		if zone_index < 19 or (value[zone_index] != "+" and value[zone_index] != "-") or value[zone_index + 3] != ":":
+			return false
 		var zone_hour = value.substr(zone_index + 1, 2)
-		var zone_minute = "00" if value.length() - zone_index == 3 else value.substr(zone_index + 4, 2)
+		var zone_minute = value.substr(zone_index + 4, 2)
 		if not _is_ascii_decimal_digits(zone_hour) or not _is_ascii_decimal_digits(zone_minute):
 			return false
-		zone_kind = "explicit"
 		zone_sign = 1 if value[zone_index] == "+" else -1
 		zone_hour_value = int(zone_hour)
 		zone_minute_value = int(zone_minute)
@@ -219,24 +216,18 @@ func _is_wire_timestamp(value):
 			return false
 		if zone_hour_value == 0 and zone_minute_value == 0:
 			zone_sign = 0
-		main = value.substr(0, zone_index)
+	var main = value.substr(0, zone_index)
 	var decimal_index = main.find(".")
 	var fraction_nonzero = false
 	if decimal_index != -1:
 		var fraction = main.substr(decimal_index + 1, main.length() - decimal_index - 1)
-		if fraction == "" or fraction.length() > 16 or not _is_ascii_decimal_digits(fraction):
+		if fraction == "" or fraction.length() > 7 or not _is_ascii_decimal_digits(fraction):
 			return false
-		# DateTimeOffset precision is 100 ns; System.Text.Json accepts additional
-		# digits but they do not move the represented value past the first 7.
-		fraction_nonzero = int(fraction.substr(0, min(7, fraction.length()))) != 0
+		fraction_nonzero = int(fraction) != 0
 		main = main.substr(0, decimal_index)
-	if main.length() != 16 and main.length() != 19:
+	if main.length() != 19:
 		return false
-	if main[4] != "-" or main[7] != "-" or main[10] != "T" or main[13] != ":":
-		return false
-	if main.length() == 16:
-		main += ":00"
-	elif main[16] != ":":
+	if main[4] != "-" or main[7] != "-" or main[10] != "T" or main[13] != ":" or main[16] != ":":
 		return false
 	var digits = main.substr(0, 4) + main.substr(5, 2) + main.substr(8, 2) + main.substr(11, 2) + main.substr(14, 2) + main.substr(17, 2)
 	if not _is_ascii_decimal_digits(digits):
@@ -250,23 +241,16 @@ func _is_wire_timestamp(value):
 	var calendar_valid = year >= 1 and month >= 1 and month <= 12 and day >= 1 and day <= _days_in_month(year, month) and hour <= 23 and minute <= 59 and second <= 59
 	if not calendar_valid:
 		return false
-	# System.Text.Json accepts timezone-less values using the local offset. Keep
-	# that canonical behavior; only explicit offsets need deterministic UTC bounds.
-	if zone_kind == "local":
-		return true
 	var local_seconds = hour * 3600 + minute * 60 + second
 	var offset_seconds = zone_hour_value * 3600 + zone_minute_value * 60
 	var minimum_date = year == 1 and month == 1 and day == 1
-	if minimum_date:
-		if zone_kind == "utc" and local_seconds == 0 and not fraction_nonzero:
+	if minimum_date and zone_sign >= 0:
+		if local_seconds < offset_seconds:
 			return false
-		if zone_kind == "explicit" and zone_sign >= 0:
-			if local_seconds < offset_seconds:
-				return false
-			if local_seconds == offset_seconds and not fraction_nonzero:
-				return false
+		if local_seconds == offset_seconds and not fraction_nonzero:
+			return false
 	var maximum_date = year == 9999 and month == 12 and day == 31
-	if maximum_date and zone_kind == "explicit" and zone_sign < 0 and local_seconds + offset_seconds >= 86400:
+	if maximum_date and zone_sign < 0 and local_seconds + offset_seconds >= 86400:
 		return false
 	return true
 

@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 
 using DDAI.Core.Mailbox;
 
@@ -8,87 +9,21 @@ namespace DDAI.Core.Tests;
 public sealed class MailboxBridgeConformanceTests
 {
     [Theory]
-    [InlineData("0001-01-01T00:00:00Z", false)]
-    [InlineData("0001-01-01T00:00:00+00:00", false)]
-    [InlineData("0001-01-01T00:00:00-00:00", false)]
-    [InlineData("0001-01-01T00:00:00+01:00", false)]
-    [InlineData("0001-01-01T00:00:00-01:00", true)]
-    [InlineData("0001-01-01T01:00:00+01:00", false)]
-    [InlineData("0001-01-01T01:00:00.0000001+01:00", true)]
-    [InlineData("0001-01-01T01:00:00.00000001+01:00", false)]
-    [InlineData("0001-01-01T14:00:00+14:00", false)]
-    [InlineData("0001-01-01T14:00:00.0000001+14:00", true)]
-    [InlineData("0001-01-01T14:00:00.0000000000000001+14:00", false)]
-    [InlineData("2026-08-09T12:00:00-04:00", true)]
-    [InlineData("2026-08-09T12:00:00+14:00", true)]
-    [InlineData("2026-08-09T12:00:00+14:01", false)]
-    [InlineData("9999-12-31T23:59:59-01:00", false)]
-    [InlineData("9999-12-31T23:59:59+01:00", true)]
-    [InlineData("9999-12-31T23:59:59.9999999+00:00", true)]
-    [InlineData("9999-12-31T23:59:59.9999999-00:00", true)]
-    [InlineData("9999-12-31T22:59:59.9999999-01:00", true)]
-    [InlineData("9999-12-31T23:00:00-01:00", false)]
-    [InlineData("9999-12-31T09:59:59.9999999-14:00", true)]
-    [InlineData("9999-12-31T10:00:00-14:00", false)]
-    [InlineData("2026-02-30T12:00:00Z", false)]
-    // These raw envelopes document the actual System.Text.Json/AtomicMailbox
-    // result that the GDScript validator must mirror exactly.
-    [InlineData("2026-08-09T12:00:00.1234567", true)]
-    [InlineData("2026-08-09T12:00:00.1234567Z", true)]
-    [InlineData("2026-08-09T12:00:00.1234567+14:00", true)]
-    [InlineData("2026-08-09T12:00:00.1234567-00:00", true)]
-    [InlineData("2026-08-09T12:00:00++1:00", false)]
-    [InlineData("2026-08-09T12:00:00-+1:00", false)]
-    [InlineData("2026-08-09T12:00:00+-1:00", false)]
-    [InlineData("2026-08-09T12:00:00--1:00", false)]
-    [InlineData("2026-08-09T12:00:00+0+1:00", false)]
-    [InlineData("2026-08-09T12:00:00+00:+1", false)]
-    [InlineData("2026-08-09T12:00:00+ 1:00", false)]
-    [InlineData("2026-08-09T12:00:00+١٢:00", false)]
-    [InlineData("2026-08-09T12:00:00+01: 0", false)]
-    [InlineData("2026-08-09T12:00:00+01:٠٠", false)]
-    [InlineData("2026-08-09T12:00:00.+1Z", false)]
-    [InlineData("2026-08-09T12:00:00.-1Z", false)]
-    [InlineData("+026-08-09T12:00:00Z", false)]
-    [InlineData(" 026-08-09T12:00:00Z", false)]
-    [InlineData("٢٠٢٦-08-09T12:00:00Z", false)]
-    [InlineData("2026-+8-09T12:00:00Z", false)]
-    [InlineData("2026- 8-09T12:00:00Z", false)]
-    [InlineData("2026-٠٨-09T12:00:00Z", false)]
-    [InlineData("2026-08-+9T12:00:00Z", false)]
-    [InlineData("2026-08- 9T12:00:00Z", false)]
-    [InlineData("2026-08-٠٩T12:00:00Z", false)]
-    [InlineData("2026-08-09T+2:00:00Z", false)]
-    [InlineData("2026-08-09T 2:00:00Z", false)]
-    [InlineData("2026-08-09T١٢:00:00Z", false)]
-    [InlineData("2026-08-09T12:+0:00Z", false)]
-    [InlineData("2026-08-09T12: 0:00Z", false)]
-    [InlineData("2026-08-09T12:٠٠:00Z", false)]
-    [InlineData("2026-08-09T12:00:+0Z", false)]
-    [InlineData("2026-08-09T12:00: 0Z", false)]
-    [InlineData("2026-08-09T12:00:٠٠Z", false)]
-    [InlineData("2026-08-09T12:00:00.+123Z", false)]
-    [InlineData("2026-08-09T12:00:00. 123Z", false)]
-    [InlineData("2026-08-09T12:00:00.١٢٣Z", false)]
-    [InlineData("2026-08-09T12:00:00", true)]
-    [InlineData("2026-08-09T12:00:00Z", true)]
-    [InlineData("2026-08-09T12:00:00+00:00", true)]
-    [InlineData("2026-08-09T12:00:00-00:00", true)]
-    [InlineData("2026-08-09T12:00:00-14:00", true)]
-    [InlineData("2026-08-09T12:00:00.1+01:30", true)]
-    [InlineData("2026-08-09T12:00:00+01", true)]
-    [InlineData("2026-08-09T12:00:00+01:", false)]
-    [InlineData("2026-08-09T12:00:00+01:0", false)]
-    [InlineData("2026-08-09T12:00:00+01:000", false)]
-    [InlineData("2026-08-09T12:00:00.", false)]
-    [InlineData("2026-08-09T12:00:00..1Z", false)]
-    [InlineData("2026-08-09T12:00:00Z+00:00", false)]
-    [InlineData("2026-08-09T12:00Z", true)]
-    [InlineData("2026-08-09T12:00:00:00Z", false)]
-    [InlineData("2026-08-09TT12:00:00Z", false)]
-    [InlineData("2026-08--09T12:00:00Z", false)]
-    [InlineData("2026/08/09T12:00:00Z", false)]
-    public void RawTimestampTruthTable_MatchesAtomicMailboxSystemTextJsonBehavior(string timestamp, bool accepted)
+    [InlineData("2026-08-09T12:00:00Z", "\"2026-08-09T12:00:00+00:00\"")]
+    [InlineData("2026-08-09T12:00:00.1234000+05:30", "\"2026-08-09T12:00:00.1234+05:30\"")]
+    [InlineData("2026-08-09T12:00:00-00:00", "\"2026-08-09T12:00:00+00:00\"")]
+    public void WireSerialization_UsesDeterministicExplicitOffsetForm(string input, string expectedJson)
+    {
+        var value = DateTimeOffset.Parse(input, System.Globalization.CultureInfo.InvariantCulture);
+
+        var json = JsonSerializer.Serialize(value, BridgeWireJson.Options);
+
+        Assert.Equal(expectedJson, json);
+    }
+
+    [Theory]
+    [MemberData(nameof(WireTimestampContractCases.All), MemberType = typeof(WireTimestampContractCases))]
+    public void RawTimestampContract_IsEnforcedByAtomicMailbox(string timestamp, bool accepted)
     {
         var root = Path.Combine(Path.GetTempPath(), "ddai-timestamp-truth-tests", Guid.NewGuid().ToString("N"));
         try
@@ -139,4 +74,126 @@ public sealed class MailboxBridgeConformanceTests
             }
         }
     }
+
+    [Fact]
+    public void AtomicMailbox_RejectsNoncanonicalRawResponseTimestamp()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "ddai-response-timestamp-tests", Guid.NewGuid().ToString("N"));
+        try
+        {
+            const string requestId = "response-timestamp-contract";
+            var mailbox = new AtomicMailbox(root);
+            var request = MailboxRequest.CreateStatus(requestId, DateTimeOffset.Parse("2026-08-09T12:00:00Z"));
+            Assert.True(mailbox.PublishRequest(request));
+            var claim = Assert.IsType<ClaimedMailboxRequest>(mailbox.ClaimNextRequest());
+            mailbox.PublishResponse(claim, new MailboxResponse
+            {
+                SchemaVersion = MailboxRequest.CurrentSchemaVersion,
+                RequestId = requestId,
+                Command = "status",
+                Timestamp = DateTimeOffset.Parse("2026-08-09T12:00:01Z"),
+                Success = true,
+                Payload = JsonSerializer.SerializeToElement(new { state = "ready" }),
+            });
+            var responsePath = Assert.Single(Directory.EnumerateFiles(Path.Combine(root, "responses"), "*.json"));
+            File.WriteAllText(
+                responsePath,
+                $"{{\"schema_version\":\"1.0\",\"request_id\":\"{requestId}\",\"command\":\"status\",\"timestamp\":\"2026-08-09\",\"success\":true,\"payload\":{{\"state\":\"ready\"}}}}");
+
+            Assert.Throws<JsonException>(() => mailbox.WaitForResponse(requestId, TimeSpan.FromMilliseconds(100)));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+}
+
+public static class WireTimestampContractCases
+{
+    public static TheoryData<string, bool> All { get; } = new()
+    {
+        { "2026-08-09T12:00:00Z", true },
+        { "2026-08-09T12:00:00+00:00", true },
+        { "2026-08-09T12:00:00-00:00", true },
+        { "2026-08-09T12:00:00+14:00", true },
+        { "2026-08-09T12:00:00-14:00", true },
+        { "2026-08-09T12:00:00.1+01:30", true },
+        { "2026-08-09T12:00:00.1234567Z", true },
+        { "2024-02-29T23:59:59.9999999-04:00", true },
+        { "0001-01-01T00:00:00.0000001Z", true },
+        { "0001-01-01T00:00:00-01:00", true },
+        { "0001-01-01T01:00:00.0000001+01:00", true },
+        { "0001-01-01T14:00:00.0000001+14:00", true },
+        { "9999-12-31T23:59:59+01:00", true },
+        { "9999-12-31T23:59:59.9999999+00:00", true },
+        { "9999-12-31T23:59:59.9999999-00:00", true },
+        { "9999-12-31T22:59:59.9999999-01:00", true },
+        { "9999-12-31T09:59:59.9999999-14:00", true },
+
+        { "2026-08-09", false },
+        { "2026-08-09T12:00", false },
+        { "2026-08-09T12:00Z", false },
+        { "2026-08-09T12:00:00", false },
+        { "2026-08-09T12:00:00.1234567", false },
+        { "2026-08-09T12:00:00+01", false },
+        { "2026-08-09T12:00:00z", false },
+        { "2026-08-09T12:00:00.12345678Z", false },
+        { "2026-08-09T12:00:00+14:01", false },
+        { "2026-08-09T12:00:00+15:00", false },
+        { "2026-08-09T12:00:00+01:60", false },
+        { "2026-02-29T12:00:00Z", false },
+        { "2026-02-30T12:00:00Z", false },
+        { "0000-01-01T12:00:00Z", false },
+        { "2026-13-09T12:00:00Z", false },
+        { "2026-08-09T24:00:00Z", false },
+        { "2026-08-09T12:60:00Z", false },
+        { "2026-08-09T12:00:60Z", false },
+        { "0001-01-01T00:00:00Z", false },
+        { "0001-01-01T00:00:00+00:00", false },
+        { "0001-01-01T00:00:00-00:00", false },
+        { "0001-01-01T00:00:00+01:00", false },
+        { "0001-01-01T01:00:00+01:00", false },
+        { "0001-01-01T14:00:00+14:00", false },
+        { "9999-12-31T23:59:59-01:00", false },
+        { "9999-12-31T23:00:00-01:00", false },
+        { "9999-12-31T10:00:00-14:00", false },
+
+        { "+026-08-09T12:00:00Z", false },
+        { "2026-+8-09T12:00:00Z", false },
+        { "2026-08-+9T12:00:00Z", false },
+        { "2026-08-09T+2:00:00Z", false },
+        { "2026-08-09T12:+0:00Z", false },
+        { "2026-08-09T12:00:+0Z", false },
+        { "2026-08-09T12:00:00.+123Z", false },
+        { "2026-08-09T12:00:00++1:00", false },
+        { "2026-08-09T12:00:00+0+1:00", false },
+        { "2026-08-09T12:00:00+00:+1", false },
+        { "٢٠٢٦-08-09T12:00:00Z", false },
+        { "2026-٠٨-09T12:00:00Z", false },
+        { "2026-08-٠٩T12:00:00Z", false },
+        { "2026-08-09T١٢:00:00Z", false },
+        { "2026-08-09T12:٠٠:00Z", false },
+        { "2026-08-09T12:00:٠٠Z", false },
+        { "2026-08-09T12:00:00.١٢٣Z", false },
+        { "2026-08-09T12:00:00+١٢:00", false },
+        { "2026-08-09T12:00:00+01:٠٠", false },
+        { " 2026-08-09T12:00:00Z", false },
+        { "2026-08-09T12:00:00Z ", false },
+        { "2026-08-09T12:00: 0Z", false },
+        { "2026-08-09T12:00:00+ 1:00", false },
+        { "2026-08-09T12:00:00+01: 0", false },
+        { "2026/08/09T12:00:00Z", false },
+        { "2026-08--09T12:00:00Z", false },
+        { "2026-08-09TT12:00:00Z", false },
+        { "2026-08-09T12:00:00.", false },
+        { "2026-08-09T12:00:00..1Z", false },
+        { "2026-08-09T12:00:00Z+00:00", false },
+        { "2026-08-09T12:00:00+01:", false },
+        { "2026-08-09T12:00:00+01:0", false },
+        { "2026-08-09T12:00:00+01:000", false },
+    };
 }

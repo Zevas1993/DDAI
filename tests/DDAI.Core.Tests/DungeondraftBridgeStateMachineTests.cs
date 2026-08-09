@@ -172,18 +172,8 @@ public sealed class DungeondraftBridgeStateMachineTests
     }
 
     [Theory]
-    [InlineData("2026-08-09T12:00:00+14:00", true)]
-    [InlineData("2026-08-09T12:00:00+14:01", false)]
-    [InlineData("2026-02-30T12:00:00Z", false)]
-    [InlineData("2026-08-09T12:00:00.1234567890123456Z", true)]
-    [InlineData("2026-08-09T12:00:00.12345678901234567Z", false)]
-    [InlineData("2026-08-09T12:00:00++1:00", false)]
-    [InlineData("2026-08-09T12:00:00-+1:00", false)]
-    [InlineData("2026-08-09T12:00:00.+1Z", false)]
-    [InlineData("2026-08-09T12:00:00.-1Z", false)]
-    [InlineData("2026-08-09T12:00:00+0+1:00", false)]
-    [InlineData("2026-08-09T12:00:00+00:+1", false)]
-    public void RequestValidation_MatchesCanonicalDateTimeOffsetRules(string timestamp, bool accepted)
+    [MemberData(nameof(WireTimestampContractCases.All), MemberType = typeof(WireTimestampContractCases))]
+    public void RequestValidation_MatchesCanonicalWireTimestampContract(string timestamp, bool accepted)
     {
         using var sandbox = new RawBridgeSandbox("timestamp-validation", RequestJson("timestamp-validation", "status", timestamp));
         var bridge = new DungeondraftBridgeStateMachine(

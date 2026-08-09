@@ -9,11 +9,7 @@ public sealed class AtomicMailbox
 {
     public const long MaximumMessageBytes = 1024 * 1024;
 
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-        WriteIndented = false,
-    };
+    private static readonly JsonSerializerOptions JsonOptions = MailboxWireJson.Options;
 
     private readonly string _requestsDirectory;
     private readonly string _processingDirectory;
@@ -237,7 +233,7 @@ public sealed class AtomicMailbox
         ValidateRequestId(request.RequestId, nameof(request));
 
         ArgumentException.ThrowIfNullOrWhiteSpace(request.Command);
-        if (request.Timestamp == default)
+        if (!WireTimestampJsonConverter.IsValid(request.Timestamp))
         {
             throw new ArgumentException("Request timestamp is required.", nameof(request));
         }
@@ -257,7 +253,7 @@ public sealed class AtomicMailbox
 
         ValidateRequestId(response.RequestId, nameof(response));
         ArgumentException.ThrowIfNullOrWhiteSpace(response.Command);
-        if (response.Timestamp == default)
+        if (!WireTimestampJsonConverter.IsValid(response.Timestamp))
         {
             throw new ArgumentException("Response timestamp is required.", nameof(response));
         }

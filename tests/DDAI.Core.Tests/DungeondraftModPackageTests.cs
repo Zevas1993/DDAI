@@ -68,16 +68,16 @@ public sealed class DungeondraftModPackageTests
     }
 
     [Fact]
-    public void Gdscript_TimestampValidatorCapsOffsetsAtFourteenHours()
+    public void Gdscript_TimestampValidatorEnforcesCanonicalWireLanguageAndUtcBounds()
     {
         var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
         var validator = FunctionBody(script, "_is_wire_timestamp");
 
         Assert.Contains("zone_hour_value > 14", validator, StringComparison.Ordinal);
         Assert.Contains("zone_hour_value == 14 and zone_minute_value != 0", validator, StringComparison.Ordinal);
-        Assert.Contains("fraction.length() > 16", validator, StringComparison.Ordinal);
-        Assert.Contains("fraction.substr(0, min(7, fraction.length()))", validator, StringComparison.Ordinal);
-        Assert.Contains("zone_kind = \"local\"", validator, StringComparison.Ordinal);
+        Assert.Contains("fraction.length() > 7", validator, StringComparison.Ordinal);
+        Assert.DoesNotContain("fraction.substr(0, min(7, fraction.length()))", validator, StringComparison.Ordinal);
+        Assert.DoesNotContain("zone_kind = \"local\"", validator, StringComparison.Ordinal);
         Assert.Contains("var zone_sign = 0", validator, StringComparison.Ordinal);
         Assert.Contains("if zone_hour_value == 0 and zone_minute_value == 0:", validator, StringComparison.Ordinal);
         Assert.Contains("zone_sign = 0", validator[validator.IndexOf("if zone_hour_value == 0 and zone_minute_value == 0:", StringComparison.Ordinal)..], StringComparison.Ordinal);
@@ -86,7 +86,7 @@ public sealed class DungeondraftModPackageTests
         Assert.Contains("local_seconds < offset_seconds", validator, StringComparison.Ordinal);
         Assert.Contains("local_seconds == offset_seconds and not fraction_nonzero", validator, StringComparison.Ordinal);
         Assert.Contains("local_seconds + offset_seconds >= 86400", validator, StringComparison.Ordinal);
-        Assert.Contains("if zone_kind == \"local\"", validator, StringComparison.Ordinal);
+        Assert.DoesNotContain("if zone_kind == \"local\"", validator, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -101,15 +101,15 @@ public sealed class DungeondraftModPackageTests
         Assert.Contains("_is_ascii_decimal_digits(zone_minute)", validator, StringComparison.Ordinal);
         Assert.Contains("_is_ascii_decimal_digits(fraction)", validator, StringComparison.Ordinal);
         Assert.Contains("_is_ascii_decimal_digits(digits)", validator, StringComparison.Ordinal);
-        Assert.Contains("value.length() - zone_index == 3", validator, StringComparison.Ordinal);
-        Assert.Contains("zone_minute = \"00\"", validator, StringComparison.Ordinal);
-        Assert.Contains("main.length() != 16 and main.length() != 19", validator, StringComparison.Ordinal);
+        Assert.DoesNotContain("value.length() - zone_index == 3", validator, StringComparison.Ordinal);
+        Assert.DoesNotContain("zone_minute = \"00\"", validator, StringComparison.Ordinal);
+        Assert.Contains("main.length() != 19", validator, StringComparison.Ordinal);
         Assert.True(
             validator.IndexOf("_is_ascii_decimal_digits(zone_hour)", StringComparison.Ordinal) <
             validator.IndexOf("int(zone_hour)", StringComparison.Ordinal));
         Assert.True(
             validator.IndexOf("_is_ascii_decimal_digits(fraction)", StringComparison.Ordinal) <
-            validator.IndexOf("int(fraction.substr", StringComparison.Ordinal));
+            validator.IndexOf("int(fraction)", StringComparison.Ordinal));
         Assert.True(
             validator.IndexOf("_is_ascii_decimal_digits(digits)", StringComparison.Ordinal) <
             validator.IndexOf("int(main.substr(0, 4))", StringComparison.Ordinal));
