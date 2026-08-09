@@ -36,6 +36,17 @@ public sealed class AtomicMailboxTests
     }
 
     [Fact]
+    public void PublishRequest_RejectsDefaultTimestamp()
+    {
+        using var sandbox = new MailboxSandbox();
+        var mailbox = new AtomicMailbox(sandbox.Root);
+        var request = MailboxRequest.CreateStatus("default-timestamp-001", DateTimeOffset.MinValue);
+
+        Assert.Throws<ArgumentException>(() => mailbox.PublishRequest(request));
+        Assert.Empty(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "requests")));
+    }
+
+    [Fact]
     public void ClaimNextRequest_IgnoresSameDirectoryTemporaryPartialWrite()
     {
         using var sandbox = new MailboxSandbox();
@@ -220,6 +231,21 @@ public sealed class AtomicMailboxTests
     }
 
     [Fact]
+    public void PublishResponse_RejectsCanonicalPathClaimWithSubstitutedCommand()
+    {
+        using var sandbox = new MailboxSandbox();
+        var mailbox = new AtomicMailbox(sandbox.Root);
+        mailbox.PublishRequest(MailboxRequest.CreateStatus("forged-canonical-001", Timestamp));
+        var genuineClaim = Assert.IsType<ClaimedMailboxRequest>(mailbox.ClaimNextRequest());
+        var forgedRequest = genuineClaim.Request with { Command = "forged-command" };
+        var forgedClaim = new ClaimedMailboxRequest(forgedRequest, genuineClaim.ProcessingPath);
+
+        Assert.Throws<ArgumentException>(() => mailbox.PublishResponse(forgedClaim, SuccessResponse(forgedRequest, "ready")));
+        Assert.True(File.Exists(genuineClaim.ProcessingPath));
+        Assert.Empty(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "responses")));
+    }
+
+    [Fact]
     public void PublishResponse_RejectsSuccessResponseWithStructuredError()
     {
         using var sandbox = new MailboxSandbox();
@@ -243,6 +269,19 @@ public sealed class AtomicMailboxTests
         mailbox.PublishRequest(MailboxRequest.CreateStatus("response-schema-001", Timestamp));
         var claim = Assert.IsType<ClaimedMailboxRequest>(mailbox.ClaimNextRequest());
         var invalid = SuccessResponse(claim.Request, "ready") with { SchemaVersion = "2.0" };
+
+        Assert.Throws<ArgumentException>(() => mailbox.PublishResponse(claim, invalid));
+        Assert.Empty(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "responses")));
+    }
+
+    [Fact]
+    public void PublishResponse_RejectsDefaultTimestamp()
+    {
+        using var sandbox = new MailboxSandbox();
+        var mailbox = new AtomicMailbox(sandbox.Root);
+        mailbox.PublishRequest(MailboxRequest.CreateStatus("response-default-timestamp-001", Timestamp));
+        var claim = Assert.IsType<ClaimedMailboxRequest>(mailbox.ClaimNextRequest());
+        var invalid = SuccessResponse(claim.Request, "ready") with { Timestamp = DateTimeOffset.MinValue };
 
         Assert.Throws<ArgumentException>(() => mailbox.PublishResponse(claim, invalid));
         Assert.Empty(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "responses")));

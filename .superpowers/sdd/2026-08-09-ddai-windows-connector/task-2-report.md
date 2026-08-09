@@ -55,3 +55,13 @@ Final verification for this round:
 
 - `dotnet test DDAI.slnx -c Release --no-restore` — 32 passed, 0 failed, 0 skipped.
 - `dotnet build DDAI.slnx -c Release --no-restore` — succeeded with 0 warnings and 0 errors.
+
+## Review fix round 2
+
+Claims are now authenticated against the persisted processing envelope before any response write or processing-file deletion. A public `ClaimedMailboxRequest` must have the canonical path and a wire-equivalent request envelope; a substituted command, timestamp, or payload cannot replace the genuine claim.
+
+Request timestamps now reject `DateTimeOffset.MinValue`, matching the existing required response-timestamp invariant. Regression coverage also confirms default response timestamps remain rejected.
+
+Red-green evidence: before the fix, the canonical-path substituted-command claim and default request timestamp tests both failed because publication/deletion proceeded. After the minimal changes, the focused timestamp/claim suite passed 3/3. Final Release verification passed 35/35 tests with a warning-free build.
+
+Review round 2 commit: `fix: authenticate persisted mailbox claims` (the commit containing this report update).

@@ -123,6 +123,14 @@ public sealed class AtomicMailbox
             throw new InvalidOperationException("Claim is no longer present in the mailbox processing directory.");
         }
 
+        var persistedRequest = ReadValidatedRequest(expectedProcessingPath);
+        if (!StringComparer.Ordinal.Equals(
+                JsonSerializer.Serialize(persistedRequest, JsonOptions),
+                JsonSerializer.Serialize(claim.Request, JsonOptions)))
+        {
+            throw new ArgumentException("Claim request does not match the persisted processing envelope.", nameof(claim));
+        }
+
         ValidateResponse(response);
         if (!StringComparer.Ordinal.Equals(claim.Request.RequestId, response.RequestId) ||
             !StringComparer.Ordinal.Equals(claim.Request.Command, response.Command))
@@ -231,6 +239,11 @@ public sealed class AtomicMailbox
         ValidateRequestId(request.RequestId, nameof(request));
 
         ArgumentException.ThrowIfNullOrWhiteSpace(request.Command);
+        if (request.Timestamp == default)
+        {
+            throw new ArgumentException("Request timestamp is required.", nameof(request));
+        }
+
         if (request.Payload.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
         {
             throw new ArgumentException("Request payload is required.", nameof(request));
@@ -304,6 +317,21 @@ public sealed class AtomicMailbox
         catch (ArgumentException exception)
         {
             throw new JsonException("Response envelope is invalid.", exception);
+        }
+    }
+
+    private static MailboxRequest ReadValidatedRequest(string path)
+    {
+        try
+        {
+            var request = JsonSerializer.Deserialize<MailboxRequest>(ReadBoundedText(path), JsonOptions)
+                ?? throw new JsonException("Request JSON cannot be null.");
+            ValidateRequest(request);
+            return request;
+        }
+        catch (ArgumentException exception)
+        {
+            throw new JsonException("Request envelope is invalid.", exception);
         }
     }
 
