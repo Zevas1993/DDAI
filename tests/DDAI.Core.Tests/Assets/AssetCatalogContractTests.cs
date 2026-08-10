@@ -56,9 +56,20 @@ public sealed class AssetCatalogContractTests
 
         var noncanonical = canonical with { PackId = "  PＡＣＫ Café  " };
         Assert.Throws<JsonException>(() => AssetCatalogJson.SerializeChunk([noncanonical]));
+    }
 
-        var invalidWire = JsonSerializer.Serialize(new[] { noncanonical });
-        Assert.Throws<JsonException>(() => AssetCatalogJson.DeserializeChunk(invalidWire));
+    [Fact]
+    public void DeserializeChunk_RejectsNoncanonicalPackIdFromOtherwiseValidSnakeCaseWire()
+    {
+        var validWire = AssetCatalogJson.SerializeChunk([ValidEntry()]);
+        const string CanonicalPackId = "\"pack_id\":\"official-pack\"";
+        const string NoncanonicalPackId = "\"pack_id\":\" Official-PACK \"";
+        var invalidWire = validWire.Replace(CanonicalPackId, NoncanonicalPackId, StringComparison.Ordinal);
+
+        Assert.Contains(CanonicalPackId, validWire, StringComparison.Ordinal);
+        Assert.Contains(NoncanonicalPackId, invalidWire, StringComparison.Ordinal);
+        var exception = Assert.Throws<JsonException>(() => AssetCatalogJson.DeserializeChunk(invalidWire));
+        Assert.Contains("Pack id must use Unicode Form KC", exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]
