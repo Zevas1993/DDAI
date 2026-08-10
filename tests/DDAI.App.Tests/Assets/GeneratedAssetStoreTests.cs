@@ -502,6 +502,9 @@ public sealed class GeneratedAssetStoreTests
     {
         using var sandbox = new GeneratedAssetSandbox();
         var gatePath = Path.Combine(sandbox.Root, "crash-start.gate");
+        var durableBoundaryPath = Path.Combine(sandbox.Root, "owner-manifest-durable.ready");
+        var retainedHandlePath = Path.Combine(sandbox.Root, "waiter-mutex-open.ready");
+        var allowOwnerCrashPath = Path.Combine(sandbox.Root, "parent-allows-owner-crash.ready");
         File.WriteAllBytes(gatePath, []);
         using var crashed = StartChildImport(
             sandbox.Root,
@@ -509,22 +512,47 @@ public sealed class GeneratedAssetStoreTests
             1,
             gatePath,
             "crash",
-            GeneratedAssetDurableMove.Manifest.ToString());
+            GeneratedAssetDurableMove.Manifest.ToString(),
+            durableBoundaryPath,
+            retainedHandlePath,
+            allowOwnerCrashPath);
+
+        Assert.True(SpinWait.SpinUntil(
+            () => File.Exists(durableBoundaryPath) || crashed.Process.HasExited,
+            TimeSpan.FromSeconds(30)), "The crash owner did not reach the manifest durability boundary.");
+        Assert.False(crashed.Process.HasExited, "The crash owner exited before a second process retained the mutex object.");
+        Assert.Single(Directory.EnumerateFiles(
+            Path.Combine(sandbox.Root, "generated-assets", "manifest"),
+            "*.json"));
+
+        var waiter = StartChildImport(
+            sandbox.Root,
+            "cross-process-crash",
+            1,
+            gatePath,
+            "abandoned-waiter",
+            waitForAbandoned: true,
+            retainedHandlePath: retainedHandlePath);
+        Assert.True(SpinWait.SpinUntil(
+            () => File.Exists(retainedHandlePath) || waiter.Process.HasExited,
+            TimeSpan.FromSeconds(30)), "The recovery child did not open and retain the owner's mutex object.");
+        Assert.False(waiter.Process.HasExited, "The recovery child exited before the owner crash.");
+        File.WriteAllBytes(allowOwnerCrashPath, []);
 
         var crashResult = await CompleteChildProcessAsync(crashed);
         Assert.NotEqual(0, crashResult.ExitCode);
         Assert.Contains("Injected generated-asset child crash after Manifest.", crashResult.StandardError, StringComparison.Ordinal);
         Assert.False(File.Exists(crashed.ResultPath));
-        Assert.Single(Directory.EnumerateFiles(
-            Path.Combine(sandbox.Root, "generated-assets", "manifest"),
-            "*.json"));
 
-        var recovered = await CompleteChildImportAsync(StartChildImport(
-            sandbox.Root, "cross-process-crash", 1, gatePath, "recover"));
+        var recovered = await CompleteChildImportAsync(waiter);
+        Assert.True(File.Exists(sandbox.ReceiptPath("cross-process-crash")));
         var replay = await CompleteChildImportAsync(StartChildImport(
             sandbox.Root, "cross-process-crash", 1, gatePath, "replay"));
         Assert.True(recovered.Success, recovered.Code);
+        Assert.True(recovered.AbandonedObserved);
+        Assert.True(recovered.Duplicate);
         Assert.True(replay.Success, replay.Code);
+        Assert.False(replay.AbandonedObserved);
         Assert.Equal(recovered.GeneratedAssetId, replay.GeneratedAssetId);
         Assert.True(replay.Duplicate);
         Assert.Empty(Directory.EnumerateFiles(sandbox.Root, "*.next", SearchOption.AllDirectories));
@@ -548,23 +576,65 @@ public sealed class GeneratedAssetStoreTests
             Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_GRID") ?? "1",
             System.Globalization.CultureInfo.InvariantCulture);
         var crashMove = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_CRASH_MOVE");
+        var durableBoundaryPath = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_DURABLE_BOUNDARY");
+        var retainedHandlePath = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_RETAINED_MUTEX");
+        var allowOwnerCrashPath = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_ALLOW_CRASH");
+        var waitForAbandoned = string.Equals(
+            Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_WAIT_ABANDONED"),
+            "1",
+            StringComparison.Ordinal);
         File.WriteAllBytes(readyPath, []);
         Assert.True(SpinWait.SpinUntil(() => File.Exists(gatePath), TimeSpan.FromSeconds(30)));
 
+        var request = Request(key, CreatePng(64, 32)) with { GridWidth = gridWidth };
+        if (waitForAbandoned)
+        {
+            Assert.False(string.IsNullOrEmpty(retainedHandlePath));
+            var mutexMethod = typeof(GeneratedAssetStore).GetMethod(
+                "MutexName",
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            var mutexName = Assert.IsType<string>(mutexMethod!.Invoke(null, [Path.Combine(root, "generated-assets")]));
+            using var retainedMutex = Mutex.OpenExisting(mutexName);
+            File.WriteAllBytes(retainedHandlePath, []);
+            var entered = false;
+            var abandonedObserved = false;
+            try
+            {
+                try { entered = retainedMutex.WaitOne(TimeSpan.FromSeconds(30)); }
+                catch (AbandonedMutexException)
+                {
+                    entered = true;
+                    abandonedObserved = true;
+                }
+                Assert.True(entered, "The recovery child did not acquire the abandoned mutex.");
+                var recovered = ImportSynchronouslyWhileHoldingMutex(root, request);
+                File.WriteAllText(resultPath, JsonSerializer.Serialize(new ChildImportOutcome(
+                    true, recovered.Duplicate, recovered.GeneratedAssetId, null, abandonedObserved)));
+            }
+            finally
+            {
+                if (entered) retainedMutex.ReleaseMutex();
+            }
+            return;
+        }
+
         IGeneratedAssetDurability durability = crashMove is null
             ? GeneratedAssetDurability.Instance
-            : new FailFastAfterMove(Enum.Parse<GeneratedAssetDurableMove>(crashMove));
+            : new FailFastAfterMove(
+                Enum.Parse<GeneratedAssetDurableMove>(crashMove),
+                durableBoundaryPath,
+                retainedHandlePath,
+                allowOwnerCrashPath);
         try
         {
-            var result = await new GeneratedAssetStore(root, durability).ImportAsync(
-                Request(key, CreatePng(64, 32)) with { GridWidth = gridWidth });
+            var result = await new GeneratedAssetStore(root, durability).ImportAsync(request);
             File.WriteAllText(resultPath, JsonSerializer.Serialize(new ChildImportOutcome(
-                true, result.Duplicate, result.GeneratedAssetId, null)));
+                true, result.Duplicate, result.GeneratedAssetId, null, false)));
         }
         catch (GeneratedAssetImportException exception)
         {
             File.WriteAllText(resultPath, JsonSerializer.Serialize(new ChildImportOutcome(
-                false, false, null, exception.Code)));
+                false, false, null, exception.Code, false)));
         }
     }
 
@@ -941,7 +1011,11 @@ public sealed class GeneratedAssetStoreTests
         int gridWidth,
         string gatePath,
         string suffix,
-        string? crashMove = null)
+        string? crashMove = null,
+        string? durableBoundaryPath = null,
+        string? retainedHandlePath = null,
+        string? allowOwnerCrashPath = null,
+        bool waitForAbandoned = false)
     {
         var testAssembly = typeof(GeneratedAssetStoreTests).Assembly.Location;
         var resultPath = Path.Combine(root, "child-" + suffix + ".json");
@@ -964,6 +1038,10 @@ public sealed class GeneratedAssetStoreTests
         startInfo.Environment["DDAI_GENERATED_CHILD_KEY"] = key;
         startInfo.Environment["DDAI_GENERATED_CHILD_GRID"] = gridWidth.ToString(System.Globalization.CultureInfo.InvariantCulture);
         if (crashMove is not null) startInfo.Environment["DDAI_GENERATED_CHILD_CRASH_MOVE"] = crashMove;
+        if (durableBoundaryPath is not null) startInfo.Environment["DDAI_GENERATED_CHILD_DURABLE_BOUNDARY"] = durableBoundaryPath;
+        if (retainedHandlePath is not null) startInfo.Environment["DDAI_GENERATED_CHILD_RETAINED_MUTEX"] = retainedHandlePath;
+        if (allowOwnerCrashPath is not null) startInfo.Environment["DDAI_GENERATED_CHILD_ALLOW_CRASH"] = allowOwnerCrashPath;
+        if (waitForAbandoned) startInfo.Environment["DDAI_GENERATED_CHILD_WAIT_ABANDONED"] = "1";
         var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Could not start the generated-asset child process.");
         return new RunningChildImport(
             process,
@@ -991,6 +1069,11 @@ public sealed class GeneratedAssetStoreTests
         await child.Process.WaitForExitAsync(deadline.Token);
         return new ChildProcessResult(child.Process.ExitCode, await child.StandardOutput, await child.StandardError);
     }
+
+    private static GeneratedAssetImportResult ImportSynchronouslyWhileHoldingMutex(
+        string root,
+        GeneratedAssetImportRequest request) =>
+        new GeneratedAssetStore(root).ImportAsync(request).GetAwaiter().GetResult();
 
     private static void CreateDirectoryJunction(string linkPath, string targetPath)
     {
@@ -1140,11 +1223,27 @@ public sealed class GeneratedAssetStoreTests
         }
     }
 
-    private sealed class FailFastAfterMove(GeneratedAssetDurableMove target) : IGeneratedAssetDurability
+    private sealed class FailFastAfterMove(
+        GeneratedAssetDurableMove target,
+        string? durableBoundaryPath,
+        string? retainedHandlePath,
+        string? allowOwnerCrashPath) : IGeneratedAssetDurability
     {
         public void AfterDurableMove(GeneratedAssetDurableMove move)
         {
-            if (move == target) Environment.FailFast("Injected generated-asset child crash after " + move + ".");
+            if (move != target) return;
+            if (durableBoundaryPath is not null) File.WriteAllBytes(durableBoundaryPath, []);
+            if (retainedHandlePath is not null &&
+                !SpinWait.SpinUntil(() => File.Exists(retainedHandlePath), TimeSpan.FromSeconds(30)))
+            {
+                throw new TimeoutException("The recovery child did not retain the mutex before the injected crash.");
+            }
+            if (allowOwnerCrashPath is not null &&
+                !SpinWait.SpinUntil(() => File.Exists(allowOwnerCrashPath), TimeSpan.FromSeconds(30)))
+            {
+                throw new TimeoutException("The parent did not release the injected crash barrier.");
+            }
+            Environment.FailFast("Injected generated-asset child crash after " + move + ".");
         }
     }
 
@@ -1173,7 +1272,12 @@ public sealed class GeneratedAssetStoreTests
 
     private sealed class InjectedDurabilityException : IOException;
 
-    private sealed record ChildImportOutcome(bool Success, bool Duplicate, string? GeneratedAssetId, string? Code);
+    private sealed record ChildImportOutcome(
+        bool Success,
+        bool Duplicate,
+        string? GeneratedAssetId,
+        string? Code,
+        bool AbandonedObserved);
     private sealed record ChildProcessResult(int ExitCode, string StandardOutput, string StandardError);
 
     private sealed record RunningChildImport(
