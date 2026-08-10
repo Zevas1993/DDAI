@@ -1,5 +1,10 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
+using DDAI.App.Assets;
+using DDAI.Core.Assets;
 
 namespace DDAI.App.Tests;
 
@@ -108,6 +113,189 @@ public sealed class PublishedProtocolFailureTests : IClassFixture<PublishedExecu
             Directory.Delete(root, recursive: true);
         }
     }
+}
+
+[Collection("Published executable")]
+public sealed class PublishedAssetHelperSecurityTests : IClassFixture<PublishedExecutableFixture>
+{
+    private readonly PublishedExecutableFixture _fixture;
+
+    public PublishedAssetHelperSecurityTests(PublishedExecutableFixture fixture)
+    {
+        _fixture = fixture;
+    }
+
+    [Fact]
+    public void AssetHelper_ReplacementBetweenOuterCheckAndProcessStartFailsBeforeMailboxMutation()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "ddai-helper-start-race", Guid.NewGuid().ToString("N"));
+        var helperRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DDAI",
+            "helpers");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(helperRoot);
+        string? helperPath = null;
+        string? replacementPath = null;
+        try
+        {
+            var original = File.ReadAllBytes(_fixture.ExecutablePath).Concat("\nDDAI benign outer-check fixture A"u8.ToArray()).ToArray();
+            var replacement = File.ReadAllBytes(_fixture.ExecutablePath).Concat("\nDDAI benign self-check fixture B"u8.ToArray()).ToArray();
+            var expectedHash = Convert.ToHexString(SHA256.HashData(original)).ToLowerInvariant();
+            helperPath = Path.Combine(helperRoot, "ddai-" + expectedHash + ".exe");
+            replacementPath = helperPath + ".replacement-" + Guid.NewGuid().ToString("N");
+            File.WriteAllBytes(helperPath, original);
+
+            var mailbox = Path.Combine(root, "mailbox");
+            var requestId = Convert.ToHexString(SHA256.HashData(" Pack Café "u8)).ToLowerInvariant();
+            var requestPath = Path.Combine(mailbox, "private", "pack-normalization", "requests", requestId + ".json");
+            Directory.CreateDirectory(Path.GetDirectoryName(requestPath)!);
+            var requestBytes = JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                schema_version = "1.0",
+                request_id = requestId,
+                request_content_hash = AssetPackNormalizationService.ComputeRequestContentHash(requestId, " Pack Café "),
+                value = " Pack Café ",
+            });
+            File.WriteAllBytes(requestPath, requestBytes);
+            var receiptPath = Path.Combine(mailbox, "private", "asset-helper.json");
+            File.WriteAllText(receiptPath, JsonSerializer.Serialize(new
+            {
+                schema_version = "1.0",
+                owner = "org.ddai.connector",
+                executable_path = helperPath,
+                sha256 = expectedHash,
+            }));
+
+            // Model the outer launcher's successful content-address check, followed by a
+            // replacement before CreateProcess. Both files are runnable DDAI PE images.
+            Assert.Equal(expectedHash, Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(helperPath))).ToLowerInvariant());
+            File.WriteAllBytes(replacementPath, replacement);
+            File.Move(replacementPath, helperPath, overwrite: true);
+
+            var result = PublishedExecutableFixture.RunProcess(
+                helperPath,
+                root,
+                ["asset-helper", "--mailbox-root", mailbox]);
+
+            Assert.Equal(1, result.ExitCode);
+            Assert.Equal(requestBytes, File.ReadAllBytes(requestPath));
+            Assert.False(Directory.Exists(Path.Combine(mailbox, "private", "pack-normalization", "responses")));
+            Assert.False(File.Exists(Path.Combine(mailbox, "catalog", "current.json")));
+        }
+        finally
+        {
+            if (replacementPath is not null && File.Exists(replacementPath)) File.Delete(replacementPath);
+            if (helperPath is not null && File.Exists(helperPath)) File.Delete(helperPath);
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task AssetHelper_SeparateProcessesSerializeCatalogRevisionsThroughTheGlobalMutex()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "ddai-helper-cross-process", Guid.NewGuid().ToString("N"));
+        var helperRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DDAI",
+            "helpers");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(helperRoot);
+        string? helperPath = null;
+        try
+        {
+            var helperBytes = File.ReadAllBytes(_fixture.ExecutablePath).Concat("\nDDAI benign cross-process fixture"u8.ToArray()).ToArray();
+            var helperHash = Convert.ToHexString(SHA256.HashData(helperBytes)).ToLowerInvariant();
+            helperPath = Path.Combine(helperRoot, "ddai-" + helperHash + ".exe");
+            File.WriteAllBytes(helperPath, helperBytes);
+            var mailbox = Path.Combine(root, "mailbox");
+            Directory.CreateDirectory(Path.Combine(mailbox, "private"));
+            File.WriteAllText(Path.Combine(mailbox, "private", "asset-helper.json"), JsonSerializer.Serialize(new
+            {
+                schema_version = "1.0",
+                owner = "org.ddai.connector",
+                executable_path = helperPath,
+                sha256 = helperHash,
+            }));
+            var first = StageCatalogCandidate(mailbox, "cross-process-a", new string('1', 64));
+            var second = StageCatalogCandidate(mailbox, "cross-process-b", new string('2', 64));
+
+            using var start = new ManualResetEventSlim();
+            var firstProcess = Task.Run(() =>
+            {
+                start.Wait();
+                return PublishedExecutableFixture.RunProcess(helperPath, root, ["asset-helper", "--mailbox-root", mailbox]);
+            });
+            var secondProcess = Task.Run(() =>
+            {
+                start.Wait();
+                return PublishedExecutableFixture.RunProcess(helperPath, root, ["asset-helper", "--mailbox-root", mailbox]);
+            });
+            start.Set();
+            var results = await Task.WhenAll(firstProcess, secondProcess);
+
+            Assert.All(results, result => Assert.Equal(0, result.ExitCode));
+            var revisions = new[] { ReadResponseRevision(mailbox, first), ReadResponseRevision(mailbox, second) }.Order().ToArray();
+            Assert.True(revisions[1] > revisions[0]);
+            var repository = new AssetCatalogRepository(Path.Combine(mailbox, "catalog"), TimeProvider.System);
+            Assert.True(repository.TryRefresh());
+            Assert.Equal(revisions[1], repository.GetCurrent()!.Manifest.CatalogRevision);
+        }
+        finally
+        {
+            if (helperPath is not null && File.Exists(helperPath)) File.Delete(helperPath);
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static string StageCatalogCandidate(string mailbox, string sessionId, string assetHash)
+    {
+        var entry = new AssetCatalogEntry(
+            "sha256:" + assetHash, "Objects", "Fixture", assetHash, "pack", "Pack", ["Fixture"], [], null, true, false);
+        var chunkBytes = Encoding.UTF8.GetBytes(AssetCatalogJson.SerializeChunk([entry]));
+        var counts = AssetCategory.All.ToDictionary(
+            category => category,
+            category => category == "Objects" ? 1 : 0,
+            StringComparer.Ordinal);
+        var manifest = new AssetCatalogManifest(
+            "1.0",
+            sessionId,
+            0,
+            new string('0', 64),
+            DateTimeOffset.Parse("2026-08-10T12:00:00Z"),
+            true,
+            counts,
+            [new AssetCatalogChunk("chunk-0000.json", Hash(chunkBytes), 1, chunkBytes.Length)],
+            []);
+        manifest = manifest with { CatalogFingerprint = AssetCatalogJson.ComputeCatalogFingerprint(manifest) };
+        var manifestBytes = Encoding.UTF8.GetBytes(AssetCatalogJson.SerializeManifest(manifest));
+        var candidateFingerprint = Hash(manifestBytes);
+        var candidateRoot = Path.Combine(mailbox, "private", "catalog-commit", "candidates", candidateFingerprint);
+        Directory.CreateDirectory(candidateRoot);
+        File.WriteAllBytes(Path.Combine(candidateRoot, "chunk-0000.json"), chunkBytes);
+        File.WriteAllBytes(Path.Combine(candidateRoot, "manifest.json"), manifestBytes);
+        var requestBytes = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            schema_version = "1.0",
+            candidate_fingerprint = candidateFingerprint,
+            session_id = sessionId,
+            snapshot_at = manifest.SnapshotAt,
+        }, AssetCatalogJson.SerializerOptions);
+        var requestId = Hash(requestBytes);
+        var requests = Path.Combine(mailbox, "private", "catalog-commit", "requests");
+        Directory.CreateDirectory(requests);
+        File.WriteAllBytes(Path.Combine(requests, requestId + ".json"), requestBytes);
+        return requestId;
+    }
+
+    private static long ReadResponseRevision(string mailbox, string requestId)
+    {
+        using var response = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(
+            mailbox, "private", "catalog-commit", "responses", requestId + ".json")));
+        return response.RootElement.GetProperty("catalog_revision").GetInt64();
+    }
+
+    private static string Hash(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
 }
 
 public sealed class PublishedExecutableFixture : IDisposable

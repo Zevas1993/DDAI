@@ -178,10 +178,8 @@ public sealed class AssetCatalogRepository
         RequireBeneath(catalogRoot, pointerPath);
         RequireOrdinaryPath(catalogRoot, pointerPath);
         var pointer = ReadPointer(ReadBoundedText(pointerPath, AssetCatalogJson.MaximumJsonBytes));
-
-        var manifestPath = ResolveSnapshotPath(pointer.Manifest);
-        var manifest = AssetCatalogJson.DeserializeManifest(
-            ReadBoundedText(manifestPath, AssetCatalogJson.MaximumJsonBytes));
+        var accepted = ReadImmutableSnapshot(pointer.Manifest);
+        var manifest = accepted.Manifest;
         if (!manifest.Complete || !string.Equals(manifest.SessionId, pointer.SessionId, StringComparison.Ordinal))
         {
             throw new InvalidDataException("The catalog pointer does not identify a complete matching snapshot.");
@@ -190,6 +188,21 @@ public sealed class AssetCatalogRepository
         if (pointer.CatalogRevision is not null && pointer.CatalogRevision != manifest.CatalogRevision)
         {
             throw new InvalidDataException("The catalog pointer revision does not match its manifest.");
+        }
+
+        return accepted;
+    }
+
+    internal AcceptedAssetCatalog ReadImmutableSnapshot(string manifestRelativePath)
+    {
+        RequireExistingOrdinaryDirectory(catalogRoot, "Catalog root");
+        RequireExistingOrdinaryDirectory(snapshotsRoot, "Snapshots directory");
+        var manifestPath = ResolveSnapshotPath(manifestRelativePath);
+        var manifest = AssetCatalogJson.DeserializeManifest(
+            ReadBoundedText(manifestPath, AssetCatalogJson.MaximumJsonBytes));
+        if (!manifest.Complete)
+        {
+            throw new InvalidDataException("The immutable catalog snapshot is incomplete.");
         }
 
         var entries = new List<AssetCatalogEntry>();

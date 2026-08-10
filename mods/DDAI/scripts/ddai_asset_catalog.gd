@@ -546,24 +546,21 @@ func _advance_publishing_candidate_state():
 
 func _advance_catalog_commit_request_state():
 	if _commit_request_pending == null:
-		var framed = ""
-		framed += _framed_string("schema_version", CATALOG_SCHEMA_VERSION)
-		framed += _framed_string("session_id", _session_id)
-		framed += _framed_string("snapshot_at", _snapshot_at)
-		framed += _framed_string("candidate_fingerprint", _candidate_fingerprint)
-		_commit_request_hash = _sha256_text(framed)
-		_commit_request_id = _commit_request_hash
-		_commit_request_pending = {
+		var request = {
 			"schema_version": CATALOG_SCHEMA_VERSION,
-			"request_id": _commit_request_id,
-			"request_content_hash": _commit_request_hash,
 			"candidate_fingerprint": _candidate_fingerprint,
 			"session_id": _session_id,
 			"snapshot_at": _snapshot_at,
 		}
-	var payload = to_json(_commit_request_pending).to_utf8()
-	var request_path = _catalog_commit_root() + "/requests/" + _commit_request_id + ".json"
-	if _write_bytes_immutable_bound(request_path, payload, _sha256_bytes(payload), payload.size()) != "valid":
+		var payload = to_json(request).to_utf8()
+		_commit_request_hash = _sha256_bytes(payload)
+		_commit_request_id = _commit_request_hash
+		_commit_request_pending = {
+			"payload": payload,
+			"path": _catalog_commit_root() + "/requests/" + _commit_request_id + ".json",
+		}
+	var pending = _commit_request_pending
+	if _write_bytes_immutable_bound(pending.path, pending.payload, _commit_request_hash, pending.payload.size()) != "valid":
 		_record_error("catalog_commit_request_failed", "The catalog commit request could not be staged without a binding conflict.", null)
 		_state = "failed"
 		return
@@ -598,19 +595,90 @@ func _read_catalog_commit_response(request_id):
 		return {"ok": false, "terminal_error": "catalog_commit_response_invalid"}
 	if response.get("request_content_hash", "") != _commit_request_hash or response.get("candidate_fingerprint", "") != _candidate_fingerprint:
 		return {"ok": false, "terminal_error": "catalog_commit_response_invalid"}
+	if typeof(response.get("session_id", null)) != TYPE_STRING or response.session_id != _session_id:
+		return {"ok": false, "terminal_error": "catalog_commit_response_invalid"}
 	if typeof(response.get("success", null)) != TYPE_BOOL:
 		return {"ok": false, "terminal_error": "catalog_commit_response_invalid"}
 	if not response.success:
 		return {"ok": false, "terminal_error": str(response.get("error_code", "catalog_commit_failed"))}
+	if typeof(response.get("manifest_path", null)) != TYPE_STRING:
+		return {"ok": false, "terminal_error": "catalog_commit_response_invalid"}
 	var revision = response.get("catalog_revision", null)
 	var fingerprint = str(response.get("catalog_fingerprint", ""))
 	var slot_index = response.get("slot_index", null)
 	var state_token = str(response.get("state_token", ""))
 	if not _is_json_nonnegative_integer(revision) or not _is_sha256_value(fingerprint) or not _is_json_nonnegative_integer(slot_index) or int(slot_index) > 1:
 		return {"ok": false, "terminal_error": "catalog_commit_response_invalid"}
-	if not _is_sha256_value(state_token) or state_token != _sha256_text(str(int(revision)) + "\n" + fingerprint + "\n" + str(int(slot_index))):
+	var manifest_path = response.manifest_path
+	var expected_manifest_path = _session_id + "-" + str(int(revision)) + "-" + _candidate_fingerprint + "/" + MANIFEST_FILE_NAME
+	if manifest_path != expected_manifest_path:
 		return {"ok": false, "terminal_error": "catalog_commit_response_invalid"}
+	if not _is_sha256_value(state_token) or state_token != _catalog_commit_state_token(manifest_path, int(revision), fingerprint, int(slot_index)):
+		return {"ok": false, "terminal_error": "catalog_commit_response_invalid"}
+
+	# A private response is only a receipt. Bind it to the independently readable public
+	# pointer, selected slot, and immutable manifest before exposing the published state.
+	var canonical = _read_bounded_dictionary(catalog_root + "/current.json", MAX_NORMALIZATION_BYTES)
+	if canonical == null or canonical.get("session_id", null) != _session_id or canonical.get("manifest", null) != manifest_path:
+		return {"ok": false, "terminal_error": "catalog_commit_public_state_invalid"}
+	var slot = _read_bounded_dictionary(catalog_root + "/current-slot-" + str(int(slot_index)) + ".json", MAX_NORMALIZATION_BYTES)
+	if slot == null or slot.get("session_id", null) != _session_id or slot.get("manifest", null) != manifest_path:
+		return {"ok": false, "terminal_error": "catalog_commit_public_state_invalid"}
+	if not _is_json_nonnegative_integer(slot.get("catalog_revision", null)) or int(slot.catalog_revision) != int(revision):
+		return {"ok": false, "terminal_error": "catalog_commit_public_state_invalid"}
+	var manifest = _read_bounded_dictionary(catalog_root + "/snapshots/" + manifest_path, MAX_MANIFEST_BYTES)
+	if not _published_manifest_has_safe_shape(manifest, int(revision), fingerprint):
+		return {"ok": false, "terminal_error": "catalog_commit_public_state_invalid"}
+	var fingerprint_manifest = manifest.duplicate(true)
+	fingerprint_manifest.snapshot_at = _snapshot_at
+	if _catalog_fingerprint(fingerprint_manifest) != fingerprint:
+		return {"ok": false, "terminal_error": "catalog_commit_public_state_invalid"}
 	return {"ok": true, "catalog_revision": int(revision)}
+
+
+func _catalog_commit_state_token(manifest_path, revision, fingerprint, slot_index):
+	return _sha256_text(
+		_commit_request_hash + "\n" + _candidate_fingerprint + "\n" + _session_id + "\n" +
+		manifest_path + "\n" + str(int(revision)) + "\n" + fingerprint + "\n" + str(int(slot_index)))
+
+
+func _published_manifest_has_safe_shape(manifest, revision, fingerprint):
+	if typeof(manifest) != TYPE_DICTIONARY or manifest.size() != 9:
+		return false
+	if manifest.get("schema_version", null) != CATALOG_SCHEMA_VERSION or manifest.get("session_id", null) != _session_id:
+		return false
+	if not _is_json_nonnegative_integer(manifest.get("catalog_revision", null)) or int(manifest.catalog_revision) != revision:
+		return false
+	if manifest.get("catalog_fingerprint", null) != fingerprint or typeof(manifest.get("snapshot_at", null)) != TYPE_STRING:
+		return false
+	var serialized_snapshot_at = _snapshot_at.replace(".0000000+00:00", "+00:00")
+	if manifest.snapshot_at != _snapshot_at and manifest.snapshot_at != serialized_snapshot_at:
+		return false
+	if typeof(manifest.get("complete", null)) != TYPE_BOOL or not manifest.complete:
+		return false
+	if typeof(manifest.get("category_counts", null)) != TYPE_DICTIONARY or manifest.category_counts.size() != CATEGORIES.size():
+		return false
+	if typeof(manifest.get("chunks", null)) != TYPE_ARRAY or typeof(manifest.get("errors", null)) != TYPE_ARRAY:
+		return false
+	for category in CATEGORIES:
+		if not _is_json_nonnegative_integer(manifest.category_counts.get(category, null)):
+			return false
+	for chunk in manifest.chunks:
+		if typeof(chunk) != TYPE_DICTIONARY or chunk.size() != 4 or typeof(chunk.get("file_name", null)) != TYPE_STRING:
+			return false
+		if chunk.file_name.get_file() != chunk.file_name or not _is_sha256_value(chunk.get("sha256", null)):
+			return false
+		if not _is_json_nonnegative_integer(chunk.get("entry_count", null)) or not _is_json_nonnegative_integer(chunk.get("byte_count", null)):
+			return false
+	for error in manifest.errors:
+		if typeof(error) != TYPE_DICTIONARY or error.size() != 3 or typeof(error.get("code", null)) != TYPE_STRING:
+			return false
+		if typeof(error.get("message", null)) != TYPE_STRING:
+			return false
+		var error_category = error.get("category", null)
+		if error_category != null and (typeof(error_category) != TYPE_STRING or not CATEGORIES.has(error_category)):
+			return false
+	return true
 
 
 func _build_manifest_text():

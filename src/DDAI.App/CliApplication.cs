@@ -41,7 +41,7 @@ public sealed class CliApplication(
 
             if (options.Command == DdaiCommand.AssetHelper)
             {
-                AssetHelperIdentity.Verify(
+                using var identityLease = AssetHelperIdentity.Verify(
                     options.MailboxRoot,
                     assetHelperExecutablePath ?? Environment.ProcessPath ?? throw new InvalidDataException("The asset-helper process path is unavailable."),
                     assetHelperTrustedRoot);

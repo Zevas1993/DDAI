@@ -119,6 +119,163 @@ public sealed class AssetCatalogCommitServiceTests
         Assert.Single(Directory.GetFileSystemEntries(sandbox.QuarantineRoot));
     }
 
+    [Fact]
+    public void RequestContentHash_BindsTheExactImmutableRequestBytes()
+    {
+        using var sandbox = new CommitSandbox();
+        var compact = sandbox.Stage("session-exact", "4545454545454545454545454545454545454545454545454545454545454545");
+        var formatted = sandbox.StageRequestForExistingCandidate(compact, indented: true);
+
+        Assert.NotEqual(compact.RequestId, formatted.RequestId);
+
+        ProcessUntilRequestConsumed(sandbox, compact);
+        ProcessUntilRequestConsumed(sandbox, formatted);
+
+        Assert.Equal(Hash(compact.RequestBytes), sandbox.ReadReceipt(compact).GetProperty("request_content_hash").GetString());
+        Assert.Equal(Hash(formatted.RequestBytes), sandbox.ReadReceipt(formatted).GetProperty("request_content_hash").GetString());
+        Assert.Equal(compact.CandidateFingerprint, sandbox.ReadReceipt(formatted).GetProperty("candidate_fingerprint").GetString());
+    }
+
+    [Fact]
+    public void CrashAfterDurableResponse_LaterCommitsAndSlotReuse_DoNotInvalidateOldAcknowledgement()
+    {
+        using var sandbox = new CommitSandbox();
+        var first = sandbox.Stage("session-response-crash", "5656565656565656565656565656565656565656565656565656565656565656");
+
+        Assert.Throws<SimulatedCrashException>(() =>
+            new AssetCatalogCommitService(sandbox.Root, sandbox.TimeProvider, boundary =>
+            {
+                if (boundary == "after-response") throw new SimulatedCrashException();
+            }).ProcessPending());
+        Assert.True(File.Exists(sandbox.ResponsePath(first)));
+        Assert.True(File.Exists(sandbox.RequestPath(first)));
+        var firstRequestBytes = File.ReadAllBytes(sandbox.RequestPath(first));
+        var firstReceiptBytes = File.ReadAllBytes(sandbox.ResponsePath(first));
+        File.Delete(sandbox.RequestPath(first));
+
+        var second = sandbox.Stage("session-later-a", "6767676767676767676767676767676767676767676767676767676767676767");
+        ProcessUntilRequestConsumed(sandbox, second);
+        var third = sandbox.Stage("session-later-b", "7878787878787878787878787878787878787878787878787878787878787878");
+        ProcessUntilRequestConsumed(sandbox, third);
+        var canonicalBeforeRetry = File.ReadAllBytes(Path.Combine(sandbox.CatalogRoot, "current.json"));
+        var repositoryBeforeRetry = new AssetCatalogRepository(sandbox.CatalogRoot, sandbox.TimeProvider);
+        Assert.True(repositoryBeforeRetry.TryRefresh());
+        var revisionBeforeRetry = repositoryBeforeRetry.GetCurrent()!.Manifest.CatalogRevision;
+
+        File.WriteAllBytes(sandbox.RequestPath(first), firstRequestBytes);
+        _ = new AssetCatalogCommitService(sandbox.Root, sandbox.TimeProvider).ProcessPending();
+
+        Assert.False(File.Exists(sandbox.RequestPath(first)));
+        Assert.Equal(firstReceiptBytes, File.ReadAllBytes(sandbox.ResponsePath(first)));
+        Assert.Equal(canonicalBeforeRetry, File.ReadAllBytes(Path.Combine(sandbox.CatalogRoot, "current.json")));
+        var repository = new AssetCatalogRepository(sandbox.CatalogRoot, sandbox.TimeProvider);
+        Assert.True(repository.TryRefresh());
+        Assert.Equal(revisionBeforeRetry, repository.GetCurrent()!.Manifest.CatalogRevision);
+        var oldReceipt = sandbox.ReadReceipt(first);
+        Assert.True(File.Exists(Path.Combine(sandbox.CatalogRoot, "snapshots", oldReceipt.GetProperty("manifest_path").GetString()!)));
+    }
+
+    [Fact]
+    public void EightMalformedEarlyRequests_AreQuarantinedWithoutCrashingAndTheLaterValidRequestProgresses()
+    {
+        using var sandbox = new CommitSandbox();
+        var valid = sandbox.StageWithRequestIdPrefix(
+            "f",
+            "8989898989898989898989898989898989898989898989898989898989898989");
+        string[] malformedBodies =
+        [
+            "{}",
+            "{\"schema_version\":null}",
+            "{\"schema_version\":1}",
+            "{\"schema_version\":\"1.0\",\"candidate_fingerprint\":null}",
+            "{\"schema_version\":\"1.0\",\"candidate_fingerprint\":3}",
+            "{\"schema_version\":\"1.0\",\"candidate_fingerprint\":\"" + new string('a', 64) + "\",\"session_id\":null}",
+            "{\"schema_version\":\"1.0\",\"candidate_fingerprint\":\"" + new string('a', 64) + "\",\"session_id\":7}",
+            "{\"schema_version\":\"1.0\",\"candidate_fingerprint\":\"" + new string('a', 64) + "\",\"session_id\":\"bad\",\"snapshot_at\":null}",
+        ];
+        foreach (var body in malformedBodies)
+        {
+            sandbox.WriteMalformedRequestWithPrefix(body, "0");
+        }
+
+        var service = new AssetCatalogCommitService(sandbox.Root, sandbox.TimeProvider);
+        Assert.Equal(8, service.ProcessPending());
+        Assert.True(File.Exists(sandbox.RequestPath(valid)));
+        Assert.Equal(8, Directory.GetFileSystemEntries(sandbox.QuarantineRoot).Length);
+
+        Assert.Equal(1, service.ProcessPending());
+        Assert.False(File.Exists(sandbox.RequestPath(valid)));
+        Assert.True(sandbox.ReadReceipt(valid).GetProperty("success").GetBoolean());
+    }
+
+    [Fact]
+    public void CandidateAndRequiredParents_CannotBeSwappedWhileTheTransactionWaitsForTheCatalogMutex()
+    {
+        using var sandbox = new CommitSandbox();
+        var request = sandbox.Stage("session-candidate-lease", "9090909090909090909090909090909090909090909090909090909090909090");
+        var mutexMethod = typeof(AssetCatalogCommitService).GetMethod(
+            "MutexName",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        var mutexName = Assert.IsType<string>(mutexMethod!.Invoke(null, [sandbox.CatalogRoot]));
+        using var mutex = new Mutex(false, mutexName);
+        Assert.True(mutex.WaitOne(TimeSpan.FromSeconds(5)));
+        Exception? workerFailure = null;
+        var worker = new Thread(() =>
+        {
+            try { _ = new AssetCatalogCommitService(sandbox.Root, sandbox.TimeProvider).ProcessPending(); }
+            catch (Exception exception) { workerFailure = exception; }
+        });
+        worker.Start();
+        Assert.True(SpinWait.SpinUntil(
+            () => (worker.ThreadState & ThreadState.WaitSleepJoin) != 0,
+            TimeSpan.FromSeconds(5)), "The commit worker did not reach the held catalog mutex.");
+
+        var candidateSwap = request.CandidateRoot + "-swapped";
+        var parent = Path.GetDirectoryName(request.CandidateRoot)!;
+        var parentSwap = parent + "-swapped";
+        var candidateMoved = TryMoveDirectory(request.CandidateRoot, candidateSwap);
+        var parentMoved = TryMoveDirectory(parent, parentSwap);
+        if (candidateMoved) Directory.Move(candidateSwap, request.CandidateRoot);
+        if (parentMoved) Directory.Move(parentSwap, parent);
+        mutex.ReleaseMutex();
+        Assert.True(worker.Join(TimeSpan.FromSeconds(10)));
+
+        Assert.Null(workerFailure);
+        Assert.False(candidateMoved);
+        Assert.False(parentMoved);
+    }
+
+    [Fact]
+    public void CatalogMutexName_UsesTheGlobalPerUserNamespaceAcrossWindowsSessions()
+    {
+        using var sandbox = new CommitSandbox();
+        var mutexMethod = typeof(AssetCatalogCommitService).GetMethod(
+            "MutexName",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+
+        var mutexName = Assert.IsType<string>(mutexMethod!.Invoke(null, [sandbox.CatalogRoot]));
+
+        Assert.StartsWith("Global\\DDAI.AssetCatalog.", mutexName, StringComparison.Ordinal);
+        Assert.DoesNotContain("Local\\", mutexName, StringComparison.Ordinal);
+        using var first = new Mutex(false, mutexName, out _);
+        using var reopened = Mutex.OpenExisting(mutexName);
+        Assert.True(first.WaitOne(TimeSpan.FromSeconds(1)));
+        first.ReleaseMutex();
+    }
+
+    private static bool TryMoveDirectory(string source, string destination)
+    {
+        try
+        {
+            Directory.Move(source, destination);
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
     private static void ProcessUntilRequestConsumed(CommitSandbox sandbox, StagedRequest request)
     {
         for (var pass = 0; pass < 10 && File.Exists(sandbox.RequestPath(request)); pass++)
@@ -182,21 +339,35 @@ public sealed class AssetCatalogCommitServiceTests
             Directory.CreateDirectory(candidateRoot);
             File.WriteAllText(Path.Combine(candidateRoot, "chunk-0000.json"), chunkText);
             File.WriteAllText(Path.Combine(candidateRoot, "manifest.json"), manifestText);
-            var requestContent = RequestContent(sessionId, manifest.SnapshotAt, candidateFingerprint);
-            var requestId = Hash(Encoding.UTF8.GetBytes(requestContent));
-            var request = new StagedRequest(requestId, requestId, candidateFingerprint, candidateRoot);
-            File.WriteAllText(
-                Path.Combine(Root, "private", "catalog-commit", "requests", requestId + ".json"),
-                JsonSerializer.Serialize(new
-                {
-                    schema_version = "1.0",
-                    request_id = requestId,
-                    request_content_hash = requestId,
-                    candidate_fingerprint = candidateFingerprint,
-                    session_id = sessionId,
-                    snapshot_at = manifest.SnapshotAt,
-                }, AssetCatalogJson.SerializerOptions));
-            return request;
+            return WriteRequest(sessionId, manifest.SnapshotAt, candidateFingerprint, candidateRoot, indented: false);
+        }
+
+        public StagedRequest StageRequestForExistingCandidate(StagedRequest existing, bool indented) =>
+            WriteRequest(existing.SessionId, existing.SnapshotAt, existing.CandidateFingerprint, existing.CandidateRoot, indented);
+
+        public StagedRequest StageWithRequestIdPrefix(string prefix, string assetHash)
+        {
+            for (var index = 0; index < 10_000; index++)
+            {
+                var request = Stage("session-valid-" + index, assetHash);
+                if (request.RequestId.StartsWith(prefix, StringComparison.Ordinal)) return request;
+                File.Delete(RequestPath(request));
+            }
+            throw new InvalidOperationException("Could not produce the requested deterministic request hash prefix.");
+        }
+
+        public void WriteMalformedRequestWithPrefix(string body, string prefix)
+        {
+            for (var padding = 0; padding < 100_000; padding++)
+            {
+                var bytes = Encoding.UTF8.GetBytes(body + new string(' ', padding));
+                var requestId = Hash(bytes);
+                var path = Path.Combine(Root, "private", "catalog-commit", "requests", requestId + ".json");
+                if (!requestId.StartsWith(prefix, StringComparison.Ordinal) || File.Exists(path)) continue;
+                File.WriteAllBytes(path, bytes);
+                return;
+            }
+            throw new InvalidOperationException("Could not produce the requested malformed request hash prefix.");
         }
 
         public void WriteResponse(StagedRequest request, string requestContentHash, string candidateFingerprint) =>
@@ -208,7 +379,9 @@ public sealed class AssetCatalogCommitServiceTests
                     request_id = request.RequestId,
                     request_content_hash = requestContentHash,
                     candidate_fingerprint = candidateFingerprint,
+                    session_id = request.SessionId,
                     success = true,
+                    manifest_path = request.SessionId + "-999-" + request.CandidateFingerprint + "/manifest.json",
                     catalog_revision = 999,
                     catalog_fingerprint = new string('9', 64),
                     slot_index = 0,
@@ -225,14 +398,37 @@ public sealed class AssetCatalogCommitServiceTests
             if (Directory.Exists(Root)) Directory.Delete(Root, recursive: true);
         }
 
-        private static string RequestContent(string sessionId, DateTimeOffset snapshotAt, string candidateFingerprint) =>
-            "schema_version=3:1.0\n" +
-            "session_id=" + Encoding.UTF8.GetByteCount(sessionId) + ":" + sessionId + "\n" +
-            "snapshot_at=33:" + snapshotAt.ToUniversalTime().ToString("O") + "\n" +
-            "candidate_fingerprint=64:" + candidateFingerprint + "\n";
+        private StagedRequest WriteRequest(
+            string sessionId,
+            DateTimeOffset snapshotAt,
+            string candidateFingerprint,
+            string candidateRoot,
+            bool indented)
+        {
+            var options = AssetCatalogJson.SerializerOptions;
+            options.WriteIndented = indented;
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                schema_version = "1.0",
+                candidate_fingerprint = candidateFingerprint,
+                session_id = sessionId,
+                snapshot_at = snapshotAt,
+            }, options);
+            var requestId = Hash(bytes);
+            var request = new StagedRequest(requestId, requestId, candidateFingerprint, candidateRoot, sessionId, snapshotAt, bytes);
+            File.WriteAllBytes(RequestPath(request), bytes);
+            return request;
+        }
     }
 
-    private sealed record StagedRequest(string RequestId, string RequestContentHash, string CandidateFingerprint, string CandidateRoot);
+    private sealed record StagedRequest(
+        string RequestId,
+        string RequestContentHash,
+        string CandidateFingerprint,
+        string CandidateRoot,
+        string SessionId,
+        DateTimeOffset SnapshotAt,
+        byte[] RequestBytes);
 
     private sealed class SimulatedCrashException : Exception
     {

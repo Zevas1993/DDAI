@@ -92,6 +92,27 @@ public sealed class CliAndStatusTests
         Assert.False(File.Exists(Path.Combine(sandbox.Path, "private", "pack-normalization", "responses", requestId + ".json")));
     }
 
+    [Fact]
+    public void AssetHelperIdentity_VerificationLeaseRetainsTheExecutableAndHelperRoot()
+    {
+        using var sandbox = new TestDirectory();
+        var helper = sandbox.WriteHelperReceipt();
+        var helperRoot = Path.GetDirectoryName(helper)!;
+        var helperSwap = helperRoot + "-swapped";
+        var executableSwap = helper + ".swapped";
+
+        using (AssetHelperIdentity.Verify(sandbox.Path, helper, helperRoot))
+        {
+            Assert.False(TryMoveFile(helper, executableSwap));
+            Assert.False(TryMoveDirectory(helperRoot, helperSwap));
+        }
+
+        Assert.True(TryMoveFile(helper, executableSwap));
+        File.Move(executableSwap, helper);
+        Assert.True(TryMoveDirectory(helperRoot, helperSwap));
+        Directory.Move(helperSwap, helperRoot);
+    }
+
     [Theory]
     [InlineData("--stdio")]
     [InlineData("--json")]
@@ -104,6 +125,20 @@ public sealed class CliAndStatusTests
             : new[] { "asset-helper", "--mailbox-root", sandbox.Path, option };
 
         Assert.Throws<CliUsageException>(() => CliParser.Parse(arguments));
+    }
+
+    private static bool TryMoveFile(string source, string destination)
+    {
+        try { File.Move(source, destination); return true; }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
+    }
+
+    private static bool TryMoveDirectory(string source, string destination)
+    {
+        try { Directory.Move(source, destination); return true; }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
     }
 
     [Theory]

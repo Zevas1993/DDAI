@@ -121,6 +121,26 @@ public sealed class DungeondraftAssetCatalogScriptTests
         Assert.DoesNotContain("func _select_current_slot", script, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void Script_BindsExactCommitRequestBytesAndVerifiesThePublishedSnapshotBeforeAcknowledgement()
+    {
+        var script = ReadCatalogScript();
+        var requester = FunctionBody(script, "_advance_catalog_commit_request_state");
+        var verifier = FunctionBody(script, "_read_catalog_commit_response");
+
+        Assert.Contains("_commit_request_hash = _sha256_bytes(payload)", requester, StringComparison.Ordinal);
+        Assert.Contains("_commit_request_id = _commit_request_hash", requester, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"request_id\"", requester, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"request_content_hash\"", requester, StringComparison.Ordinal);
+        Assert.Contains("session_id", verifier, StringComparison.Ordinal);
+        Assert.Contains("manifest_path", verifier, StringComparison.Ordinal);
+        Assert.Contains("current.json", verifier, StringComparison.Ordinal);
+        Assert.Contains("current-slot-", verifier, StringComparison.Ordinal);
+        Assert.Contains("/snapshots/", verifier, StringComparison.Ordinal);
+        Assert.Contains("_catalog_fingerprint(fingerprint_manifest)", verifier, StringComparison.Ordinal);
+        Assert.Contains("_catalog_commit_state_token", verifier, StringComparison.Ordinal);
+    }
+
     private static string ReadCatalogScript() => File.ReadAllText(
         Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_asset_catalog.gd"));
 

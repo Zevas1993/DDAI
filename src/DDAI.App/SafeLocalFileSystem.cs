@@ -49,13 +49,40 @@ internal sealed class SafeLocalFileSystem
         return current;
     }
 
-    public IDisposable AcquireDirectoryLease()
+    public IDisposable AcquireDirectoryLease(params string[] requiredDirectories)
     {
-        var handles = trustedDirectories
-            .OrderBy(path => path.Length)
-            .Select(path => OpenValidatedHandle(path, directory: true, GenericRead, shareDelete: false, rejectReparse: true))
-            .ToArray();
-        return new DirectoryLease(handles);
+        var directories = new HashSet<string>(trustedDirectories, StringComparer.OrdinalIgnoreCase);
+        foreach (var requiredDirectory in requiredDirectories)
+        {
+            var current = Path.TrimEndingDirectorySeparator(Path.GetFullPath(requiredDirectory));
+            if (!PathsEqual(current, root))
+            {
+                RequireBeneath(root, current);
+            }
+
+            while (true)
+            {
+                directories.Add(current);
+                if (PathsEqual(current, root)) break;
+                current = Path.GetDirectoryName(current)
+                    ?? throw new InvalidDataException("A required private directory has no parent.");
+            }
+        }
+
+        var handles = new List<SafeFileHandle>();
+        try
+        {
+            foreach (var directory in directories.OrderBy(path => path.Length))
+            {
+                handles.Add(OpenValidatedHandle(directory, directory: true, GenericRead, shareDelete: false, rejectReparse: true));
+            }
+            return new DirectoryLease(handles.ToArray());
+        }
+        catch
+        {
+            foreach (var handle in handles) handle.Dispose();
+            throw;
+        }
     }
 
     public IReadOnlyList<string> EnumerateFiles(string directory, string pattern, int maximumCandidates)
@@ -93,6 +120,27 @@ internal sealed class SafeLocalFileSystem
         return bytes;
     }
 
+    public FileStream OpenReadLease(string path, int maximumBytes)
+    {
+        RequireBeneath(root, path);
+        var handle = OpenValidatedHandle(path, directory: false, GenericRead, shareDelete: false, rejectReparse: true);
+        try
+        {
+            var stream = new FileStream(handle, FileAccess.Read, bufferSize: 4096, isAsync: false);
+            if (stream.Length > maximumBytes)
+            {
+                stream.Dispose();
+                throw new InvalidDataException("Private data exceeds its byte limit.");
+            }
+            return stream;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
     public void WriteImmutable<T>(string destinationPath, T value, System.Text.Json.JsonSerializerOptions options)
     {
         WriteImmutableBytes(destinationPath, System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(value, options));
@@ -105,17 +153,43 @@ internal sealed class SafeLocalFileSystem
             ?? throw new InvalidDataException("The private destination has no parent.");
         RequireOrdinaryDirectory(parent);
         using var lease = AcquireDirectoryLease();
-        using (var stream = new FileStream(
-                   destinationPath,
-                   FileMode.CreateNew,
-                   FileAccess.Write,
-                   FileShare.None,
-                   bufferSize: 4096,
-                   FileOptions.WriteThrough))
+        using var handle = CreateFile(
+            destinationPath,
+            GenericWrite | DeleteAccess,
+            0,
+            IntPtr.Zero,
+            CreateNew,
+            FileAttributeNormal | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
         {
-            stream.Write(bytes);
-            stream.Flush(flushToDisk: true);
-            ValidateOpenedHandle(stream.SafeFileHandle, destinationPath, rejectReparse: true);
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "An immutable private file could not be created.");
+        }
+
+        try
+        {
+            ValidateOpenedHandle(handle, destinationPath, rejectReparse: true);
+        }
+        catch
+        {
+            try { SetDeleteDisposition(handle); }
+            catch (Win32Exception) { }
+            throw;
+        }
+
+        using (var stream = new FileStream(handle, FileAccess.Write, bufferSize: 4096, isAsync: false))
+        {
+            try
+            {
+                stream.Write(bytes);
+                stream.Flush(flushToDisk: true);
+            }
+            catch
+            {
+                try { SetDeleteDisposition(stream.SafeFileHandle); }
+                catch (Win32Exception) { }
+                throw;
+            }
         }
     }
 
@@ -374,11 +448,14 @@ internal sealed class SafeLocalFileSystem
     }
 
     private const uint GenericRead = 0x80000000;
+    private const uint GenericWrite = 0x40000000;
     private const uint DeleteAccess = 0x00010000;
     private const uint FileShareRead = 0x00000001;
     private const uint FileShareWrite = 0x00000002;
     private const uint FileShareDelete = 0x00000004;
     private const uint OpenExisting = 3;
+    private const uint CreateNew = 1;
+    private const uint FileAttributeNormal = 0x00000080;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagOpenReparsePoint = 0x00200000;
 
