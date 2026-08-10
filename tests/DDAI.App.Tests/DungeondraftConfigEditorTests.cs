@@ -7,6 +7,66 @@ public sealed class DungeondraftConfigEditorTests
     private const string ManagedModsDirectory = @"C:\Users\Chris\AppData\Local\DDAI\DungeondraftMods";
 
     [Fact]
+    public void PlanSetup_RequiresCustomSnapAndDdaiExactlyOnceAndRecordsDecodedPriorPath()
+    {
+        var original = Encoding.UTF8.GetBytes(
+            "[Mods]\nactive_mods=[ \"Other.Mod\", \"Lievven.Snappy_Mod\", \"Lievven.Snappy_Mod\" ]\n" +
+            "mods_directory=\"D:\\\\DungeonDraft\\\\Dungeondraft\\\\mods\\\\custom_snap\"\n");
+
+        var edit = DungeondraftConfigEditor.PlanSetup(
+            original,
+            ManagedModsDirectory,
+            [DungeondraftConfigEditor.CustomSnapModId, DungeondraftConfigEditor.DdaiModId]);
+        var text = Encoding.UTF8.GetString(edit.ReplacementBytes);
+
+        Assert.Contains(
+            "active_mods=[ \"Other.Mod\", \"Lievven.Snappy_Mod\", \"org.ddai.status_bridge\" ]",
+            text);
+        Assert.Equal(@"D:\DungeonDraft\Dungeondraft\mods\custom_snap", edit.Ownership.PreviousModsDirectory);
+        Assert.Equal(DungeondraftConfigEditor.DdaiModId, edit.Ownership.ModId);
+    }
+
+    [Fact]
+    public void PlanSetup_EmptyListGainsBothRequiredIdsAndSecondRunIsByteExact()
+    {
+        var original = Encoding.UTF8.GetBytes(
+            "[Mods]\nactive_mods=[ ]\nmods_directory=\"D:\\\\Mods\"\n");
+        string[] required =
+        [
+            DungeondraftConfigEditor.CustomSnapModId,
+            DungeondraftConfigEditor.DdaiModId,
+            DungeondraftConfigEditor.CustomSnapModId,
+        ];
+
+        var first = DungeondraftConfigEditor.PlanSetup(original, ManagedModsDirectory, required);
+        var second = DungeondraftConfigEditor.PlanSetup(first.ReplacementBytes, ManagedModsDirectory, required);
+
+        Assert.Contains(
+            "active_mods=[ \"Lievven.Snappy_Mod\", \"org.ddai.status_bridge\" ]",
+            Encoding.UTF8.GetString(first.ReplacementBytes));
+        Assert.False(second.Changed);
+        Assert.Equal(first.ReplacementBytes, second.ReplacementBytes);
+    }
+
+    [Fact]
+    public void PlanSetup_PreservesNonRequiredDuplicatesAndRejectsBlankRequiredIds()
+    {
+        var original = Encoding.UTF8.GetBytes(
+            "[Mods]\nactive_mods=[ \"Other.Mod\", \"Other.Mod\" ]\nmods_directory=\"D:\\\\Mods\"\n");
+
+        var edit = DungeondraftConfigEditor.PlanSetup(
+            original,
+            ManagedModsDirectory,
+            [DungeondraftConfigEditor.CustomSnapModId, DungeondraftConfigEditor.DdaiModId]);
+
+        Assert.Contains(
+            "active_mods=[ \"Other.Mod\", \"Other.Mod\", \"Lievven.Snappy_Mod\", \"org.ddai.status_bridge\" ]",
+            Encoding.UTF8.GetString(edit.ReplacementBytes));
+        Assert.Throws<DungeondraftConfigException>(() =>
+            DungeondraftConfigEditor.PlanSetup(original, ManagedModsDirectory, [" "]));
+    }
+
+    [Fact]
     public void PlanSetup_PreservesCustomSnapCommentsUtf8BomAndCrLf()
     {
         const string text = "; keep\r\n[Display]\r\nwindow_width=1920\r\n\r\n[Mods]\r\nactive_mods=[ \"Lievven.Snappy_Mod\", \"Other.Mod\" ]\r\nmods_directory=\"D:\\\\OldMods\"\r\n";

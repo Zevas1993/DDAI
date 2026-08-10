@@ -5,6 +5,33 @@ namespace DDAI.App.Tests;
 public sealed class DungeondraftConfigTransactionTests
 {
     [Fact]
+    public void Apply_RequiredModOverloadPersistsBothIdsAndIsIdempotent()
+    {
+        using var sandbox = new ConfigTransactionSandbox();
+        File.WriteAllText(
+            sandbox.ConfigPath,
+            "[Mods]\nactive_mods=[ ]\nmods_directory=\"D:\\\\DungeonDraft\\\\Dungeondraft\\\\mods\\\\custom_snap\"\n");
+        var transaction = new DungeondraftConfigTransaction(new FixedTimeProvider());
+        string[] required =
+        [
+            DungeondraftConfigEditor.CustomSnapModId,
+            DungeondraftConfigEditor.DdaiModId,
+        ];
+
+        var first = transaction.Apply(
+            transaction.PlanSetup(sandbox.ConfigPath, sandbox.ManagedModsDirectory, required));
+        var second = transaction.Apply(
+            transaction.PlanSetup(sandbox.ConfigPath, sandbox.ManagedModsDirectory, required));
+        var text = File.ReadAllText(sandbox.ConfigPath);
+
+        Assert.Equal("updated", first.State);
+        Assert.Contains("Lievven.Snappy_Mod", text);
+        Assert.Contains("org.ddai.status_bridge", text);
+        Assert.Equal("already_current", second.State);
+        Assert.False(second.Changed);
+    }
+
+    [Fact]
     public void Apply_CreatesExactSiblingBackupAndIsIdempotent()
     {
         using var sandbox = new ConfigTransactionSandbox();

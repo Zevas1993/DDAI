@@ -6,7 +6,8 @@ public sealed record DungeondraftConfigOwnership(
     string ManagedModsDirectory,
     bool PreviousModsDirectoryPresent,
     string? PreviousModsDirectoryLiteral,
-    string ModId);
+    string ModId,
+    string? PreviousModsDirectory = null);
 
 public sealed record DungeondraftConfigEdit(
     byte[] OriginalBytes,
@@ -22,21 +23,54 @@ public sealed class DungeondraftConfigException(string message, Exception? inner
 public static class DungeondraftConfigEditor
 {
     public const string DdaiModId = "org.ddai.status_bridge";
+    public const string CustomSnapModId = "Lievven.Snappy_Mod";
 
-    public static DungeondraftConfigEdit PlanSetup(byte[] originalBytes, string managedModsDirectory)
+    public static DungeondraftConfigEdit PlanSetup(byte[] originalBytes, string managedModsDirectory) =>
+        PlanSetup(originalBytes, managedModsDirectory, [DdaiModId]);
+
+    public static DungeondraftConfigEdit PlanSetup(
+        byte[] originalBytes,
+        string managedModsDirectory,
+        IReadOnlyList<string> requiredModIds)
     {
         ArgumentNullException.ThrowIfNull(originalBytes);
+        if (requiredModIds is null)
+        {
+            throw new DungeondraftConfigException("At least one required Dungeondraft mod ID is required.");
+        }
+
+        var required = new List<string>(requiredModIds.Count);
+        var requiredSet = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var modId in requiredModIds)
+        {
+            if (string.IsNullOrWhiteSpace(modId))
+            {
+                throw new DungeondraftConfigException("Required Dungeondraft mod IDs cannot be blank.");
+            }
+
+            if (requiredSet.Add(modId))
+            {
+                required.Add(modId);
+            }
+        }
+
+        if (required.Count == 0)
+        {
+            throw new DungeondraftConfigException("At least one required Dungeondraft mod ID is required.");
+        }
+
         var managedPath = NormalizeAbsolutePath(managedModsDirectory);
         var document = ConfigDocument.Parse(originalBytes);
         var mods = document.FindModsSection();
 
         string? previousLiteral = null;
+        string? previousDirectory = null;
         var previousPresent = false;
 
         if (mods is null)
         {
             document.AppendModsSection(
-                FormatArray([DdaiModId]),
+                FormatArray(required),
                 FormatString(managedPath));
         }
         else
@@ -46,29 +80,31 @@ public static class DungeondraftConfigEditor
 
             if (active is null)
             {
-                document.InsertOwnedKey(mods.Value, "active_mods", FormatArray([DdaiModId]));
+                document.InsertOwnedKey(mods.Value, "active_mods", FormatArray(required));
             }
             else
             {
                 var values = ParseStringArray(active.Value.Value);
-                var result = new List<string>(values.Count + 1);
-                var ddaiSeen = false;
+                var result = new List<string>(values.Count + required.Count);
+                var seenRequired = new HashSet<string>(StringComparer.Ordinal);
                 foreach (var value in values)
                 {
-                    if (!string.Equals(value, DdaiModId, StringComparison.Ordinal))
+                    if (!requiredSet.Contains(value))
                     {
                         result.Add(value);
                     }
-                    else if (!ddaiSeen)
+                    else if (seenRequired.Add(value))
                     {
                         result.Add(value);
-                        ddaiSeen = true;
                     }
                 }
 
-                if (!ddaiSeen)
+                foreach (var modId in required)
                 {
-                    result.Add(DdaiModId);
+                    if (seenRequired.Add(modId))
+                    {
+                        result.Add(modId);
+                    }
                 }
 
                 document.ReplaceValue(active.Value, FormatArray(result));
@@ -82,7 +118,7 @@ public static class DungeondraftConfigEditor
             {
                 previousPresent = true;
                 previousLiteral = directory.Value.Value;
-                _ = ParseString(directory.Value.Value);
+                previousDirectory = ParseString(directory.Value.Value);
                 document.ReplaceValue(directory.Value, FormatString(managedPath));
             }
         }
@@ -91,7 +127,8 @@ public static class DungeondraftConfigEditor
             managedPath,
             previousPresent,
             previousLiteral,
-            DdaiModId);
+            DdaiModId,
+            previousDirectory);
         return document.CreateEdit(originalBytes, ownership);
     }
 

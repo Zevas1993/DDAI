@@ -15,11 +15,17 @@ public sealed record DungeondraftConfigUpdate(
 
 public sealed class DungeondraftConfigTransaction(TimeProvider timeProvider)
 {
-    public DungeondraftConfigTransactionPlan PlanSetup(string configPath, string managedModsDirectory)
+    public DungeondraftConfigTransactionPlan PlanSetup(string configPath, string managedModsDirectory) =>
+        PlanSetup(configPath, managedModsDirectory, [DungeondraftConfigEditor.DdaiModId]);
+
+    public DungeondraftConfigTransactionPlan PlanSetup(
+        string configPath,
+        string managedModsDirectory,
+        IReadOnlyList<string> requiredModIds)
     {
         var path = RequireRegularFile(configPath);
         var original = ReadExact(path);
-        var edit = DungeondraftConfigEditor.PlanSetup(original, managedModsDirectory);
+        var edit = DungeondraftConfigEditor.PlanSetup(original, managedModsDirectory, requiredModIds);
         return new DungeondraftConfigTransactionPlan(
             path,
             edit.OriginalBytes,
