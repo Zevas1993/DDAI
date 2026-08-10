@@ -12,8 +12,8 @@ public sealed class DungeondraftModPackageTests
         var script = File.ReadAllText(Path.Combine(modRoot, "scripts", "ddai_bridge.gd"));
         var readme = File.ReadAllText(Path.Combine(modRoot, "README.md"));
 
-        Assert.Equal("0.2.0", manifest.RootElement.GetProperty("version").GetString());
-        Assert.Equal("0.2.0", ConstantValue(script, "MOD_VERSION"));
+        Assert.Equal("0.2.1", manifest.RootElement.GetProperty("version").GetString());
+        Assert.Equal("0.2.1", ConstantValue(script, "MOD_VERSION"));
         Assert.Contains("const SUPPORTED_COMMANDS = [\"status\", \"apply_plan\"]", script, StringComparison.Ordinal);
         Assert.Contains("apply_plan", readme, StringComparison.Ordinal);
         Assert.Contains("native rectangular wall", readme, StringComparison.OrdinalIgnoreCase);
@@ -109,7 +109,7 @@ public sealed class DungeondraftModPackageTests
             "Global.World.Width", "Global.World.Height", "Global.World.GridSize", "Global.World.CurrentLevelId",
             "Global.World.GetLevelByID", "level.Walls.get_children()", "Global.Editor.Tools[\"WallTool\"]",
             "wall_tool.Enable()", "Global.WorldUI.ClearPolyline()", "Global.WorldUI.AddPolyPoint",
-            "wall_tool.Confirm()", "level.Walls.get_children()", "_cleanup_wall_tool(wall_tool)",
+            "wall_tool.EndWall(true)", "level.Walls.get_children()", "_cleanup_wall_tool(wall_tool)",
         };
         var position = -1;
         foreach (var token in orderedTokens)
@@ -119,9 +119,10 @@ public sealed class DungeondraftModPackageTests
             position = next;
         }
 
-        Assert.Equal(5, CountOccurrences(executor, "Global.WorldUI.AddPolyPoint("));
-        Assert.Equal(1, CountOccurrences(executor, "wall_tool.Confirm()"));
-        Assert.Equal(2, CountOccurrences(executor, "Global.WorldUI.AddPolyPoint(point_1)"));
+        Assert.Equal(4, CountOccurrences(executor, "Global.WorldUI.AddPolyPoint("));
+        Assert.Equal(1, CountOccurrences(executor, "wall_tool.EndWall(true)"));
+        Assert.Equal(1, CountOccurrences(executor, "Global.WorldUI.AddPolyPoint(point_1)"));
+        Assert.DoesNotContain("wall_tool.Confirm()", executor, StringComparison.Ordinal);
         Assert.Contains("walls_after == walls_before + 1", executor, StringComparison.Ordinal);
         Assert.Contains("_runtime_room_preflight(plan)", executor, StringComparison.Ordinal);
         Assert.Contains("level.Walls.get_children().size()", preflight, StringComparison.Ordinal);

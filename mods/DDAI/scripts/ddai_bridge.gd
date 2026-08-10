@@ -1,6 +1,6 @@
 var script_class = "tool"
 
-const MOD_VERSION = "0.2.0"
+const MOD_VERSION = "0.2.1"
 const TARGET_DUNGEONDRAFT_VERSION = "1.2.0.1"
 const MAILBOX_SCHEMA_VERSION = "1.0"
 const MAILBOX_ROOT = "user://ddai"
@@ -333,8 +333,10 @@ func _execute_rectangular_room(request, plan, plan_fingerprint):
 	Global.WorldUI.AddPolyPoint(point_2)
 	Global.WorldUI.AddPolyPoint(point_3)
 	Global.WorldUI.AddPolyPoint(point_4)
-	Global.WorldUI.AddPolyPoint(point_1)
-	wall_tool.Confirm()
+	# Confirm() is cursor-driven: when the live cursor is not on point_1 it appends
+	# that cursor as another point and creates an open wall. EndWall(true) consumes
+	# only these four supplied corners and records one closed native wall operation.
+	wall_tool.EndWall(true)
 	var walls_after = level.Walls.get_children().size()
 	var cleanup_ok = _cleanup_wall_tool(wall_tool)
 	if not cleanup_ok:
