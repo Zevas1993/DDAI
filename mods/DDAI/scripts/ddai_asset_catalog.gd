@@ -3,13 +3,9 @@ var script_class = "tool"
 const CATALOG_SCHEMA_VERSION = "1.0"
 const RUNTIME_RECEIPT_PATH = "user://ddai/runtime-receipt.json"
 const CATALOG_ROOT = "user://ddai/catalog"
-const SNAPSHOTS_ROOT = "user://ddai/catalog/snapshots"
 const PREVIEWS_ROOT = "user://ddai/catalog/previews"
-const CURRENT_POINTER_PATH = "user://ddai/catalog/current.json"
 const RUNTIME_RECEIPT_SLOT_PATHS = ["user://ddai/runtime-receipt-slot-0.json", "user://ddai/runtime-receipt-slot-1.json"]
 const MANIFEST_FILE_NAME = "manifest.json"
-const CURRENT_POINTER_FILE_NAME = "current.json"
-const CURRENT_SLOT_FILE_NAMES = ["current-slot-0.json", "current-slot-1.json"]
 const MAX_ASSETS_PER_TICK = 8
 const MAX_PREVIEW_EDGE = 256
 const MAX_PREVIEW_BYTES = 262144
@@ -49,8 +45,6 @@ var _state = "waiting_for_receipt"
 var _session_id = ""
 var _catalog_revision = 0
 var _snapshot_at = ""
-var _snapshot_namespace = ""
-var _snapshot_root = ""
 var _category_index = 0
 var _enumeration_loaded = false
 var _enumeration_raw = []
@@ -69,11 +63,14 @@ var _suppressed_error_count = 0
 var _preview_work = null
 var _normalization_request_pending = null
 var _normalization_active_request_id = ""
+var _normalization_active_request_hash = ""
 var _pack_normalization_values = {}
-var _pack_normalization_failures = {}
-var _publication_request_pending = null
-var _publication_request_id = ""
-var _publication_slot_index = -1
+var _candidate_fingerprint = ""
+var _candidate_root = ""
+var _candidate_write_index = 0
+var _commit_request_pending = null
+var _commit_request_id = ""
+var _commit_request_hash = ""
 var _helper_verification_started = false
 var _helper_ready = false
 var _helper_launch_attempts = 0
@@ -86,7 +83,6 @@ var _pending_chunks = []
 var _chunk_write_index = 0
 var _chunk_receipts = []
 var _chunk_phase = "building"
-var _publishing_step = 0
 var _manifest_text = ""
 var _last_update_entry_operations = 0
 var _last_update_file_publications = 0
@@ -155,12 +151,14 @@ class LiveRuntimeAdapter:
 		if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
 			return false
 		var receipt = parsed.result
-		var fixed_path = (OS.get_environment("LOCALAPPDATA") + "/DDAI/ddai.exe").replace("\\", "/")
+		var fixed_root = (OS.get_environment("LOCALAPPDATA") + "/DDAI/helpers/").replace("\\", "/")
 		var receipt_path = str(receipt.get("executable_path", "")).replace("\\", "/")
 		var expected_hash = str(receipt.get("sha256", ""))
 		if receipt.get("schema_version", "") != CATALOG_SCHEMA_VERSION or receipt.get("owner", "") != "org.ddai.connector":
 			return false
-		if receipt_path.to_lower() != fixed_path.to_lower() or not _is_sha256_value(expected_hash):
+		if not receipt_path.is_abs_path() or receipt_path.find("..") >= 0 or not receipt_path.to_lower().begins_with(fixed_root.to_lower()) or not _is_sha256_value(expected_hash):
+			return false
+		if receipt_path.get_file().to_lower() != "ddai-" + expected_hash + ".exe":
 			return false
 		_helper_file = File.new()
 		if _helper_file.open(receipt_path, File.READ) != OK:
@@ -259,10 +257,6 @@ func update(_delta):
 		_advance_waiting_for_receipt_state()
 	elif _state == "helper_verification":
 		_advance_helper_verification_state()
-	elif _state == "requesting_publication_advice":
-		_advance_publication_advice_request_state()
-	elif _state == "waiting_publication_advice":
-		_advance_waiting_publication_advice_state()
 	elif _state == "enumerating":
 		_advance_enumerating_state()
 	elif _state == "previewing":
@@ -275,8 +269,12 @@ func update(_delta):
 		_advance_preview_finalization_state()
 	elif _state == "writing_chunks":
 		_advance_writing_chunks_state()
-	elif _state == "publishing":
-		_advance_publishing_state()
+	elif _state == "publishing_candidate":
+		_advance_publishing_candidate_state()
+	elif _state == "requesting_catalog_commit":
+		_advance_catalog_commit_request_state()
+	elif _state == "waiting_catalog_commit":
+		_advance_waiting_catalog_commit_state()
 	if _last_update_entry_operations > MAX_ASSETS_PER_TICK or _last_update_file_publications > 1 or (_last_update_entry_operations > 0 and _last_update_file_publications > 0):
 		_state = "failed"
 
@@ -325,80 +323,11 @@ func _advance_helper_verification_state():
 	if result.get("status", "") != "ready":
 		return
 	_helper_ready = true
-	_publication_request_id = _sha256_text("catalog-publication\n" + _session_id)
-	_publication_request_pending = {
-		"path": _catalog_publication_root() + "/requests/" + _publication_request_id + ".json",
-		"payload": {
-			"schema_version": CATALOG_SCHEMA_VERSION,
-			"request_id": _publication_request_id,
-			"wall_clock_revision": int(OS.get_unix_time()) * 1000,
-		},
-	}
-	_state = "requesting_publication_advice"
-
-
-func _advance_publication_advice_request_state():
-	var result = _write_bytes_immutable(
-		_publication_request_pending.path,
-		to_json(_publication_request_pending.payload).to_utf8())
-	if result != "created" and result != "existing":
-		_record_error("catalog_advice_unavailable", "The private catalog publication request could not be written.", null)
-		_state = "failed"
-		return
-	_publication_request_pending = null
-	_reset_helper_launch_window()
-	_state = "waiting_publication_advice"
-
-
-func _advance_waiting_publication_advice_state():
-	var response = {"ok": false}
-	if not _private_request_is_pending(_catalog_publication_root(), _publication_request_id):
-		response = _read_publication_advice_response()
-	if response.ok:
-		if not response.success:
-			_record_error(response.error_code, "Existing catalog pointers conflict or cannot advance safely.", null)
-			_state = "failed"
-			return
-		_catalog_revision = response.catalog_revision
-		_publication_slot_index = response.slot_index
-		_snapshot_at = _utc_wire_timestamp()
-		_snapshot_namespace = _session_id + "-" + str(_catalog_revision)
-		_snapshot_root = _snapshots_root() + "/" + _snapshot_namespace
-		var directory = Directory.new()
-		if directory.dir_exists(_snapshot_root) or directory.make_dir_recursive(_snapshot_root) != OK:
-			_record_error("catalog_snapshot_conflict", "The advised immutable snapshot namespace is unavailable.", null)
-			_state = "failed"
-			return
-		for category in CATEGORIES:
-			_category_counts[category] = 0
-		_state = "enumerating"
-		return
-	if _advance_helper_launch_window():
-		return
-	_record_error("catalog_advice_unavailable", "The owned local helper did not return bounded publication advice.", null)
-	_state = "failed"
-
-
-func _read_publication_advice_response():
-	var path = _catalog_publication_root() + "/responses/" + _publication_request_id + ".json"
-	var parsed = _read_bounded_dictionary(path, MAX_NORMALIZATION_BYTES)
-	if parsed == null or parsed.get("schema_version", "") != CATALOG_SCHEMA_VERSION or parsed.get("request_id", "") != _publication_request_id:
-		return {"ok": false}
-	if typeof(parsed.get("success", null)) != TYPE_BOOL:
-		return {"ok": false}
-	if not parsed.success:
-		var error_code = str(parsed.get("error_code", "catalog_pointer_conflict"))
-		return {"ok": true, "success": false, "error_code": error_code}
-	if not _is_json_nonnegative_integer(parsed.get("catalog_revision", null)):
-		return {"ok": false}
-	if not _is_json_nonnegative_integer(parsed.get("slot_index", null)) or not [0, 1].has(int(parsed.slot_index)):
-		return {"ok": false}
-	return {
-		"ok": true,
-		"success": true,
-		"catalog_revision": int(parsed.catalog_revision),
-		"slot_index": int(parsed.slot_index),
-	}
+	_catalog_revision = 0
+	_snapshot_at = _utc_wire_timestamp()
+	for category in CATEGORIES:
+		_category_counts[category] = 0
+	_state = "enumerating"
 
 
 func _reset_helper_launch_window():
@@ -474,11 +403,6 @@ func _advance_previewing_state():
 	var pack_id_result = _resolve_pack_id(pack_metadata.pack_id)
 	if not pack_id_result.ok:
 		return
-	if pack_id_result.has("error_code"):
-		_record_error(
-			pack_id_result.error_code,
-			"A pack identifier could not be normalized by the verified local helper; the asset remains available without pack metadata.",
-			category)
 	var pack_id = pack_id_result.value
 	var resource_fingerprint = _sha256_text(resource_identity)
 	var asset_ref = "sha256:" + _sha256_text(_pack_id_for_hash(pack_id) + "\n" + category + "\n" + resource_identity)
@@ -576,67 +500,117 @@ func _advance_writing_chunks_state():
 			return
 		if _chunk_entry_json.size() > 0:
 			_queue_current_chunk()
-		_chunk_phase = "writing"
-		return
-	if _chunk_write_index < _pending_chunks.size():
-		var pending = _pending_chunks[_chunk_write_index]
-		var file_name = "chunk-%04d.json" % _chunk_write_index
-		var payload = pending.text.to_utf8()
-		if _write_bytes_immutable(_snapshot_root + "/" + file_name, payload) != "created":
+		_manifest_text = _build_manifest_text()
+		if _manifest_text.to_utf8().size() > MAX_MANIFEST_BYTES:
+			_record_error("catalog_manifest_too_large", "The bounded catalog manifest exceeds the reader limit.", null)
 			_state = "failed"
 			return
-		_chunk_receipts.append({
-			"file_name": file_name,
-			"sha256": _sha256_bytes(payload),
-			"entry_count": pending.entry_count,
-			"byte_count": payload.size(),
-		})
-		_chunk_write_index += 1
-		return
-	_publishing_step = 0
-	_state = "publishing"
+		_candidate_fingerprint = _sha256_text(_manifest_text)
+		_candidate_root = _catalog_commit_root() + "/candidates/" + _candidate_fingerprint
+		_candidate_write_index = 0
+		_state = "publishing_candidate"
 
 
 func _queue_current_chunk():
 	var chunk_text = "[" + PoolStringArray(_chunk_entry_json).join(",") + "]"
-	_pending_chunks.append({"text": chunk_text, "entry_count": _chunk_entry_json.size()})
+	var payload = chunk_text.to_utf8()
+	var file_name = "chunk-%04d.json" % _pending_chunks.size()
+	_pending_chunks.append({"text": chunk_text, "entry_count": _chunk_entry_json.size(), "file_name": file_name})
+	_chunk_receipts.append({
+		"file_name": file_name,
+		"sha256": _sha256_bytes(payload),
+		"entry_count": _chunk_entry_json.size(),
+		"byte_count": payload.size(),
+	})
 	_chunk_entry_json = []
 	_chunk_payload_bytes = 2
 
 
-func _advance_publishing_state():
-	if _publishing_step == 0:
-		_manifest_text = _build_manifest_text()
-		if _manifest_text.to_utf8().size() > MAX_MANIFEST_BYTES:
+func _advance_publishing_candidate_state():
+	if _candidate_write_index < _pending_chunks.size():
+		var pending = _pending_chunks[_candidate_write_index]
+		var payload = pending.text.to_utf8()
+		var expected = _chunk_receipts[_candidate_write_index]
+		if _write_bytes_immutable_bound(_candidate_root + "/" + pending.file_name, payload, expected.sha256, expected.byte_count) != "valid":
+			_record_error("catalog_candidate_conflict", "A staged catalog chunk did not match its content binding.", null)
 			_state = "failed"
 			return
-		if _write_bytes_immutable(_snapshot_root + "/" + MANIFEST_FILE_NAME, _manifest_text.to_utf8()) != "created":
-			_state = "failed"
-			return
-		_publishing_step = 1
+		_candidate_write_index += 1
 		return
-	if _publishing_step == 1:
-		var slot_pointer = {
-			"session_id": _session_id,
-			"manifest": _snapshot_namespace + "/" + MANIFEST_FILE_NAME,
-			"catalog_revision": _catalog_revision,
-		}
-		var slot_name = CURRENT_SLOT_FILE_NAMES[_publication_slot_index]
-		if _replace_bytes_recoverably(catalog_root + "/" + slot_name, to_json(slot_pointer).to_utf8()) != "replaced":
-			_state = "failed"
-			return
-		_publishing_step = 2
+	if _write_bytes_immutable_bound(_candidate_root + "/" + MANIFEST_FILE_NAME, _manifest_text.to_utf8(), _candidate_fingerprint, _manifest_text.to_utf8().size()) != "valid":
+		_record_error("catalog_candidate_conflict", "The staged catalog manifest did not match its candidate fingerprint.", null)
+		_state = "failed"
 		return
-	if _publishing_step == 2:
-		var pointer = {
+	_state = "requesting_catalog_commit"
+
+
+func _advance_catalog_commit_request_state():
+	if _commit_request_pending == null:
+		var framed = ""
+		framed += _framed_string("schema_version", CATALOG_SCHEMA_VERSION)
+		framed += _framed_string("session_id", _session_id)
+		framed += _framed_string("snapshot_at", _snapshot_at)
+		framed += _framed_string("candidate_fingerprint", _candidate_fingerprint)
+		_commit_request_hash = _sha256_text(framed)
+		_commit_request_id = _commit_request_hash
+		_commit_request_pending = {
+			"schema_version": CATALOG_SCHEMA_VERSION,
+			"request_id": _commit_request_id,
+			"request_content_hash": _commit_request_hash,
+			"candidate_fingerprint": _candidate_fingerprint,
 			"session_id": _session_id,
-			"manifest": _snapshot_namespace + "/" + MANIFEST_FILE_NAME,
+			"snapshot_at": _snapshot_at,
 		}
-		if _replace_bytes_recoverably(catalog_root + "/" + CURRENT_POINTER_FILE_NAME, to_json(pointer).to_utf8()) != "replaced":
-			_state = "failed"
-			return
-		_publishing_step = 3
+	var payload = to_json(_commit_request_pending).to_utf8()
+	var request_path = _catalog_commit_root() + "/requests/" + _commit_request_id + ".json"
+	if _write_bytes_immutable_bound(request_path, payload, _sha256_bytes(payload), payload.size()) != "valid":
+		_record_error("catalog_commit_request_failed", "The catalog commit request could not be staged without a binding conflict.", null)
+		_state = "failed"
+		return
+	_commit_request_pending = null
+	_reset_helper_launch_window()
+	_state = "waiting_catalog_commit"
+
+
+func _advance_waiting_catalog_commit_state():
+	var response = {"ok": false}
+	if not _private_request_is_pending(_catalog_commit_root(), _commit_request_id):
+		response = _read_catalog_commit_response(_commit_request_id)
+	if response.ok:
+		_catalog_revision = response.catalog_revision
 		_state = "published"
+		return
+	if response.has("terminal_error"):
+		_record_error(response.terminal_error, "The serialized local catalog commit was rejected; the last good snapshot remains current.", null)
+		_state = "failed"
+		return
+	if _advance_helper_launch_window():
+		return
+	_record_error("catalog_commit_failed", "The serialized local catalog commit did not complete before its bounded deadline; the last good snapshot remains current.", null)
+	_state = "failed"
+
+
+func _read_catalog_commit_response(request_id):
+	var response = _read_bounded_dictionary(_catalog_commit_root() + "/responses/" + request_id + ".json", MAX_NORMALIZATION_BYTES)
+	if response == null:
+		return {"ok": false}
+	if response.get("schema_version", "") != CATALOG_SCHEMA_VERSION or response.get("request_id", "") != request_id:
+		return {"ok": false, "terminal_error": "catalog_commit_response_invalid"}
+	if response.get("request_content_hash", "") != _commit_request_hash or response.get("candidate_fingerprint", "") != _candidate_fingerprint:
+		return {"ok": false, "terminal_error": "catalog_commit_response_invalid"}
+	if typeof(response.get("success", null)) != TYPE_BOOL:
+		return {"ok": false, "terminal_error": "catalog_commit_response_invalid"}
+	if not response.success:
+		return {"ok": false, "terminal_error": str(response.get("error_code", "catalog_commit_failed"))}
+	var revision = response.get("catalog_revision", null)
+	var fingerprint = str(response.get("catalog_fingerprint", ""))
+	var slot_index = response.get("slot_index", null)
+	var state_token = str(response.get("state_token", ""))
+	if not _is_json_nonnegative_integer(revision) or not _is_sha256_value(fingerprint) or not _is_json_nonnegative_integer(slot_index) or int(slot_index) > 1:
+		return {"ok": false, "terminal_error": "catalog_commit_response_invalid"}
+	if not _is_sha256_value(state_token) or state_token != _sha256_text(str(int(revision)) + "\n" + fingerprint + "\n" + str(int(slot_index))):
+		return {"ok": false, "terminal_error": "catalog_commit_response_invalid"}
+	return {"ok": true, "catalog_revision": int(revision)}
 
 
 func _build_manifest_text():
@@ -766,24 +740,20 @@ func _resolve_pack_id(value):
 	var request_id = _sha256_text(raw_value)
 	if _pack_normalization_values.has(request_id):
 		return {"ok": true, "value": _pack_normalization_values[request_id]}
-	if _pack_normalization_failures.has(request_id):
-		return {
-			"ok": true,
-			"value": null,
-			"error_code": "pack_normalization_unavailable",
-		}
 	_normalization_active_request_id = request_id
+	_normalization_active_request_hash = _sha256_text(
+		"schema_version=3:1.0\nrequest_id=64:" + request_id + "\nvalue=" +
+		str(raw_value.to_utf8().size()) + ":" + raw_value + "\n")
 	var request_path = _pack_normalization_root() + "/requests/" + request_id + ".json"
-	var directory = Directory.new()
-	if not directory.file_exists(request_path):
-		_normalization_request_pending = {
-			"path": request_path,
-			"payload": {
-				"schema_version": CATALOG_SCHEMA_VERSION,
-				"request_id": request_id,
-				"value": raw_value,
-			},
-		}
+	_normalization_request_pending = {
+		"path": request_path,
+		"payload": {
+			"schema_version": CATALOG_SCHEMA_VERSION,
+			"request_id": request_id,
+			"request_content_hash": _normalization_active_request_hash,
+			"value": raw_value,
+		},
+	}
 	_state = "normalizing_pack_id"
 	return {"ok": false}
 
@@ -791,12 +761,14 @@ func _resolve_pack_id(value):
 func _advance_pack_normalization_state():
 	if _normalization_request_pending != null:
 		var pending = _normalization_request_pending
-		var result = _write_bytes_immutable(pending.path, to_json(pending.payload).to_utf8())
-		if result != "created" and result != "existing":
-			_pack_normalization_failures[_normalization_active_request_id] = true
+		var payload = to_json(pending.payload).to_utf8()
+		var result = _write_bytes_immutable_bound(pending.path, payload, _sha256_bytes(payload), payload.size())
+		if result != "valid":
+			_record_error("pack_normalization_failed", "The non-ASCII pack normalization request conflicted with private mailbox state; the last good catalog remains current.", null)
 			_normalization_request_pending = null
 			_normalization_active_request_id = ""
-			_state = "previewing"
+			_normalization_active_request_hash = ""
+			_state = "failed"
 			return
 		_normalization_request_pending = null
 		_reset_helper_launch_window()
@@ -807,13 +779,21 @@ func _advance_pack_normalization_state():
 	if response.ok:
 		_pack_normalization_values[_normalization_active_request_id] = response.value
 		_normalization_active_request_id = ""
+		_normalization_active_request_hash = ""
 		_state = "previewing"
+		return
+	if response.has("terminal_error"):
+		_record_error("pack_normalization_failed", "The non-ASCII pack normalization response was not bound to its request; the last good catalog remains current.", null)
+		_normalization_active_request_id = ""
+		_normalization_active_request_hash = ""
+		_state = "failed"
 		return
 	if _advance_helper_launch_window():
 		return
-	_pack_normalization_failures[_normalization_active_request_id] = true
+	_record_error("pack_normalization_failed", "The non-ASCII pack normalization request exceeded its bounded deadline; the last good catalog remains current.", null)
 	_normalization_active_request_id = ""
-	_state = "previewing"
+	_normalization_active_request_hash = ""
+	_state = "failed"
 
 
 func _read_pack_normalization_response(request_id):
@@ -822,14 +802,16 @@ func _read_pack_normalization_response(request_id):
 	if response == null:
 		return {"ok": false}
 	if response.get("schema_version", "") != CATALOG_SCHEMA_VERSION or response.get("request_id", "") != request_id:
-		return {"ok": false}
+		return {"ok": false, "terminal_error": "pack_normalization_failed"}
+	if response.get("request_content_hash", "") != _normalization_active_request_hash:
+		return {"ok": false, "terminal_error": "pack_normalization_failed"}
 	if not response.has("normalized_pack_id"):
-		return {"ok": false}
+		return {"ok": false, "terminal_error": "pack_normalization_failed"}
 	var normalized = response.normalized_pack_id
 	if normalized == null:
 		return {"ok": true, "value": null}
 	if typeof(normalized) != TYPE_STRING or normalized.strip_edges().length() == 0:
-		return {"ok": false}
+		return {"ok": false, "terminal_error": "pack_normalization_failed"}
 	return {"ok": true, "value": normalized}
 
 
@@ -935,33 +917,29 @@ func _write_bytes_immutable(path, bytes):
 	return "write_failed"
 
 
-func _replace_bytes_recoverably(path, bytes):
-	var directory = Directory.new()
-	directory.make_dir_recursive(path.get_base_dir())
-	var temporary_path = path + "." + str(OS.get_ticks_msec()) + ".next"
-	directory.remove(temporary_path)
-	_last_update_file_publications += 1
+func _write_bytes_immutable_bound(path, bytes, expected_hash, expected_byte_count):
+	var existing = _read_bounded_bytes(path, expected_byte_count)
+	if existing != null:
+		return "valid" if existing.size() == expected_byte_count and _sha256_bytes(existing) == expected_hash else "conflict"
+	return "valid" if _write_bytes_immutable(path, bytes) == "created" else "write_failed"
+
+
+func _read_bounded_bytes(path, maximum_bytes):
 	var file = File.new()
-	if file.open(temporary_path, File.WRITE) != OK:
-		return "write_failed"
-	file.store_buffer(bytes)
-	file.flush()
+	if not file.file_exists(path) or file.open(path, File.READ) != OK:
+		return null
+	if file.get_len() > maximum_bytes:
+		file.close()
+		return null
+	var bytes = file.get_buffer(file.get_len())
 	file.close()
-	if directory.rename(temporary_path, path) == OK:
-		return "replaced"
-	directory.remove(temporary_path)
-	return "write_failed"
+	return bytes
 
 
 func _ensure_catalog_directories():
 	var directory = Directory.new()
 	directory.make_dir_recursive(catalog_root)
-	directory.make_dir_recursive(_snapshots_root())
 	directory.make_dir_recursive(_previews_root())
-
-
-func _snapshots_root():
-	return catalog_root + "/snapshots"
 
 
 func _previews_root():
@@ -972,8 +950,8 @@ func _pack_normalization_root():
 	return catalog_root.get_base_dir() + "/private/pack-normalization"
 
 
-func _catalog_publication_root():
-	return catalog_root.get_base_dir() + "/private/catalog-publication"
+func _catalog_commit_root():
+	return catalog_root.get_base_dir() + "/private/catalog-commit"
 
 
 func _read_bounded_dictionary(path, maximum_bytes):
@@ -996,6 +974,16 @@ func _private_request_is_pending(private_root, request_id):
 
 func _is_json_nonnegative_integer(value):
 	return typeof(value) == TYPE_REAL and not is_nan(value) and not is_inf(value) and value >= 0.0 and value <= 9007199254740991.0 and value == floor(value)
+
+
+func _is_sha256_value(value):
+	if typeof(value) != TYPE_STRING or value.length() != 64:
+		return false
+	for index in range(value.length()):
+		var code = value.ord_at(index)
+		if not (code >= 48 and code <= 57) and not (code >= 97 and code <= 102):
+			return false
+	return true
 
 
 func _is_safe_segment(value):

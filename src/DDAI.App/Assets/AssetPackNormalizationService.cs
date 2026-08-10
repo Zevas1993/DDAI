@@ -35,6 +35,7 @@ public sealed class AssetPackNormalizationService
 
     public int ProcessPending()
     {
+        using var lease = fileSystem.AcquireDirectoryLease();
         var processed = 0;
         foreach (var requestPath in fileSystem
                      .EnumerateFiles(requestsRoot, "*.json", MaximumDirectoryCandidates)
@@ -61,6 +62,7 @@ public sealed class AssetPackNormalizationService
             var expectedId = Hash(request.Value);
             if (!string.Equals(request.SchemaVersion, "1.0", StringComparison.Ordinal) ||
                 !string.Equals(request.RequestId, expectedId, StringComparison.Ordinal) ||
+                !string.Equals(request.RequestContentHash, ComputeRequestContentHash(request.RequestId, request.Value), StringComparison.Ordinal) ||
                 !string.Equals(Path.GetFileNameWithoutExtension(requestPath), expectedId, StringComparison.Ordinal))
             {
                 throw new InvalidDataException("Pack normalization request identity is invalid.");
@@ -76,14 +78,13 @@ public sealed class AssetPackNormalizationService
         var response = new NormalizationResponse(
             "1.0",
             request.RequestId,
+            request.RequestContentHash,
             normalized.Length == 0 ? null : normalized);
-        if (File.Exists(responsePath))
+        if (fileSystem.EntryExists(responsePath))
         {
             try
             {
-                var existing = JsonSerializer.Deserialize<NormalizationResponse>(
-                    fileSystem.ReadBounded(responsePath, MaximumRequestBytes),
-                    JsonOptions);
+                var existing = ReadResponse(responsePath);
                 if (existing == response)
                 {
                     fileSystem.DeleteOrdinaryOrLink(requestPath);
@@ -142,9 +143,42 @@ public sealed class AssetPackNormalizationService
     private static string Hash(string value) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
 
-    private sealed record NormalizationRequest(string SchemaVersion, string RequestId, string Value);
+    internal static string ComputeRequestContentHash(string requestId, string value) => Hash(
+        "schema_version=3:1.0\nrequest_id=64:" + requestId + "\nvalue=" +
+        Encoding.UTF8.GetByteCount(value) + ":" + value + "\n");
 
-    private sealed record NormalizationResponse(string SchemaVersion, string RequestId, string? NormalizedPackId);
+    private NormalizationResponse ReadResponse(string responsePath)
+    {
+        using var document = JsonDocument.Parse(fileSystem.ReadBounded(responsePath, MaximumRequestBytes));
+        var root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object ||
+            !root.TryGetProperty("schema_version", out var schema) || schema.ValueKind != JsonValueKind.String ||
+            !root.TryGetProperty("request_id", out var requestId) || requestId.ValueKind != JsonValueKind.String ||
+            !root.TryGetProperty("request_content_hash", out var requestHash) || requestHash.ValueKind != JsonValueKind.String ||
+            !root.TryGetProperty("normalized_pack_id", out var normalized) ||
+            normalized.ValueKind is not (JsonValueKind.String or JsonValueKind.Null))
+        {
+            throw new JsonException("Pack normalization response is malformed.");
+        }
+
+        return new NormalizationResponse(
+            schema.GetString()!,
+            requestId.GetString()!,
+            requestHash.GetString()!,
+            normalized.ValueKind == JsonValueKind.Null ? null : normalized.GetString());
+    }
+
+    private sealed record NormalizationRequest(
+        string SchemaVersion,
+        string RequestId,
+        string RequestContentHash,
+        string Value);
+
+    private sealed record NormalizationResponse(
+        string SchemaVersion,
+        string RequestId,
+        string RequestContentHash,
+        string? NormalizedPackId);
 }
 
 public sealed class AssetPackNormalizationWorker(AssetPackNormalizationService service) : BackgroundService

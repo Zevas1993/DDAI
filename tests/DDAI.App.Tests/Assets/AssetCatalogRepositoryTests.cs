@@ -90,35 +90,6 @@ public sealed class AssetCatalogRepositoryTests
     }
 
     [Fact]
-    public void PublicationAdviceService_WritesBoundedPrivateResponseAndDeletesDurableRequest()
-    {
-        using var sandbox = CatalogSandbox.CreateComplete();
-        File.Copy(sandbox.CurrentPath, Path.Combine(sandbox.Root, "current-slot-0.json"));
-        const string requestId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        var requests = Path.Combine(sandbox.MailboxRoot, "private", "catalog-publication", "requests");
-        Directory.CreateDirectory(requests);
-        var requestPath = Path.Combine(requests, requestId + ".json");
-        File.WriteAllText(
-            requestPath,
-            JsonSerializer.Serialize(new { schema_version = "1.0", request_id = requestId, wall_clock_revision = 0 }));
-
-        var processed = new AssetCatalogPublicationAdviceService(sandbox.MailboxRoot, sandbox.TimeProvider)
-            .ProcessPending();
-
-        Assert.Equal(1, processed);
-        Assert.False(File.Exists(requestPath));
-        using var response = JsonDocument.Parse(File.ReadAllText(Path.Combine(
-            sandbox.MailboxRoot,
-            "private",
-            "catalog-publication",
-            "responses",
-            requestId + ".json")));
-        Assert.True(response.RootElement.GetProperty("success").GetBoolean());
-        Assert.Equal(2, response.RootElement.GetProperty("catalog_revision").GetInt64());
-        Assert.Equal(1, response.RootElement.GetProperty("slot_index").GetInt32());
-    }
-
-    [Fact]
     public void TryRefresh_PromotesOnlyACompleteHashVerifiedSnapshot()
     {
         using var sandbox = CatalogSandbox.CreateComplete();

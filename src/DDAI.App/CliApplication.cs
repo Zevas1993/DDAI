@@ -8,7 +8,9 @@ public sealed class CliApplication(
     TextWriter stdout,
     TextWriter stderr,
     TimeProvider timeProvider,
-    IDungeondraftProcessProbe? processProbe = null)
+    IDungeondraftProcessProbe? processProbe = null,
+    string? assetHelperExecutablePath = null,
+    string? assetHelperTrustedRoot = null)
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -39,6 +41,10 @@ public sealed class CliApplication(
 
             if (options.Command == DdaiCommand.AssetHelper)
             {
+                AssetHelperIdentity.Verify(
+                    options.MailboxRoot,
+                    assetHelperExecutablePath ?? Environment.ProcessPath ?? throw new InvalidDataException("The asset-helper process path is unavailable."),
+                    assetHelperTrustedRoot);
                 new AssetHelperService(options.MailboxRoot, timeProvider).RunOnce();
                 return 0;
             }
@@ -69,7 +75,7 @@ public sealed class CliApplication(
             await stderr.WriteLineAsync(exception.Message);
             return 64;
         }
-        catch (Exception exception) when (exception is ClientConfigException or LocalSetupException or DungeondraftConfigException or IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (exception is ClientConfigException or LocalSetupException or DungeondraftConfigException or IOException or UnauthorizedAccessException or InvalidDataException)
         {
             if (options?.Command != DdaiCommand.Serve)
             {

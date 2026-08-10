@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Security.Cryptography;
 using System.Text;
 using DDAI.App;
+using DDAI.App.Assets;
 using DDAI.Core.Mailbox;
 
 namespace DDAI.App.Tests;
@@ -35,13 +36,20 @@ public sealed class CliAndStatusTests
         var requestId = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
         var requests = Path.Combine(sandbox.Path, "private", "pack-normalization", "requests");
         Directory.CreateDirectory(requests);
+        var requestContentHash = AssetPackNormalizationService.ComputeRequestContentHash(requestId, value);
         File.WriteAllText(
             Path.Combine(requests, requestId + ".json"),
-            JsonSerializer.Serialize(new { schema_version = "1.0", request_id = requestId, value }));
+            JsonSerializer.Serialize(new { schema_version = "1.0", request_id = requestId, request_content_hash = requestContentHash, value }));
+        var helper = sandbox.WriteHelperReceipt();
         using var stdout = new StringWriter();
         using var stderr = new StringWriter();
 
-        var exitCode = await new CliApplication(stdout, stderr, TimeProvider.System)
+        var exitCode = await new CliApplication(
+                stdout,
+                stderr,
+                TimeProvider.System,
+                assetHelperExecutablePath: helper,
+                assetHelperTrustedRoot: Path.GetDirectoryName(helper))
             .RunAsync(["asset-helper", "--mailbox-root", sandbox.Path]);
 
         Assert.Equal(0, exitCode);
@@ -49,6 +57,39 @@ public sealed class CliAndStatusTests
             Path.Combine(sandbox.Path, "private", "pack-normalization", "responses", requestId + ".json")));
         Assert.Equal("pack café", response.RootElement.GetProperty("normalized_pack_id").GetString());
         Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Fact]
+    public async Task AssetHelper_ChangedExecutableFailsSelfCheckBeforeMailboxAction()
+    {
+        using var sandbox = new TestDirectory();
+        var helper = sandbox.WriteHelperReceipt();
+        File.AppendAllText(helper, "changed");
+        const string value = " Pack Café ";
+        var requestId = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+        var requests = Path.Combine(sandbox.Path, "private", "pack-normalization", "requests");
+        Directory.CreateDirectory(requests);
+        File.WriteAllText(
+            Path.Combine(requests, requestId + ".json"),
+            JsonSerializer.Serialize(new
+            {
+                schema_version = "1.0",
+                request_id = requestId,
+                request_content_hash = AssetPackNormalizationService.ComputeRequestContentHash(requestId, value),
+                value,
+            }));
+
+        var exitCode = await new CliApplication(
+                TextWriter.Null,
+                TextWriter.Null,
+                TimeProvider.System,
+                assetHelperExecutablePath: helper,
+                assetHelperTrustedRoot: Path.GetDirectoryName(helper))
+            .RunAsync(["asset-helper", "--mailbox-root", sandbox.Path]);
+
+        Assert.Equal(1, exitCode);
+        Assert.True(File.Exists(Path.Combine(requests, requestId + ".json")));
+        Assert.False(File.Exists(Path.Combine(sandbox.Path, "private", "pack-normalization", "responses", requestId + ".json")));
     }
 
     [Theory]
@@ -139,6 +180,25 @@ public sealed class CliAndStatusTests
         }
 
         public string Path { get; }
+
+        public string WriteHelperReceipt()
+        {
+            var bytes = Encoding.UTF8.GetBytes("helper-fixture");
+            var hash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+            var helper = System.IO.Path.Combine(Path, "helpers", "ddai-" + hash + ".exe");
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(helper)!);
+            File.WriteAllBytes(helper, bytes);
+            var receipt = System.IO.Path.Combine(Path, "private", "asset-helper.json");
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(receipt)!);
+            File.WriteAllText(receipt, JsonSerializer.Serialize(new
+            {
+                schema_version = "1.0",
+                owner = "org.ddai.connector",
+                executable_path = helper,
+                sha256 = hash,
+            }));
+            return helper;
+        }
 
         public void Dispose() => Directory.Delete(Path, recursive: true);
     }

@@ -50,11 +50,11 @@ public sealed class DungeondraftAssetCatalogScriptTests
     }
 
     [Fact]
-    public void Script_PublishesStrictOpaqueSnapshotWireContractWithCurrentPointerLast()
+    public void Script_StagesStrictOpaqueCandidateAndLeavesPublicPointerCommitToHelper()
     {
         var script = ReadCatalogScript();
         var entryBuilder = FunctionBody(script, "_build_catalog_entry");
-        var publisher = FunctionBody(script, "_advance_publishing_state");
+        var publisher = FunctionBody(script, "_read_catalog_commit_response");
 
         foreach (var field in new[]
                  {
@@ -68,17 +68,14 @@ public sealed class DungeondraftAssetCatalogScriptTests
         Assert.DoesNotContain("\"resource_identity\"", entryBuilder, StringComparison.Ordinal);
         Assert.Contains("preview_hash = null", script, StringComparison.Ordinal);
         Assert.Contains("preview_not_available", script, StringComparison.Ordinal);
-        Assert.Contains("catalog/snapshots", script, StringComparison.Ordinal);
         Assert.Contains("catalog/previews", script, StringComparison.Ordinal);
-        Assert.Contains("catalog/current.json", script, StringComparison.Ordinal);
-        Assert.Contains("current-slot-0.json", script, StringComparison.Ordinal);
-        Assert.Contains("current-slot-1.json", script, StringComparison.Ordinal);
-        Assert.True(
-            publisher.IndexOf("MANIFEST_FILE_NAME", StringComparison.Ordinal) <
-            publisher.IndexOf("CURRENT_SLOT_FILE_NAMES", StringComparison.Ordinal) &&
-            publisher.IndexOf("CURRENT_SLOT_FILE_NAMES", StringComparison.Ordinal) <
-            publisher.IndexOf("CURRENT_POINTER_FILE_NAME", StringComparison.Ordinal),
-            "The immutable manifest and recoverable slot must be published before the mutable current pointer.");
+        Assert.Contains("private/catalog-commit", script, StringComparison.Ordinal);
+        Assert.Contains("candidate_fingerprint", script, StringComparison.Ordinal);
+        Assert.Contains("request_content_hash", script, StringComparison.Ordinal);
+        Assert.Contains("state_token", publisher, StringComparison.Ordinal);
+        Assert.DoesNotContain("_replace_bytes_recoverably", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("CURRENT_POINTER_FILE_NAME", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("CURRENT_SLOT_FILE_NAMES", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -88,7 +85,7 @@ public sealed class DungeondraftAssetCatalogScriptTests
 
         foreach (var state in new[]
                  {
-                     "waiting_for_receipt", "enumerating", "previewing", "writing_chunks", "publishing",
+                     "waiting_for_receipt", "enumerating", "previewing", "writing_chunks", "publishing_candidate", "waiting_catalog_commit",
                  })
         {
             Assert.Contains($"\"{state}\"", script, StringComparison.Ordinal);
@@ -109,18 +106,18 @@ public sealed class DungeondraftAssetCatalogScriptTests
         Assert.Contains("+ \"/responses/\"", script, StringComparison.Ordinal);
         Assert.DoesNotContain("non-ASCII IDs become null", script, StringComparison.Ordinal);
         Assert.Contains("helper_verification", script, StringComparison.Ordinal);
-        Assert.Contains("waiting_publication_advice", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("waiting_publication_advice", script, StringComparison.Ordinal);
         Assert.Contains("asset-helper", script, StringComparison.Ordinal);
         Assert.Contains("OS.execute", script, StringComparison.Ordinal);
         Assert.Contains("HELPER_LAUNCH_INTERVAL_MSEC", script, StringComparison.Ordinal);
         Assert.Contains("HELPER_MAX_LAUNCH_ATTEMPTS", script, StringComparison.Ordinal);
-        Assert.Contains("pack_normalization_unavailable", script, StringComparison.Ordinal);
+        Assert.Contains("pack_normalization_failed", script, StringComparison.Ordinal);
         Assert.Contains("response.has(\"normalized_pack_id\")", script, StringComparison.Ordinal);
         Assert.Contains("_pack_normalization_values", script, StringComparison.Ordinal);
         Assert.Contains("_private_request_is_pending", script, StringComparison.Ordinal);
-        Assert.Contains("if not _private_request_is_pending(_catalog_publication_root(), _publication_request_id)", script, StringComparison.Ordinal);
+        Assert.Contains("if not _private_request_is_pending(_catalog_commit_root(), _commit_request_id)", script, StringComparison.Ordinal);
         Assert.Contains("if not _private_request_is_pending(_pack_normalization_root(), _normalization_active_request_id)", script, StringComparison.Ordinal);
-        Assert.Contains("_publication_slot_index", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("_publication_slot_index", script, StringComparison.Ordinal);
         Assert.DoesNotContain("func _select_current_slot", script, StringComparison.Ordinal);
     }
 

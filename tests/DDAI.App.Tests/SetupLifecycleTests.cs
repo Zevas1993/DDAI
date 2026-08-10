@@ -18,15 +18,18 @@ public sealed class SetupLifecycleTests
         var receiptPath = Path.Combine(sandbox.UserDataDirectory, "ddai", "private", "asset-helper.json");
 
         _ = service.Setup(sandbox.Paths);
+        var helperPath = sandbox.Paths.AssetHelperExecutablePath;
 
         using (var receipt = JsonDocument.Parse(File.ReadAllText(receiptPath)))
         {
             Assert.Equal("1.0", receipt.RootElement.GetProperty("schema_version").GetString());
-            Assert.Equal(Path.GetFullPath(sandbox.Paths.InstalledExecutable), receipt.RootElement.GetProperty("executable_path").GetString());
+            Assert.Equal(Path.GetFullPath(helperPath), receipt.RootElement.GetProperty("executable_path").GetString());
             Assert.Equal(
                 Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(sandbox.Paths.InstalledExecutable))).ToLowerInvariant(),
                 receipt.RootElement.GetProperty("sha256").GetString());
         }
+        Assert.True(File.Exists(helperPath));
+        Assert.StartsWith("ddai-", Path.GetFileName(helperPath), StringComparison.Ordinal);
 
         File.Delete(receiptPath);
         _ = service.Setup(sandbox.Paths);
@@ -34,6 +37,19 @@ public sealed class SetupLifecycleTests
 
         _ = service.Uninstall(sandbox.Paths, sandbox.SourceExecutable);
         Assert.False(File.Exists(receiptPath));
+        Assert.False(File.Exists(helperPath));
+    }
+
+    [Fact]
+    public void Setup_RejectsHelperRootOutsidePerUserLocalAppData()
+    {
+        using var sandbox = new LifecycleSandbox();
+        var paths = sandbox.Paths with { AssetHelperRootOverride = Path.Combine(Environment.SystemDirectory, "DDAI", "helpers") };
+        var service = new LocalSetupService(new FixedTimeProvider(), new StubProcessProbe(false));
+
+        Assert.Throws<LocalSetupException>(() => service.Setup(paths));
+
+        Assert.False(File.Exists(paths.AssetHelperReceiptPath));
     }
 
     [Fact]
@@ -527,7 +543,10 @@ public sealed class SetupLifecycleTests
                 ModsDirectory,
                 UserDataDirectory,
                 ClaudePath,
-                GeminiPath);
+                GeminiPath)
+            {
+                AssetHelperRootOverride = Path.Combine(Root, "LocalAppData", "DDAI", "helpers"),
+            };
             SetupArguments = CommandArguments("setup");
         }
 

@@ -5,6 +5,6 @@ public sealed class AssetHelperService(string mailboxRoot, TimeProvider timeProv
     public void RunOnce()
     {
         _ = new AssetPackNormalizationService(mailboxRoot).ProcessPending();
-        _ = new AssetCatalogPublicationAdviceService(mailboxRoot, timeProvider).ProcessPending();
+        _ = new AssetCatalogCommitService(mailboxRoot, timeProvider).ProcessPending();
     }
 }

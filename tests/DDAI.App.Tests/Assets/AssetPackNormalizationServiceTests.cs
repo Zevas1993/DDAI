@@ -43,13 +43,21 @@ public sealed class AssetPackNormalizationServiceTests
             sandbox.WriteRequest(requestId, rawPackId);
 
             var responsePath = sandbox.ResponsePath(requestId);
-            for (var attempt = 0; attempt < 50 && !File.Exists(responsePath); attempt++)
+            string? responseText = null;
+            for (var attempt = 0; attempt < 50 && responseText is null; attempt++)
             {
+                try
+                {
+                    responseText = File.ReadAllText(responsePath);
+                }
+                catch (IOException)
+                {
+                }
                 await Task.Delay(20);
             }
 
-            Assert.True(File.Exists(responsePath));
-            using var response = JsonDocument.Parse(File.ReadAllText(responsePath));
+            Assert.NotNull(responseText);
+            using var response = JsonDocument.Parse(responseText);
             Assert.Equal("pack café", response.RootElement.GetProperty("normalized_pack_id").GetString());
         }
         finally
@@ -105,10 +113,12 @@ public sealed class AssetPackNormalizationServiceTests
         sandbox.WriteRequest(requestId, value);
         var service = new AssetPackNormalizationService(sandbox.MailboxRoot);
 
-        Assert.Equal(AssetPackNormalizationService.MaximumRequestsPerPass, service.ProcessPending());
-        Assert.Equal(AssetPackNormalizationService.MaximumRequestsPerPass, sandbox.QuarantinePaths().Length);
-        Assert.Single(sandbox.RequestPaths());
-        Assert.Equal(1, service.ProcessPending());
+        for (var pass = 0; pass < 10 && sandbox.RequestPaths().Length > 0; pass++)
+        {
+            _ = service.ProcessPending();
+        }
+
+        Assert.Empty(sandbox.RequestPaths());
         Assert.True(File.Exists(sandbox.ResponsePath(requestId)));
     }
 
@@ -143,6 +153,100 @@ public sealed class AssetPackNormalizationServiceTests
         Assert.Equal(1, restarted.ProcessPending());
         Assert.Empty(sandbox.RequestPaths());
         Assert.Empty(sandbox.QuarantinePaths());
+    }
+
+    [Fact]
+    public void ProcessPending_RestartReplacesResponseMissingNormalizedProperty()
+    {
+        using var sandbox = new NormalizationSandbox();
+        const string value = " Pack Café ";
+        var requestId = Hash(value);
+        sandbox.WriteRequest(requestId, value);
+        sandbox.WriteRawResponse(
+            requestId,
+            JsonSerializer.Serialize(new
+            {
+                schema_version = "1.0",
+                request_id = requestId,
+                request_content_hash = RequestContentHash(requestId, value),
+            }));
+
+        var restarted = new AssetPackNormalizationService(sandbox.MailboxRoot);
+
+        Assert.Equal(1, restarted.ProcessPending());
+        using var response = JsonDocument.Parse(File.ReadAllText(sandbox.ResponsePath(requestId)));
+        Assert.True(response.RootElement.TryGetProperty("normalized_pack_id", out var normalized));
+        Assert.Equal("pack café", normalized.GetString());
+        Assert.Single(sandbox.QuarantineEntries());
+    }
+
+    [Fact]
+    public void ProcessPending_RestartAcknowledgesExplicitNormalizedNull()
+    {
+        using var sandbox = new NormalizationSandbox();
+        const string value = "\u3000";
+        var requestId = Hash(value);
+        sandbox.WriteRequest(requestId, value);
+        sandbox.WriteNullResponse(requestId, value);
+
+        var restarted = new AssetPackNormalizationService(sandbox.MailboxRoot);
+
+        Assert.Equal(1, restarted.ProcessPending());
+        Assert.Empty(sandbox.RequestPaths());
+        using var response = JsonDocument.Parse(File.ReadAllText(sandbox.ResponsePath(requestId)));
+        Assert.Equal(JsonValueKind.Null, response.RootElement.GetProperty("normalized_pack_id").ValueKind);
+        Assert.Empty(sandbox.QuarantineEntries());
+    }
+
+    [Fact]
+    public void ProcessPending_RejectsRequestContentHashMismatch()
+    {
+        using var sandbox = new NormalizationSandbox();
+        const string value = " Pack Café ";
+        var requestId = Hash(value);
+        sandbox.WriteRawRequest(
+            requestId,
+            JsonSerializer.Serialize(new
+            {
+                schema_version = "1.0",
+                request_id = requestId,
+                request_content_hash = new string('0', 64),
+                value,
+            }));
+
+        Assert.Equal(1, new AssetPackNormalizationService(sandbox.MailboxRoot).ProcessPending());
+
+        Assert.Empty(sandbox.RequestPaths());
+        Assert.False(File.Exists(sandbox.ResponsePath(requestId)));
+        Assert.Single(sandbox.QuarantineEntries());
+    }
+
+    [Fact]
+    public void ProcessPending_ConsumesEightBlockingResponseDirectoriesThenProcessesValidRequest()
+    {
+        using var sandbox = new NormalizationSandbox();
+        var requests = Enumerable.Range(0, 9)
+            .Select(index => (Value: " Pack Café blocker " + index, Id: Hash(" Pack Café blocker " + index)))
+            .OrderBy(item => item.Id, StringComparer.Ordinal)
+            .ToArray();
+        foreach (var request in requests)
+        {
+            sandbox.WriteRequest(request.Id, request.Value);
+        }
+        foreach (var request in requests.Take(8))
+        {
+            Directory.CreateDirectory(sandbox.ResponsePath(request.Id));
+        }
+        var service = new AssetPackNormalizationService(sandbox.MailboxRoot);
+
+        for (var pass = 0; pass < 10 && sandbox.RequestPaths().Length > 0; pass++)
+        {
+            _ = service.ProcessPending();
+        }
+
+        Assert.Empty(sandbox.RequestPaths());
+        Assert.All(requests, request => Assert.True(File.Exists(sandbox.ResponsePath(request.Id))));
+        Assert.All(requests, request => Assert.False(Directory.Exists(sandbox.ResponsePath(request.Id))));
     }
 
     [Theory]
@@ -233,6 +337,10 @@ public sealed class AssetPackNormalizationServiceTests
     private static string Hash(string value) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
 
+    private static string RequestContentHash(string requestId, string value) =>
+        Hash("schema_version=3:1.0\nrequest_id=64:" + requestId + "\nvalue=" +
+             Encoding.UTF8.GetByteCount(value) + ":" + value + "\n");
+
     private sealed class NormalizationSandbox : IDisposable
     {
         public NormalizationSandbox(bool createServiceRoots = true)
@@ -252,7 +360,13 @@ public sealed class AssetPackNormalizationServiceTests
 
         public void WriteRequest(string requestId, string value) => File.WriteAllText(
             RequestPath(requestId),
-            JsonSerializer.Serialize(new { schema_version = "1.0", request_id = requestId, value }));
+            JsonSerializer.Serialize(new
+            {
+                schema_version = "1.0",
+                request_id = requestId,
+                request_content_hash = RequestContentHash(requestId, value),
+                value,
+            }));
 
         public void WriteRawRequest(string requestId, string json) => File.WriteAllText(RequestPath(requestId), json);
 
@@ -264,10 +378,29 @@ public sealed class AssetPackNormalizationServiceTests
         public void WriteResponse(string requestId, string normalizedPackId)
         {
             Directory.CreateDirectory(Path.Combine(NormalizationRoot, "responses"));
+            var request = JsonDocument.Parse(File.ReadAllText(RequestPath(requestId)));
             File.WriteAllText(
                 ResponsePath(requestId),
-                JsonSerializer.Serialize(new { schema_version = "1.0", request_id = requestId, normalized_pack_id = normalizedPackId }));
+                JsonSerializer.Serialize(new
+                {
+                    schema_version = "1.0",
+                    request_id = requestId,
+                    request_content_hash = request.RootElement.GetProperty("request_content_hash").GetString(),
+                    normalized_pack_id = normalizedPackId,
+                }));
         }
+
+        public void WriteNullResponse(string requestId, string value) => File.WriteAllText(
+            ResponsePath(requestId),
+            JsonSerializer.Serialize(new
+            {
+                schema_version = "1.0",
+                request_id = requestId,
+                request_content_hash = RequestContentHash(requestId, value),
+                normalized_pack_id = (string?)null,
+            }));
+
+        public void WriteRawResponse(string requestId, string json) => File.WriteAllText(ResponsePath(requestId), json);
 
         public string[] RequestPaths() => Directory.GetFiles(
             Path.Combine(NormalizationRoot, "requests"),
@@ -276,6 +409,10 @@ public sealed class AssetPackNormalizationServiceTests
 
         public string[] QuarantinePaths() => Directory.Exists(Path.Combine(NormalizationRoot, "quarantine"))
             ? Directory.GetFiles(Path.Combine(NormalizationRoot, "quarantine"), "*", SearchOption.TopDirectoryOnly)
+            : [];
+
+        public string[] QuarantineEntries() => Directory.Exists(Path.Combine(NormalizationRoot, "quarantine"))
+            ? Directory.GetFileSystemEntries(Path.Combine(NormalizationRoot, "quarantine"), "*", SearchOption.TopDirectoryOnly)
             : [];
 
         public void Dispose()

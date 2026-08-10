@@ -15,6 +15,7 @@ public sealed record LocalSetupPaths(
     string ClaudeConfigPath,
     string GeminiConfigPath)
 {
+    public string? AssetHelperRootOverride { get; init; }
     public string InstalledExecutable => Path.Combine(Path.GetFullPath(InstallRoot), "ddai.exe");
     public string MetadataPath => Path.Combine(Path.GetFullPath(InstallRoot), "install-metadata.json");
     public string AssetHelperReceiptPath => Path.Combine(
@@ -22,6 +23,18 @@ public sealed record LocalSetupPaths(
         "ddai",
         "private",
         "asset-helper.json");
+    public string AssetHelperRoot => Path.GetFullPath(AssetHelperRootOverride ?? Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "DDAI",
+        "helpers"));
+    public string AssetHelperExecutablePath
+    {
+        get
+        {
+            var hash = LocalSetupService.HashFile(InstalledExecutable);
+            return Path.Combine(AssetHelperRoot, "ddai-" + hash + ".exe");
+        }
+    }
     public string InstalledModDirectory => Path.Combine(Path.GetFullPath(ModsDirectory), "DDAI");
     public string DungeondraftConfigPath =>
         Path.Combine(Path.GetFullPath(DungeondraftUserDataDirectory), "config.ini");
@@ -678,6 +691,36 @@ public sealed class LocalSetupService
 
     private static void WriteAssetHelperReceipt(LocalSetupPaths paths)
     {
+        ValidateAssetHelperRoot(paths.AssetHelperRoot);
+        Directory.CreateDirectory(paths.AssetHelperRoot);
+        ValidateOrdinaryPath(paths.AssetHelperRoot);
+        var executableHash = HashFile(paths.InstalledExecutable);
+        var helperPath = Path.Combine(paths.AssetHelperRoot, "ddai-" + executableHash + ".exe");
+        if (File.Exists(helperPath))
+        {
+            if (HashFile(helperPath) != executableHash)
+            {
+                throw new LocalSetupException("Refusing a conflicting content-addressed asset helper.");
+            }
+        }
+        else
+        {
+            var temporary = helperPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                using (var source = new FileStream(paths.InstalledExecutable, FileMode.Open, FileAccess.Read, FileShare.Read))
+                using (var destination = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, FileOptions.WriteThrough))
+                {
+                    source.CopyTo(destination);
+                    destination.Flush(flushToDisk: true);
+                }
+                File.Move(temporary, helperPath, overwrite: false);
+            }
+            finally
+            {
+                File.Delete(temporary);
+            }
+        }
         var receiptPath = paths.AssetHelperReceiptPath;
         Directory.CreateDirectory(Path.GetDirectoryName(receiptPath)!);
         if (File.Exists(receiptPath))
@@ -693,7 +736,7 @@ public sealed class LocalSetupService
             }
 
             if (existing is null || existing.Owner != Owner ||
-                !Path.GetFullPath(existing.ExecutablePath).Equals(Path.GetFullPath(paths.InstalledExecutable), StringComparison.OrdinalIgnoreCase))
+                !Path.GetFullPath(existing.ExecutablePath).Equals(Path.GetFullPath(helperPath), StringComparison.OrdinalIgnoreCase))
             {
                 throw new LocalSetupException("Refusing to replace foreign asset-helper ownership metadata.");
             }
@@ -704,8 +747,8 @@ public sealed class LocalSetupService
             new AssetHelperReceipt(
                 "1.0",
                 Owner,
-                Path.GetFullPath(paths.InstalledExecutable),
-                HashFile(paths.InstalledExecutable)));
+                Path.GetFullPath(helperPath),
+                executableHash));
     }
 
     private static void DeleteOwnedAssetHelperReceipt(LocalSetupPaths paths)
@@ -720,10 +763,15 @@ public sealed class LocalSetupService
             var receipt = JsonSerializer.Deserialize<AssetHelperReceipt>(
                 File.ReadAllBytes(paths.AssetHelperReceiptPath),
                 JsonOptions);
+            var expectedPath = receipt is null ? string.Empty : Path.Combine(paths.AssetHelperRoot, "ddai-" + receipt.Sha256 + ".exe");
             if (receipt is not null && receipt.Owner == Owner &&
-                Path.GetFullPath(receipt.ExecutablePath).Equals(Path.GetFullPath(paths.InstalledExecutable), StringComparison.OrdinalIgnoreCase))
+                Path.GetFullPath(receipt.ExecutablePath).Equals(Path.GetFullPath(expectedPath), StringComparison.OrdinalIgnoreCase))
             {
                 File.Delete(paths.AssetHelperReceiptPath);
+                if (File.Exists(receipt.ExecutablePath) && HashFile(receipt.ExecutablePath) == receipt.Sha256)
+                {
+                    File.Delete(receipt.ExecutablePath);
+                }
             }
         }
         catch (Exception exception) when (exception is JsonException or IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
@@ -731,10 +779,32 @@ public sealed class LocalSetupService
         }
     }
 
-    private static string HashFile(string path)
+    internal static string HashFile(string path)
     {
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+    }
+
+    private static void ValidateAssetHelperRoot(string helperRoot)
+    {
+        var localAppData = Path.TrimEndingDirectorySeparator(Path.GetFullPath(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)));
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(helperRoot));
+        if (!root.StartsWith(localAppData + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new LocalSetupException("The asset helper root must remain under per-user LocalApplicationData.");
+        }
+    }
+
+    private static void ValidateOrdinaryPath(string path)
+    {
+        for (var current = new DirectoryInfo(Path.GetFullPath(path)); current is not null; current = current.Parent)
+        {
+            if (current.Exists && (current.Attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                throw new LocalSetupException("The asset helper path cannot traverse a reparse point.");
+            }
+        }
     }
 
     private void WriteInstallMetadata(

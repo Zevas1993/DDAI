@@ -8,6 +8,7 @@ namespace DDAI.App;
 internal sealed class SafeLocalFileSystem
 {
     private readonly string root;
+    private readonly HashSet<string> trustedDirectories = new(StringComparer.OrdinalIgnoreCase);
 
     public SafeLocalFileSystem(string root)
     {
@@ -19,6 +20,7 @@ internal sealed class SafeLocalFileSystem
 
         this.root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
         RequireOrdinaryDirectory(this.root);
+        trustedDirectories.Add(this.root);
     }
 
     public string EnsureDirectory(params string[] segments)
@@ -41,9 +43,19 @@ internal sealed class SafeLocalFileSystem
 
             Directory.CreateDirectory(current);
             RequireOrdinaryDirectory(current);
+            trustedDirectories.Add(current);
         }
 
         return current;
+    }
+
+    public IDisposable AcquireDirectoryLease()
+    {
+        var handles = trustedDirectories
+            .OrderBy(path => path.Length)
+            .Select(path => OpenValidatedHandle(path, directory: true, GenericRead, shareDelete: false, rejectReparse: true))
+            .ToArray();
+        return new DirectoryLease(handles);
     }
 
     public IReadOnlyList<string> EnumerateFiles(string directory, string pattern, int maximumCandidates)
@@ -58,10 +70,18 @@ internal sealed class SafeLocalFileSystem
         return files;
     }
 
+    public bool EntryExists(string path)
+    {
+        RequireBeneath(root, path);
+        var attributes = GetFileAttributes(path);
+        return attributes != uint.MaxValue || Marshal.GetLastWin32Error() is not (2 or 3);
+    }
+
     public byte[] ReadBounded(string path, int maximumBytes)
     {
         RequireBeneath(root, path);
-        using var handle = OpenOrdinaryHandle(path, directory: false);
+        using var lease = AcquireDirectoryLease();
+        using var handle = OpenValidatedHandle(path, directory: false, GenericRead, shareDelete: false, rejectReparse: true);
         using var stream = new FileStream(handle, FileAccess.Read, bufferSize: 4096, isAsync: false);
         if (stream.Length > maximumBytes)
         {
@@ -75,37 +95,56 @@ internal sealed class SafeLocalFileSystem
 
     public void WriteImmutable<T>(string destinationPath, T value, System.Text.Json.JsonSerializerOptions options)
     {
+        WriteImmutableBytes(destinationPath, System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(value, options));
+    }
+
+    public void WriteImmutableBytes(string destinationPath, ReadOnlySpan<byte> bytes)
+    {
         RequireBeneath(root, destinationPath);
         var parent = Path.GetDirectoryName(destinationPath)
             ?? throw new InvalidDataException("The private destination has no parent.");
         RequireOrdinaryDirectory(parent);
-        var temporaryPath = Path.Combine(parent, "." + Path.GetFileName(destinationPath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        using var lease = AcquireDirectoryLease();
+        using (var stream = new FileStream(
+                   destinationPath,
+                   FileMode.CreateNew,
+                   FileAccess.Write,
+                   FileShare.None,
+                   bufferSize: 4096,
+                   FileOptions.WriteThrough))
+        {
+            stream.Write(bytes);
+            stream.Flush(flushToDisk: true);
+            ValidateOpenedHandle(stream.SafeFileHandle, destinationPath, rejectReparse: true);
+        }
+    }
+
+    public void ReplaceBytes(string destinationPath, ReadOnlySpan<byte> bytes)
+    {
+        RequireBeneath(root, destinationPath);
+        var parent = Path.GetDirectoryName(destinationPath)
+            ?? throw new InvalidDataException("The replacement destination has no parent.");
+        RequireOrdinaryDirectory(parent);
+        using var lease = AcquireDirectoryLease();
+        var temporary = Path.Combine(parent, "." + Path.GetFileName(destinationPath) + "." + Guid.NewGuid().ToString("N") + ".next");
         try
         {
             using (var stream = new FileStream(
-                       temporaryPath,
+                       temporary,
                        FileMode.CreateNew,
                        FileAccess.Write,
-                       FileShare.None,
+                       FileShare.Read,
                        bufferSize: 4096,
                        FileOptions.WriteThrough))
             {
-                System.Text.Json.JsonSerializer.Serialize(stream, value, options);
+                stream.Write(bytes);
                 stream.Flush(flushToDisk: true);
             }
-
-            using (OpenOrdinaryHandle(temporaryPath, directory: false))
-            {
-            }
-            RequireOrdinaryDirectory(parent);
-            File.Move(temporaryPath, destinationPath, overwrite: false);
-            using (OpenOrdinaryHandle(destinationPath, directory: false))
-            {
-            }
+            File.Move(temporary, destinationPath, overwrite: true);
         }
         finally
         {
-            File.Delete(temporaryPath);
+            File.Delete(temporary);
         }
     }
 
@@ -115,19 +154,15 @@ internal sealed class SafeLocalFileSystem
         var parent = Path.GetDirectoryName(path)
             ?? throw new InvalidDataException("The private file has no parent.");
         RequireOrdinaryDirectory(parent);
-        if (!File.Exists(path))
+        using var lease = AcquireDirectoryLease();
+        if (!EntryExists(path))
         {
             return;
         }
-
-        if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) == 0)
-        {
-            using (OpenOrdinaryHandle(path, directory: false))
-            {
-            }
-        }
-
-        File.Delete(path);
+        var attributes = GetEntryAttributes(path);
+        var isDirectory = (attributes & FileAttributes.Directory) != 0;
+        using var handle = OpenValidatedHandle(path, isDirectory, DeleteAccess, shareDelete: true, rejectReparse: false);
+        SetDeleteDisposition(handle);
         RequireOrdinaryDirectory(parent);
     }
 
@@ -136,27 +171,39 @@ internal sealed class SafeLocalFileSystem
         RequireBeneath(root, path);
         RequireBeneath(root, quarantineDirectory);
         RequireOrdinaryDirectory(quarantineDirectory);
-        if (!File.Exists(path))
+        using var lease = AcquireDirectoryLease();
+        if (!EntryExists(path))
         {
             return;
         }
 
-        if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
-        {
-            DeleteOrdinaryOrLink(path);
-            return;
-        }
-
-        using (OpenOrdinaryHandle(path, directory: false))
-        {
-        }
-        var destination = Path.Combine(
-            quarantineDirectory,
-            Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N") + ".invalid");
+        var attributes = GetEntryAttributes(path);
+        var isDirectory = (attributes & FileAttributes.Directory) != 0;
+        var destinationName = Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N") + ".invalid";
+        var destination = Path.Combine(quarantineDirectory, destinationName);
         RequireBeneath(root, destination);
-        File.Move(path, destination, overwrite: false);
-        using (OpenOrdinaryHandle(destination, directory: false))
+        using var quarantine = OpenValidatedHandle(quarantineDirectory, directory: true, GenericRead, shareDelete: false, rejectReparse: true);
+        var deleted = false;
+        using (var source = OpenValidatedHandle(path, isDirectory, DeleteAccess, shareDelete: true, rejectReparse: false))
         {
+            try
+            {
+                RenameByHandleWithRetries(source, destination);
+            }
+            catch (Win32Exception)
+            {
+                // Empty directory blockers and malformed files may be safely consumed even when
+                // a filter driver refuses the handle rename. The already-opened object is deleted;
+                // no path is re-resolved for the fallback.
+                SetDeleteDisposition(source);
+                deleted = true;
+            }
+        }
+        if (!deleted)
+        {
+            using (OpenValidatedHandle(destination, isDirectory, GenericRead, shareDelete: false, rejectReparse: false))
+            {
+            }
         }
     }
 
@@ -167,15 +214,20 @@ internal sealed class SafeLocalFileSystem
             throw new InvalidDataException("Private paths must use ordinary directories.");
         }
 
-        using var handle = OpenOrdinaryHandle(path, directory: true);
+        using var handle = OpenValidatedHandle(path, directory: true, GenericRead, shareDelete: true, rejectReparse: true);
     }
 
-    private static SafeFileHandle OpenOrdinaryHandle(string path, bool directory)
+    private static SafeFileHandle OpenValidatedHandle(
+        string path,
+        bool directory,
+        uint desiredAccess,
+        bool shareDelete,
+        bool rejectReparse)
     {
         var handle = CreateFile(
             path,
-            GenericRead,
-            FileShareRead | FileShareWrite | FileShareDelete,
+            desiredAccess,
+            FileShareRead | FileShareWrite | (shareDelete ? FileShareDelete : 0),
             IntPtr.Zero,
             OpenExisting,
             FileFlagOpenReparsePoint | (directory ? FileFlagBackupSemantics : 0),
@@ -187,23 +239,27 @@ internal sealed class SafeLocalFileSystem
 
         try
         {
-            if (!GetFileInformationByHandleEx(
-                    handle,
-                    FileInfoByHandleClass.FileAttributeTagInfo,
-                    out var attributes,
-                    (uint)Marshal.SizeOf<FileAttributeTagInfo>()) ||
-                (attributes.FileAttributes & (uint)FileAttributes.ReparsePoint) != 0 ||
-                !PathsEqual(GetFinalPath(handle), path))
-            {
-                throw new InvalidDataException("Private paths cannot traverse reparse points.");
-            }
-
+            ValidateOpenedHandle(handle, path, rejectReparse);
             return handle;
         }
         catch
         {
             handle.Dispose();
             throw;
+        }
+    }
+
+    private static void ValidateOpenedHandle(SafeFileHandle handle, string path, bool rejectReparse)
+    {
+        if (!GetFileInformationByHandleEx(
+                handle,
+                FileInfoByHandleClass.FileAttributeTagInfo,
+                out var attributes,
+                (uint)Marshal.SizeOf<FileAttributeTagInfo>()) ||
+            (rejectReparse && (attributes.FileAttributes & (uint)FileAttributes.ReparsePoint) != 0) ||
+            !PathsEqual(GetFinalPath(handle), path))
+        {
+            throw new InvalidDataException("Private paths cannot traverse reparse points.");
         }
     }
 
@@ -248,7 +304,77 @@ internal sealed class SafeLocalFileSystem
         Path.TrimEndingDirectorySeparator(Path.GetFullPath(right)),
         StringComparison.OrdinalIgnoreCase);
 
+    private static FileAttributes GetEntryAttributes(string path)
+    {
+        var attributes = GetFileAttributes(path);
+        if (attributes == uint.MaxValue)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "A private entry could not be inspected.");
+        }
+        return (FileAttributes)attributes;
+    }
+
+    private static void SetDeleteDisposition(SafeFileHandle handle)
+    {
+        var disposition = new FileDispositionInfo { DeleteFile = true };
+        if (!SetFileInformationByHandle(
+                handle,
+                FileInfoByHandleClass.FileDispositionInfo,
+                ref disposition,
+                (uint)Marshal.SizeOf<FileDispositionInfo>()))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "A private entry could not be deleted by handle.");
+        }
+    }
+
+    private static void RenameByHandle(SafeFileHandle source, string destinationPath)
+    {
+        var nameBytes = Encoding.Unicode.GetBytes(destinationPath);
+        var headerSize = IntPtr.Size == 8 ? 20 : 12;
+        var buffer = Marshal.AllocHGlobal(headerSize + nameBytes.Length);
+        try
+        {
+            for (var index = 0; index < headerSize + nameBytes.Length; index++)
+            {
+                Marshal.WriteByte(buffer, index, 0);
+            }
+            Marshal.WriteByte(buffer, 0, 0);
+            Marshal.WriteIntPtr(buffer, IntPtr.Size == 8 ? 8 : 4, IntPtr.Zero);
+            Marshal.WriteInt32(buffer, IntPtr.Size == 8 ? 16 : 8, nameBytes.Length);
+            Marshal.Copy(nameBytes, 0, IntPtr.Add(buffer, headerSize), nameBytes.Length);
+            if (!SetFileInformationByHandle(
+                    source,
+                    FileInfoByHandleClass.FileRenameInfo,
+                    buffer,
+                    (uint)(headerSize + nameBytes.Length)))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "A private entry could not be quarantined by handle.");
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    private static void RenameByHandleWithRetries(SafeFileHandle source, string destinationPath)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                RenameByHandle(source, destinationPath);
+                return;
+            }
+            catch (Win32Exception) when (attempt < 3)
+            {
+                Thread.Sleep(1);
+            }
+        }
+    }
+
     private const uint GenericRead = 0x80000000;
+    private const uint DeleteAccess = 0x00010000;
     private const uint FileShareRead = 0x00000001;
     private const uint FileShareWrite = 0x00000002;
     private const uint FileShareDelete = 0x00000004;
@@ -258,6 +384,8 @@ internal sealed class SafeLocalFileSystem
 
     private enum FileInfoByHandleClass
     {
+        FileRenameInfo = 3,
+        FileDispositionInfo = 4,
         FileAttributeTagInfo = 9,
     }
 
@@ -266,6 +394,25 @@ internal sealed class SafeLocalFileSystem
     {
         public uint FileAttributes;
         public uint ReparseTag;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileDispositionInfo
+    {
+        [MarshalAs(UnmanagedType.U1)]
+        public bool DeleteFile;
+    }
+
+    private sealed class DirectoryLease(IEnumerable<SafeFileHandle> handles) : IDisposable
+    {
+        private readonly SafeFileHandle[] handles = handles.ToArray();
+        public void Dispose()
+        {
+            foreach (var handle in handles.Reverse())
+            {
+                handle.Dispose();
+            }
+        }
     }
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -292,4 +439,23 @@ internal sealed class SafeLocalFileSystem
         StringBuilder path,
         uint pathLength,
         uint flags);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFileAttributes(string fileName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetFileInformationByHandle(
+        SafeFileHandle file,
+        FileInfoByHandleClass fileInformationClass,
+        ref FileDispositionInfo fileInformation,
+        uint bufferSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetFileInformationByHandle(
+        SafeFileHandle file,
+        FileInfoByHandleClass fileInformationClass,
+        IntPtr fileInformation,
+        uint bufferSize);
 }
