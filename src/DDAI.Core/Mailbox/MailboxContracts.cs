@@ -1,4 +1,5 @@
 using System.Text.Json;
+using DDAI.Core.MapPlans;
 
 namespace DDAI.Core.Mailbox;
 
@@ -24,6 +25,20 @@ public sealed record MailboxRequest
         Timestamp = timestamp,
         Payload = JsonSerializer.SerializeToElement(new { }),
     };
+
+    public static MailboxRequest CreateApplyPlan(MapPlan plan, DateTimeOffset timestamp)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+
+        return new MailboxRequest
+        {
+            SchemaVersion = CurrentSchemaVersion,
+            RequestId = plan.RequestId,
+            Command = "apply_plan",
+            Timestamp = timestamp,
+            Payload = MapPlanJson.SerializeToElement(plan),
+        };
+    }
 }
 
 public sealed record MailboxErrorDetails(string Code, string Message, string? Path = null);

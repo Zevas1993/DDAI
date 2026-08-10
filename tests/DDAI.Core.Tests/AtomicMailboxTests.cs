@@ -1,10 +1,49 @@
 using DDAI.Core.Mailbox;
+using DDAI.Core.MapPlans;
 using System.Text.Json;
 
 namespace DDAI.Core.Tests;
 
 public sealed class AtomicMailboxTests
 {
+    [Fact]
+    public void CreateApplyPlan_UsesPlanIdentityAndCanonicalPayload()
+    {
+        var plan = ValidRoomPlan("apply-factory-001");
+        var timestamp = DateTimeOffset.Parse("2026-08-09T12:00:00Z");
+
+        var request = MailboxRequest.CreateApplyPlan(plan, timestamp);
+
+        Assert.Equal(MailboxRequest.CurrentSchemaVersion, request.SchemaVersion);
+        Assert.Equal(plan.RequestId, request.RequestId);
+        Assert.Equal("apply_plan", request.Command);
+        Assert.Equal(timestamp, request.Timestamp);
+        Assert.Equal(MapPlanJson.Serialize(plan), request.Payload.GetRawText());
+    }
+
+    [Fact]
+    public void FakeMod_ClaimsApplyPlanAndWritesCorrelatedSuccessResponse()
+    {
+        using var sandbox = new MailboxSandbox();
+        var mailbox = new AtomicMailbox(sandbox.Root);
+        var plan = ValidRoomPlan("apply-fake-001");
+
+        mailbox.PublishRequest(MailboxRequest.CreateApplyPlan(plan, Timestamp));
+        var handled = new FakeModHarness(mailbox).HandleOne();
+        var response = mailbox.WaitForResponse(plan.RequestId, TimeSpan.FromMilliseconds(100));
+
+        Assert.True(handled);
+        Assert.NotNull(response);
+        Assert.True(response.Success);
+        Assert.Equal("apply_plan", response.Command);
+        Assert.True(response.Payload.GetProperty("applied").GetBoolean());
+        Assert.Equal(1, response.Payload.GetProperty("created_walls").GetInt32());
+        Assert.Equal("room-entrance", response.Payload.GetProperty("room_id").GetString());
+        Assert.True(response.Payload.GetProperty("undo_available").GetBoolean());
+        Assert.Equal("Use Dungeondraft Undo once", response.Payload.GetProperty("undo_instruction").GetString());
+        Assert.Equal(MapPlanJson.Fingerprint(plan), response.Payload.GetProperty("plan_fingerprint").GetString());
+    }
+
     [Fact]
     public void FakeMod_ClaimsStatusRequestAndWritesCorrelatedSuccessResponse()
     {
@@ -338,6 +377,16 @@ public sealed class AtomicMailboxTests
         Timestamp = Timestamp,
         Success = true,
         Payload = JsonSerializer.SerializeToElement(new { state }),
+    };
+
+    private static MapPlan ValidRoomPlan(string requestId) => new()
+    {
+        SchemaVersion = MapPlan.CurrentSchemaVersion,
+        RequestId = requestId,
+        BaseRevision = 0,
+        Mode = MapOperationMode.Add,
+        Canvas = new MapCanvas(40, 30),
+        Rooms = [new MapRoom("room-entrance", 8, 7, 10, 8)],
     };
 
     private static string PublishCompletedStatusResponse(AtomicMailbox mailbox, string root, string requestId)
