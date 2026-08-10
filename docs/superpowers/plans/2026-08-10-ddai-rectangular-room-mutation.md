@@ -635,16 +635,19 @@ Expected: failures for version, command list, missing plan validator, missing in
 
 - [ ] **Step 3: Add strict GDScript plan validation**
 
-Validate the direct request payload as the plan. Require exact types (`TYPE_STRING`, `TYPE_INT`, `TYPE_DICTIONARY`, `TYPE_ARRAY`), `schema_version == "1.0"`, matching request IDs, `mode == "add"`, `base_revision == 0`, positive canvas, one room, safe room ID, nonnegative x/y, positive width/height, and subtraction-based bounds.
+Execution correction from the official Godot 3.5 JSON contract: `JSON.parse` converts every JSON number to `TYPE_REAL`, including integer spellings. Validate the direct request payload as the plan. Require exact types (`TYPE_STRING`, `TYPE_REAL`, `TYPE_DICTIONARY`, `TYPE_ARRAY`), `schema_version == "1.0"`, matching request IDs, `mode == "add"`, `base_revision == 0`, positive canvas, one room, safe room ID, nonnegative x/y, positive width/height, and subtraction-based bounds. A numeric field is accepted only when it is finite, whole-valued, and within signed 32-bit range; convert to `int` only afterward.
 
 Reject JSON integers outside signed 32-bit range before conversion or multiplication:
 
 ```gdscript
+func _is_json_int32(value):
+	return typeof(value) == TYPE_REAL and not is_nan(value) and not is_inf(value) and value == floor(value) and value >= -2147483648.0 and value <= 2147483647.0
+
 func _is_nonnegative_int32(value):
-	return typeof(value) == TYPE_INT and value >= 0 and value <= 2147483647
+	return _is_json_int32(value) and value >= 0.0
 
 func _is_positive_int32(value):
-	return typeof(value) == TYPE_INT and value > 0 and value <= 2147483647
+	return _is_json_int32(value) and value > 0.0
 ```
 
 After strict field/type checks, build `_plan_fingerprint_input(plan)` using the exact Task 1 scalar framing. Use `value.to_utf8().size()` for string byte counts, literal `"\n"`, decimal integer strings, fixed tags, and room array order; do not hash `to_json(plan)` or depend on Dictionary iteration/escaping. Compute `plan_fingerprint` from `_plan_fingerprint_input(plan).sha256_text()`. Add a static source contract for the exact field/tag order and pair it with the .NET golden fixture containing a non-ASCII/quoted identifier. The live mismatch and valid responses are the executable cross-language proof and must equal `MapPlanJson.Fingerprint`.

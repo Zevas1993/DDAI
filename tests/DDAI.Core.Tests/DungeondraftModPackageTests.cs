@@ -5,6 +5,146 @@ namespace DDAI.Core.Tests;
 public sealed class DungeondraftModPackageTests
 {
     [Fact]
+    public void Package_DeclaresRectangularRoomMutationBridgeVersionAndCommands()
+    {
+        var modRoot = Path.Combine(FindRepositoryRoot(), "mods", "DDAI");
+        using var manifest = JsonDocument.Parse(File.ReadAllText(Path.Combine(modRoot, "ddai_bridge.ddmod")));
+        var script = File.ReadAllText(Path.Combine(modRoot, "scripts", "ddai_bridge.gd"));
+        var readme = File.ReadAllText(Path.Combine(modRoot, "README.md"));
+
+        Assert.Equal("0.2.0", manifest.RootElement.GetProperty("version").GetString());
+        Assert.Equal("0.2.0", ConstantValue(script, "MOD_VERSION"));
+        Assert.Contains("const SUPPORTED_COMMANDS = [\"status\", \"apply_plan\"]", script, StringComparison.Ordinal);
+        Assert.Contains("apply_plan", readme, StringComparison.Ordinal);
+        Assert.Contains("native rectangular wall", readme, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Gdscript_ValidatesGodotJsonFloatsAsBoundedWholeInt32Values()
+    {
+        var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
+        var validator = FunctionBody(script, "_validate_rectangular_room_plan");
+        var int32 = FunctionBody(script, "_is_json_int32");
+
+        Assert.Contains("typeof(value) == TYPE_REAL", int32, StringComparison.Ordinal);
+        Assert.DoesNotContain("typeof(value) == TYPE_INT", int32, StringComparison.Ordinal);
+        Assert.Contains("not is_nan(value)", int32, StringComparison.Ordinal);
+        Assert.Contains("not is_inf(value)", int32, StringComparison.Ordinal);
+        Assert.Contains("value == floor(value)", int32, StringComparison.Ordinal);
+        Assert.Contains("value >= -2147483648.0", int32, StringComparison.Ordinal);
+        Assert.Contains("value <= 2147483647.0", int32, StringComparison.Ordinal);
+        foreach (var code in new[]
+                 {
+                     "unsupported_mode", "unsupported_base_revision", "invalid_room_count", "room_required",
+                     "invalid_room_id", "invalid_room_x", "invalid_room_y", "invalid_room_width",
+                     "invalid_room_height", "room_out_of_bounds",
+                 })
+        {
+            Assert.Contains("\"" + code + "\"", validator, StringComparison.Ordinal);
+        }
+        Assert.Contains("canvas.width - room.x", validator, StringComparison.Ordinal);
+        Assert.Contains("canvas.height - room.y", validator, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Gdscript_UsesLanguageNeutralPlanFingerprintFraming()
+    {
+        var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
+        var body = FunctionBody(script, "_plan_fingerprint_input");
+        var orderedTags = new[]
+        {
+            "schema_version=", "request_id=", "base_revision=", "mode=", "canvas_width=",
+            "canvas_height=", "rooms_count=", "room[0].id=", "room[0].x=", "room[0].y=",
+            "room[0].width=", "room[0].height=",
+        };
+        var position = -1;
+        foreach (var tag in orderedTags)
+        {
+            var next = body.IndexOf(tag, position + 1, StringComparison.Ordinal);
+            Assert.True(next > position, $"Expected fingerprint tag in order: {tag}");
+            position = next;
+        }
+
+        Assert.Contains("value.to_utf8().size()", FunctionBody(script, "_framed_string"), StringComparison.Ordinal);
+        Assert.Contains("_plan_fingerprint_input(plan).sha256_text()", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("to_json(plan).sha256_text()", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Gdscript_UsesImmutableNonReplayableMutationIntentRouting()
+    {
+        var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
+        var advance = FunctionBody(script, "_advance_claim_state");
+        var mutation = FunctionBody(script, "_advance_apply_plan_claim");
+        var recovery = FunctionBody(script, "_recover_processing_claims");
+
+        Assert.Contains("if request.command == \"apply_plan\":", advance, StringComparison.Ordinal);
+        Assert.Contains("_advance_apply_plan_claim", advance, StringComparison.Ordinal);
+        Assert.Contains("mutation-intents", recovery, StringComparison.Ordinal);
+        Assert.Contains(".prepared.json", mutation, StringComparison.Ordinal);
+        Assert.Contains(".confirmed.json", mutation, StringComparison.Ordinal);
+        Assert.Contains(".ambiguous.json", mutation, StringComparison.Ordinal);
+        Assert.Contains("_prepared_mutation_keys.has(key)", mutation, StringComparison.Ordinal);
+        Assert.Contains("mutation_outcome_unknown", mutation, StringComparison.Ordinal);
+        Assert.True(
+            mutation.IndexOf("_write_mutation_intent(prepared_path", StringComparison.Ordinal) <
+            mutation.IndexOf("_execute_rectangular_room", StringComparison.Ordinal));
+        Assert.True(
+            mutation.IndexOf("mutation_outcome_unknown", StringComparison.Ordinal) <
+            mutation.IndexOf("_execute_rectangular_room", StringComparison.Ordinal));
+        Assert.Contains("_mutation_active", mutation, StringComparison.Ordinal);
+        Assert.Contains("mutation_busy", mutation, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Gdscript_ExecutesExactlyOneDocumentedClosedNativeWallWithCleanup()
+    {
+        var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
+        var advance = FunctionBody(script, "_advance_apply_plan_claim");
+        var executor = FunctionBody(script, "_execute_rectangular_room");
+        var cleanup = FunctionBody(script, "_cleanup_wall_tool");
+        var preflight = FunctionBody(script, "_runtime_room_preflight");
+        var orderedTokens = new[]
+        {
+            "Global.World.Width", "Global.World.Height", "Global.World.GridSize", "Global.World.CurrentLevelId",
+            "Global.World.GetLevelByID", "level.Walls.get_children()", "Global.Editor.Tools[\"WallTool\"]",
+            "wall_tool.Enable()", "Global.WorldUI.ClearPolyline()", "Global.WorldUI.AddPolyPoint",
+            "wall_tool.Confirm()", "level.Walls.get_children()", "_cleanup_wall_tool(wall_tool)",
+        };
+        var position = -1;
+        foreach (var token in orderedTokens)
+        {
+            var next = executor.IndexOf(token, position + 1, StringComparison.Ordinal);
+            Assert.True(next > position, $"Expected native wall token in order: {token}");
+            position = next;
+        }
+
+        Assert.Equal(5, CountOccurrences(executor, "Global.WorldUI.AddPolyPoint("));
+        Assert.Equal(1, CountOccurrences(executor, "wall_tool.Confirm()"));
+        Assert.Equal(2, CountOccurrences(executor, "Global.WorldUI.AddPolyPoint(point_1)"));
+        Assert.Contains("walls_after == walls_before + 1", executor, StringComparison.Ordinal);
+        Assert.Contains("_runtime_room_preflight(plan)", executor, StringComparison.Ordinal);
+        Assert.Contains("level.Walls.get_children().size()", preflight, StringComparison.Ordinal);
+        foreach (var payloadField in new[]
+                 {
+                     "\"applied\": true", "\"created_walls\": 1", "\"room_id\": room.id",
+                     "\"undo_available\": true", "\"undo_instruction\": \"Use Dungeondraft Undo once\"",
+                     "\"plan_fingerprint\": plan_fingerprint",
+                 })
+        {
+            Assert.Contains(payloadField, executor, StringComparison.Ordinal);
+        }
+        Assert.Contains("Global.WorldUI.ClearPolyline()", cleanup, StringComparison.Ordinal);
+        Assert.Contains("wall_tool.Disable()", cleanup, StringComparison.Ordinal);
+        Assert.True(
+            advance.IndexOf("_runtime_room_preflight", StringComparison.Ordinal) <
+            advance.IndexOf("_write_mutation_intent(prepared_path", StringComparison.Ordinal));
+        Assert.Contains("_advance_journaled_response(claim, request, request_fingerprint, journal_path, response_path, key", advance, StringComparison.Ordinal);
+        Assert.DoesNotContain("get_property_list", executor, StringComparison.Ordinal);
+        Assert.DoesNotContain("Custom Snap", executor, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Package_TargetsDungeondraft1201AndImplementsMailboxStatusBridge()
     {
         var modRoot = Path.Combine(FindRepositoryRoot(), "mods", "DDAI");
@@ -188,6 +328,29 @@ public sealed class DungeondraftModPackageTests
         Assert.True(start >= 0, $"Expected GDScript function {functionName}.");
         var next = script.IndexOf("\nfunc ", start + marker.Length, StringComparison.Ordinal);
         return next < 0 ? script[start..] : script[start..next];
+    }
+
+    private static string ConstantValue(string script, string constantName)
+    {
+        var marker = "const " + constantName + " = \"";
+        var start = script.IndexOf(marker, StringComparison.Ordinal);
+        Assert.True(start >= 0, $"Expected GDScript constant {constantName}.");
+        start += marker.Length;
+        var end = script.IndexOf('"', start);
+        return script[start..end];
+    }
+
+    private static int CountOccurrences(string value, string token)
+    {
+        var count = 0;
+        var position = 0;
+        while ((position = value.IndexOf(token, position, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            position += token.Length;
+        }
+
+        return count;
     }
 
     private static string FindRepositoryRoot()

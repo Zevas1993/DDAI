@@ -213,7 +213,7 @@ public sealed class LocalSetupService
                 ConsolidationUpdate("not_checked"));
         }
 
-        if (HasFreshHeartbeat(paths.DungeondraftUserDataDirectory))
+        if (HasFreshHeartbeat(paths.DungeondraftUserDataDirectory, paths.InstalledModDirectory))
         {
             return new LocalDiagnosisResult(
                 "running",
@@ -526,8 +526,9 @@ public sealed class LocalSetupService
         }
     }
 
-    private bool HasFreshHeartbeat(string userDataDirectory)
+    private bool HasFreshHeartbeat(string userDataDirectory, string installedModDirectory)
     {
+        var installedModVersion = ReadModVersion(installedModDirectory);
         var heartbeatDirectory = Path.Combine(userDataDirectory, "ddai", "runtime-heartbeats");
         for (var slot = 0; slot < 8; slot++)
         {
@@ -542,7 +543,7 @@ public sealed class LocalSetupService
                 var root = JsonNode.Parse(File.ReadAllBytes(path));
                 var timestamp = root?["timestamp"]?.GetValue<DateTimeOffset>();
                 if (root?["schema_version"]?.GetValue<string>() == "1.0" &&
-                    root?["mod_version"]?.GetValue<string>() == "0.1.0" &&
+                    root?["mod_version"]?.GetValue<string>() == installedModVersion &&
                     !string.IsNullOrWhiteSpace(root?["session_id"]?.GetValue<string>()) &&
                     timestamp is not null &&
                     timestamp <= timeProvider.GetUtcNow().AddSeconds(5) &&
@@ -589,7 +590,22 @@ public sealed class LocalSetupService
                 throw new LocalSetupException($"Mod manifest is not the owned DDAI status bridge: {manifestPath}");
             }
         }
-        catch (JsonException exception)
+        catch (Exception exception) when (exception is JsonException or InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            throw new LocalSetupException($"DDAI mod manifest is invalid JSON: {manifestPath}", exception);
+        }
+    }
+
+    private static string ReadModVersion(string directory)
+    {
+        var manifestPath = Path.Combine(directory, "ddai_bridge.ddmod");
+        try
+        {
+            return JsonNode.Parse(File.ReadAllBytes(manifestPath))?["version"]?.GetValue<string>() is { Length: > 0 } version
+                ? version
+                : throw new LocalSetupException($"DDAI mod manifest version is missing: {manifestPath}");
+        }
+        catch (Exception exception) when (exception is JsonException or InvalidOperationException or IOException or UnauthorizedAccessException)
         {
             throw new LocalSetupException($"DDAI mod manifest is invalid JSON: {manifestPath}", exception);
         }

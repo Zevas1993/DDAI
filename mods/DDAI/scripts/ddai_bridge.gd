@@ -1,18 +1,20 @@
 var script_class = "tool"
 
-const MOD_VERSION = "0.1.0"
+const MOD_VERSION = "0.2.0"
 const TARGET_DUNGEONDRAFT_VERSION = "1.2.0.1"
 const MAILBOX_SCHEMA_VERSION = "1.0"
 const MAILBOX_ROOT = "user://ddai"
 const MAXIMUM_MESSAGE_BYTES = 1048576
 const POLL_INTERVAL_SECONDS = 0.25
 const HEARTBEAT_INTERVAL_SECONDS = 10.0
-const SUPPORTED_COMMANDS = ["status"]
+const SUPPORTED_COMMANDS = ["status", "apply_plan"]
 
 var _poll_elapsed = POLL_INTERVAL_SECONDS
 var _heartbeat_elapsed = HEARTBEAT_INTERVAL_SECONDS
 var _session_id = ""
 var _heartbeat_slot = 0
+var _prepared_mutation_keys = {}
+var _mutation_active = false
 
 
 # Called by Dungeondraft after the mod is loaded.
@@ -39,7 +41,7 @@ func update(delta):
 
 func _ensure_mailbox_directories():
 	var directory = Directory.new()
-	for name in ["requests", "processing", "responses", "failed", "journal", "runtime-receipts", "runtime-heartbeats"]:
+	for name in ["requests", "processing", "responses", "failed", "journal", "mutation-intents", "runtime-receipts", "runtime-heartbeats"]:
 		directory.make_dir_recursive(MAILBOX_ROOT + "/" + name)
 
 
@@ -53,9 +55,9 @@ func _process_one_request():
 func _run_claim_state_machine(claim):
 	# Each iteration crosses at most one durable boundary. Re-entry after any
 	# boundary follows the same route during ordinary polling and startup recovery.
-	for _step in range(5):
+	for _step in range(8):
 		var transition = _advance_claim_state(claim)
-		if transition == "blocked" or transition == "no_work" or transition == "journal_deleted" or transition == "invalid_claim_failed":
+		if transition == "blocked" or transition == "no_work" or transition == "invalid_claim_failed":
 			return transition
 	return "bounded_transition_limit"
 
@@ -66,7 +68,7 @@ func _advance_claim_state(claim):
 	var journal_path = MAILBOX_ROOT + "/journal/" + claim.file_name
 	var response_path = MAILBOX_ROOT + "/responses/" + claim.file_name
 	if not directory.file_exists(claim.path):
-		return _cleanup_stale_journal(claim.file_name)
+		return _advance_without_claim(claim.file_name)
 
 	var read_result = _read_bounded_text(claim.path)
 	if not read_result.ok:
@@ -84,6 +86,8 @@ func _advance_claim_state(claim):
 	if reconciliation_result != "reconciled":
 		return "blocked"
 	var request_fingerprint = canonical_request_text.sha256_text()
+	if request.command == "apply_plan":
+		return _advance_apply_plan_claim(claim, request, request_fingerprint, journal_path, response_path, key)
 	if not directory.file_exists(journal_path):
 		var response = _prepare_response(request)
 		var response_text = to_json(response)
@@ -122,6 +126,326 @@ func _advance_claim_state(claim):
 	return "claim_deleted" if claim_remove_result == "removed" or claim_remove_result == "missing" else "blocked"
 
 
+func _advance_apply_plan_claim(claim, request, request_fingerprint, journal_path, response_path, key):
+	var plan_validation = _validate_rectangular_room_plan(request.payload, request.request_id)
+	if not plan_validation.ok:
+		return _fail_claim_without_loss(claim, plan_validation.error)
+	var plan = plan_validation.plan
+	var plan_fingerprint = _plan_fingerprint_input(plan).sha256_text()
+	var prepared_path = MAILBOX_ROOT + "/mutation-intents/" + key + ".prepared.json"
+	var confirmed_path = MAILBOX_ROOT + "/mutation-intents/" + key + ".confirmed.json"
+	var ambiguous_path = MAILBOX_ROOT + "/mutation-intents/" + key + ".ambiguous.json"
+	var directory = Directory.new()
+	if directory.file_exists(journal_path):
+		var existing_journal = _read_validated_journal(journal_path, request, request_fingerprint)
+		if not existing_journal.ok:
+			return "blocked"
+		return _advance_journaled_response(claim, request, request_fingerprint, journal_path, response_path, key, existing_journal.journal.response_text)
+
+	if not directory.file_exists(prepared_path):
+		if directory.file_exists(confirmed_path) or directory.file_exists(ambiguous_path):
+			return "blocked"
+		var preflight = _runtime_room_preflight(plan)
+		if not preflight.ok:
+			var preflight_text = to_json(_apply_failure(request, plan_fingerprint, preflight.error.code, preflight.error.message, preflight.error.path, false))
+			return _advance_journaled_response(claim, request, request_fingerprint, journal_path, response_path, key, preflight_text)
+		var prepared = _mutation_intent_payload(request, request_fingerprint, plan_fingerprint, "prepared", null)
+		var prepared_write = _write_mutation_intent(prepared_path, prepared)
+		if prepared_write == "created":
+			_prepared_mutation_keys[key] = true
+			return "mutation_intent_created"
+		if prepared_write != "existing":
+			return "blocked"
+
+	var prepared_read = _read_validated_mutation_intent(prepared_path, key, request, request_fingerprint, plan_fingerprint, "prepared", false)
+	if not prepared_read.ok:
+		_write_mutation_conflict(key, "prepared")
+		return "blocked"
+	var has_confirmed = directory.file_exists(confirmed_path)
+	var has_ambiguous = directory.file_exists(ambiguous_path)
+	if has_confirmed and has_ambiguous:
+		_write_mutation_conflict(key, "multiple-outcomes")
+		return "blocked"
+	if has_confirmed or has_ambiguous:
+		var outcome_path = confirmed_path if has_confirmed else ambiguous_path
+		var outcome_state = "confirmed" if has_confirmed else "ambiguous"
+		var outcome = _read_validated_mutation_intent(outcome_path, key, request, request_fingerprint, plan_fingerprint, outcome_state, true)
+		if not outcome.ok:
+			_write_mutation_conflict(key, outcome_state)
+			return "blocked"
+		return _advance_journaled_response(claim, request, request_fingerprint, journal_path, response_path, key, outcome.intent.response_text)
+
+	# A prepared intent from an earlier process may already have mutated the map.
+	# Never replay it: durably record ambiguity and tell the user to inspect/Undo.
+	if not _prepared_mutation_keys.has(key):
+		var unknown_response = _apply_failure(request, plan_fingerprint, "mutation_outcome_unknown", "Dungeondraft may have applied this room before interruption; inspect the map and use Undo once if it appeared.", "request_id", true)
+		var ambiguous = _mutation_intent_payload(request, request_fingerprint, plan_fingerprint, "ambiguous", to_json(unknown_response))
+		return "mutation_ambiguity_recorded" if _write_mutation_intent(ambiguous_path, ambiguous) == "created" else "blocked"
+	if _mutation_active:
+		var busy_text = to_json(_apply_failure(request, plan_fingerprint, "mutation_busy", "Another native map mutation is already active.", "request_id", false))
+		return _advance_journaled_response(claim, request, request_fingerprint, journal_path, response_path, key, busy_text)
+
+	_prepared_mutation_keys.erase(key)
+	_mutation_active = true
+	var executed_response = _execute_rectangular_room(request, plan, plan_fingerprint)
+	_mutation_active = false
+	if not _validate_response(executed_response, request.request_id, request.command):
+		return "blocked"
+	if not executed_response.payload.has("plan_fingerprint") or executed_response.payload.plan_fingerprint != plan_fingerprint:
+		return "blocked"
+	var confirmed = _mutation_intent_payload(request, request_fingerprint, plan_fingerprint, "confirmed", to_json(executed_response))
+	return "mutation_confirmed" if _write_mutation_intent(confirmed_path, confirmed) == "created" else "blocked"
+
+
+func _advance_journaled_response(claim, request, request_fingerprint, journal_path, response_path, key, response_text):
+	var directory = Directory.new()
+	if not directory.file_exists(journal_path):
+		var journal_write = _write_json_atomically(journal_path, {
+			"schema_version": MAILBOX_SCHEMA_VERSION,
+			"request_id": request.request_id,
+			"request_fingerprint": request_fingerprint,
+			"response_text": response_text,
+		})
+		return "journal_created" if journal_write == "created" else "blocked"
+	var journal_result = _read_validated_journal(journal_path, request, request_fingerprint)
+	if not journal_result.ok or journal_result.journal.response_text != response_text:
+		return "blocked"
+	if not directory.file_exists(response_path):
+		return "response_published" if _write_text_atomically(response_path, response_text) == "created" else "blocked"
+	if not _response_text_matches(response_path, response_text):
+		return "blocked"
+	var claim_remove_result = _remove_file(claim.path)
+	return "claim_deleted" if claim_remove_result == "removed" or claim_remove_result == "missing" else "blocked"
+
+
+func _validate_rectangular_room_plan(plan, expected_request_id):
+	if typeof(plan) != TYPE_DICTIONARY:
+		return {"ok": false, "error": _error("room_required", "apply_plan payload must contain a map plan object.", "payload")}
+	if not plan.has("schema_version") or typeof(plan.schema_version) != TYPE_STRING or plan.schema_version != MAILBOX_SCHEMA_VERSION:
+		return {"ok": false, "error": _error("malformed_plan", "Unsupported or missing plan schema_version.", "payload.schema_version")}
+	if not plan.has("request_id") or typeof(plan.request_id) != TYPE_STRING or plan.request_id != expected_request_id or not _is_safe_request_id(plan.request_id):
+		return {"ok": false, "error": _error("malformed_plan", "Plan request_id must match the request envelope.", "payload.request_id")}
+	if not plan.has("mode") or typeof(plan.mode) != TYPE_STRING or plan.mode != "add":
+		return {"ok": false, "error": _error("unsupported_mode", "Only add mode is supported.", "payload.mode")}
+	if not plan.has("base_revision") or not _is_json_int32(plan.base_revision) or plan.base_revision != 0.0:
+		return {"ok": false, "error": _error("unsupported_base_revision", "Only base_revision 0 is supported.", "payload.base_revision")}
+	if not plan.has("canvas") or typeof(plan.canvas) != TYPE_DICTIONARY:
+		return {"ok": false, "error": _error("malformed_plan", "canvas is required.", "payload.canvas")}
+	var canvas = plan.canvas
+	if not canvas.has("width") or not _is_positive_json_int32(canvas.width):
+		return {"ok": false, "error": _error("invalid_canvas_width", "Canvas width must be a positive 32-bit integer.", "payload.canvas.width")}
+	if not canvas.has("height") or not _is_positive_json_int32(canvas.height):
+		return {"ok": false, "error": _error("invalid_canvas_height", "Canvas height must be a positive 32-bit integer.", "payload.canvas.height")}
+	if not plan.has("rooms") or typeof(plan.rooms) != TYPE_ARRAY or plan.rooms.size() != 1:
+		return {"ok": false, "error": _error("invalid_room_count", "Exactly one room is required.", "payload.rooms")}
+	if typeof(plan.rooms[0]) != TYPE_DICTIONARY:
+		return {"ok": false, "error": _error("room_required", "The room must be an object.", "payload.rooms[0]")}
+	var room = plan.rooms[0]
+	if not room.has("id") or typeof(room.id) != TYPE_STRING or not _is_safe_request_id(room.id):
+		return {"ok": false, "error": _error("invalid_room_id", "Room id is missing or unsafe.", "payload.rooms[0].id")}
+	if not room.has("x") or not _is_nonnegative_json_int32(room.x):
+		return {"ok": false, "error": _error("invalid_room_x", "Room x must be a nonnegative 32-bit integer.", "payload.rooms[0].x")}
+	if not room.has("y") or not _is_nonnegative_json_int32(room.y):
+		return {"ok": false, "error": _error("invalid_room_y", "Room y must be a nonnegative 32-bit integer.", "payload.rooms[0].y")}
+	if not room.has("width") or not _is_positive_json_int32(room.width):
+		return {"ok": false, "error": _error("invalid_room_width", "Room width must be a positive 32-bit integer.", "payload.rooms[0].width")}
+	if not room.has("height") or not _is_positive_json_int32(room.height):
+		return {"ok": false, "error": _error("invalid_room_height", "Room height must be a positive 32-bit integer.", "payload.rooms[0].height")}
+	if room.x > canvas.width or room.y > canvas.height or room.width > canvas.width - room.x or room.height > canvas.height - room.y:
+		return {"ok": false, "error": _error("room_out_of_bounds", "Room must fit inside the canvas.", "payload.rooms[0]")}
+	return {"ok": true, "plan": plan}
+
+
+func _is_json_int32(value):
+	return typeof(value) == TYPE_REAL and not is_nan(value) and not is_inf(value) and value == floor(value) and value >= -2147483648.0 and value <= 2147483647.0
+
+
+func _is_nonnegative_json_int32(value):
+	return _is_json_int32(value) and value >= 0.0
+
+
+func _is_positive_json_int32(value):
+	return _is_json_int32(value) and value > 0.0
+
+
+func _plan_fingerprint_input(plan):
+	var room = plan.rooms[0]
+	var text = _framed_string("schema_version=", plan.schema_version)
+	text += _framed_string("request_id=", plan.request_id)
+	text += "base_revision=" + str(int(plan.base_revision)) + "\n"
+	text += _framed_string("mode=", plan.mode)
+	text += "canvas_width=" + str(int(plan.canvas.width)) + "\n"
+	text += "canvas_height=" + str(int(plan.canvas.height)) + "\n"
+	text += "rooms_count=" + str(plan.rooms.size()) + "\n"
+	text += _framed_string("room[0].id=", room.id)
+	text += "room[0].x=" + str(int(room.x)) + "\n"
+	text += "room[0].y=" + str(int(room.y)) + "\n"
+	text += "room[0].width=" + str(int(room.width)) + "\n"
+	text += "room[0].height=" + str(int(room.height)) + "\n"
+	return text
+
+
+func _framed_string(name, value):
+	return name + str(value.to_utf8().size()) + ":" + value + "\n"
+
+
+func _runtime_room_preflight(plan):
+	if Global.World == null:
+		return {"ok": false, "error": _error("map_not_available", "No Dungeondraft map is available.", "")}
+	if Global.World.Width == null or Global.World.Height == null:
+		return {"ok": false, "error": _error("canvas_unavailable", "The map canvas dimensions are unavailable.", "")}
+	if int(Global.World.Width) != int(plan.canvas.width) or int(Global.World.Height) != int(plan.canvas.height):
+		return {"ok": false, "error": _error("canvas_mismatch", "The open map dimensions do not match the plan.", "payload.canvas")}
+	if Global.World.GridSize == null or float(Global.World.GridSize) <= 0.0:
+		return {"ok": false, "error": _error("grid_scale_unavailable", "The map grid scale is unavailable.", "")}
+	var level = Global.World.GetLevelByID(Global.World.CurrentLevelId)
+	if level == null:
+		return {"ok": false, "error": _error("active_level_unavailable", "The active map level is unavailable.", "")}
+	if level.Walls == null:
+		return {"ok": false, "error": _error("wall_count_unavailable", "The active level wall container is unavailable.", "")}
+	var wall_count = level.Walls.get_children().size()
+	if wall_count < 0:
+		return {"ok": false, "error": _error("wall_count_unavailable", "The active level wall count is unavailable.", "")}
+	if Global.Editor == null or typeof(Global.Editor.Tools) != TYPE_DICTIONARY or not Global.Editor.Tools.has("WallTool") or Global.Editor.Tools["WallTool"] == null or Global.WorldUI == null:
+		return {"ok": false, "error": _error("wall_tool_unavailable", "The documented Dungeondraft wall tool is unavailable.", "")}
+	return {"ok": true}
+
+
+func _execute_rectangular_room(request, plan, plan_fingerprint):
+	var execution_preflight = _runtime_room_preflight(plan)
+	if not execution_preflight.ok:
+		return _apply_failure(request, plan_fingerprint, execution_preflight.error.code, execution_preflight.error.message, execution_preflight.error.path, false)
+	var runtime_width = Global.World.Width
+	var runtime_height = Global.World.Height
+	var grid_size = Global.World.GridSize
+	var level_id = Global.World.CurrentLevelId
+	var level = Global.World.GetLevelByID(level_id)
+	var walls_before = level.Walls.get_children().size()
+	var wall_tool = Global.Editor.Tools["WallTool"]
+	var room = plan.rooms[0]
+	var point_1 = Vector2(int(room.x) * grid_size, int(room.y) * grid_size)
+	var point_2 = Vector2(int(room.x + room.width) * grid_size, int(room.y) * grid_size)
+	var point_3 = Vector2(int(room.x + room.width) * grid_size, int(room.y + room.height) * grid_size)
+	var point_4 = Vector2(int(room.x) * grid_size, int(room.y + room.height) * grid_size)
+	wall_tool.Enable()
+	Global.WorldUI.ClearPolyline()
+	Global.WorldUI.AddPolyPoint(point_1)
+	Global.WorldUI.AddPolyPoint(point_2)
+	Global.WorldUI.AddPolyPoint(point_3)
+	Global.WorldUI.AddPolyPoint(point_4)
+	Global.WorldUI.AddPolyPoint(point_1)
+	wall_tool.Confirm()
+	var walls_after = level.Walls.get_children().size()
+	var cleanup_ok = _cleanup_wall_tool(wall_tool)
+	if not cleanup_ok:
+		return _apply_failure(request, plan_fingerprint, "cleanup_failed", "The wall tool could not be returned to an idle state.", "", false)
+	if int(runtime_width) != int(plan.canvas.width) or int(runtime_height) != int(plan.canvas.height) or not walls_after == walls_before + 1:
+		return _apply_failure(request, plan_fingerprint, "wall_creation_unverified", "Dungeondraft did not report exactly one new native wall.", "", false)
+	return {
+		"schema_version": MAILBOX_SCHEMA_VERSION,
+		"request_id": request.request_id,
+		"command": request.command,
+		"timestamp": _iso_timestamp(),
+		"success": true,
+		"payload": {
+			"applied": true,
+			"created_walls": 1,
+			"room_id": room.id,
+			"undo_available": true,
+			"undo_instruction": "Use Dungeondraft Undo once",
+			"plan_fingerprint": plan_fingerprint,
+		},
+	}
+
+
+func _cleanup_wall_tool(wall_tool):
+	Global.WorldUI.ClearPolyline()
+	wall_tool.Disable()
+	return true
+
+
+func _apply_failure(request, plan_fingerprint, code, message, path, outcome_unknown):
+	return {
+		"schema_version": MAILBOX_SCHEMA_VERSION,
+		"request_id": request.request_id,
+		"command": request.command,
+		"timestamp": _iso_timestamp(),
+		"success": false,
+		"payload": {"plan_fingerprint": plan_fingerprint, "outcome_unknown": outcome_unknown},
+		"error": _error(code, message, path),
+	}
+
+
+func _mutation_intent_payload(request, request_fingerprint, plan_fingerprint, state, response_text):
+	var intent = {
+		"schema_version": MAILBOX_SCHEMA_VERSION,
+		"request_id": request.request_id,
+		"request_fingerprint": request_fingerprint,
+		"plan_fingerprint": plan_fingerprint,
+		"command": request.command,
+		"state": state,
+	}
+	if response_text != null:
+		intent["response_text"] = response_text
+	return intent
+
+
+func _write_mutation_intent(path, intent):
+	var text = to_json(intent)
+	if text.to_utf8().size() > MAXIMUM_MESSAGE_BYTES:
+		return "write_failed"
+	return _write_text_atomically(path, text)
+
+
+func _read_validated_mutation_intent(path, key, request, request_fingerprint, plan_fingerprint, state, require_response):
+	var read_result = _read_bounded_text(path)
+	if not read_result.ok:
+		return {"ok": false}
+	var parsed = JSON.parse(read_result.text)
+	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+		return {"ok": false}
+	var intent = parsed.result
+	if not intent.has("schema_version") or intent.schema_version != MAILBOX_SCHEMA_VERSION:
+		return {"ok": false}
+	if not intent.has("request_id") or intent.request_id != request.request_id or intent.request_id.sha256_text() != key:
+		return {"ok": false}
+	if not intent.has("request_fingerprint") or intent.request_fingerprint != request_fingerprint or not _is_sha256(intent.request_fingerprint):
+		return {"ok": false}
+	if not intent.has("plan_fingerprint") or intent.plan_fingerprint != plan_fingerprint or not _is_sha256(intent.plan_fingerprint):
+		return {"ok": false}
+	if not intent.has("command") or intent.command != "apply_plan" or not intent.has("state") or intent.state != state:
+		return {"ok": false}
+	if require_response:
+		if not intent.has("response_text") or typeof(intent.response_text) != TYPE_STRING or intent.response_text == "" or intent.response_text.to_utf8().size() > MAXIMUM_MESSAGE_BYTES:
+			return {"ok": false}
+		var response = JSON.parse(intent.response_text)
+		if response.error != OK or typeof(response.result) != TYPE_DICTIONARY or not _validate_response(response.result, request.request_id, "apply_plan"):
+			return {"ok": false}
+		if typeof(response.result.payload) != TYPE_DICTIONARY or not response.result.payload.has("plan_fingerprint") or response.result.payload.plan_fingerprint != plan_fingerprint:
+			return {"ok": false}
+	elif intent.has("response_text"):
+		return {"ok": false}
+	return {"ok": true, "intent": intent}
+
+
+func _is_sha256(value):
+	if typeof(value) != TYPE_STRING or value.length() != 64:
+		return false
+	for index in range(value.length()):
+		var code = value.ord_at(index)
+		if not (code >= 48 and code <= 57) and not (code >= 97 and code <= 102):
+			return false
+	return true
+
+
+func _write_mutation_conflict(key, state):
+	_write_json_atomically(MAILBOX_ROOT + "/failed/" + key + ".mutation-intent-" + state + ".json", {
+		"schema_version": MAILBOX_SCHEMA_VERSION,
+		"error": _error("mutation_intent_conflict", "Mutation intent state is invalid or conflicting.", ""),
+		"state": state,
+	})
+
+
 func _recover_processing_claims():
 	var directory = Directory.new()
 	if directory.open(MAILBOX_ROOT + "/processing") != OK:
@@ -132,6 +456,18 @@ func _recover_processing_claims():
 		if not directory.current_is_dir() and file_name.ends_with(".json"):
 			var path = MAILBOX_ROOT + "/processing/" + file_name
 			_run_claim_state_machine({"file_name": file_name, "path": path})
+		file_name = directory.get_next()
+	directory.list_dir_end()
+
+	# Mutation intent cleanup is also restartable when the claim and journal are gone.
+	if directory.open(MAILBOX_ROOT + "/mutation-intents") != OK:
+		return
+	directory.list_dir_begin(true, true)
+	file_name = directory.get_next()
+	while file_name != "":
+		if not directory.current_is_dir() and (file_name.ends_with(".prepared.json") or file_name.ends_with(".confirmed.json") or file_name.ends_with(".ambiguous.json")):
+			var key = file_name.substr(0, 64)
+			_run_claim_state_machine({"file_name": key + ".json", "path": MAILBOX_ROOT + "/processing/" + key + ".json"})
 		file_name = directory.get_next()
 	directory.list_dir_end()
 
@@ -396,6 +732,78 @@ func _response_text_matches(path, expected_response_text):
 	var existing = JSON.parse(result.text)
 	var expected = JSON.parse(expected_response_text)
 	return existing.error == OK and expected.error == OK and typeof(existing.result) == TYPE_DICTIONARY and typeof(expected.result) == TYPE_DICTIONARY and to_json(existing.result) == to_json(expected.result)
+
+
+func _advance_without_claim(file_name):
+	var journal_result = _cleanup_stale_journal(file_name)
+	if journal_result != "no_work":
+		return journal_result
+	var key = file_name.get_basename()
+	if not _is_sha256(key):
+		return "blocked"
+	var response_path = MAILBOX_ROOT + "/responses/" + file_name
+	var prepared_path = MAILBOX_ROOT + "/mutation-intents/" + key + ".prepared.json"
+	var confirmed_path = MAILBOX_ROOT + "/mutation-intents/" + key + ".confirmed.json"
+	var ambiguous_path = MAILBOX_ROOT + "/mutation-intents/" + key + ".ambiguous.json"
+	var directory = Directory.new()
+	if directory.file_exists(ambiguous_path):
+		var ambiguous = _read_standalone_mutation_intent(ambiguous_path, key, "ambiguous", true)
+		if not ambiguous.ok:
+			return "blocked"
+		var diagnostic_path = MAILBOX_ROOT + "/failed/" + key + ".mutation-outcome-unknown.json"
+		if not directory.file_exists(diagnostic_path):
+			return "mutation_ambiguity_recorded" if _write_text_atomically(diagnostic_path, ambiguous.text) == "created" else "blocked"
+		return "no_work"
+	if directory.file_exists(confirmed_path):
+		var confirmed = _read_standalone_mutation_intent(confirmed_path, key, "confirmed", true)
+		if not confirmed.ok or not directory.file_exists(response_path) or not _response_text_matches(response_path, confirmed.intent.response_text):
+			return "blocked"
+		return "mutation_intent_deleted" if _remove_file(confirmed_path) == "removed" else "blocked"
+	if directory.file_exists(prepared_path):
+		var prepared = _read_standalone_mutation_intent(prepared_path, key, "prepared", false)
+		if not prepared.ok or not directory.file_exists(response_path):
+			return "blocked"
+		var response_read = _read_bounded_text(response_path)
+		if not response_read.ok:
+			return "blocked"
+		var response = JSON.parse(response_read.text)
+		if response.error != OK or typeof(response.result) != TYPE_DICTIONARY or not _validate_response(response.result, prepared.intent.request_id, "apply_plan"):
+			return "blocked"
+		if typeof(response.result.payload) != TYPE_DICTIONARY or not response.result.payload.has("plan_fingerprint") or response.result.payload.plan_fingerprint != prepared.intent.plan_fingerprint:
+			return "blocked"
+		return "mutation_intent_deleted" if _remove_file(prepared_path) == "removed" else "blocked"
+	return "no_work"
+
+
+func _read_standalone_mutation_intent(path, key, state, require_response):
+	var read_result = _read_bounded_text(path)
+	if not read_result.ok:
+		return {"ok": false}
+	var parsed = JSON.parse(read_result.text)
+	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+		return {"ok": false}
+	var intent = parsed.result
+	if not intent.has("schema_version") or intent.schema_version != MAILBOX_SCHEMA_VERSION:
+		return {"ok": false}
+	if not intent.has("request_id") or typeof(intent.request_id) != TYPE_STRING or intent.request_id.sha256_text() != key:
+		return {"ok": false}
+	if not intent.has("request_fingerprint") or not _is_sha256(intent.request_fingerprint):
+		return {"ok": false}
+	if not intent.has("plan_fingerprint") or not _is_sha256(intent.plan_fingerprint):
+		return {"ok": false}
+	if not intent.has("command") or intent.command != "apply_plan" or not intent.has("state") or intent.state != state:
+		return {"ok": false}
+	if require_response:
+		if not intent.has("response_text") or typeof(intent.response_text) != TYPE_STRING or intent.response_text == "" or intent.response_text.to_utf8().size() > MAXIMUM_MESSAGE_BYTES:
+			return {"ok": false}
+		var response = JSON.parse(intent.response_text)
+		if response.error != OK or typeof(response.result) != TYPE_DICTIONARY or not _validate_response(response.result, intent.request_id, "apply_plan"):
+			return {"ok": false}
+		if typeof(response.result.payload) != TYPE_DICTIONARY or not response.result.payload.has("plan_fingerprint") or response.result.payload.plan_fingerprint != intent.plan_fingerprint:
+			return {"ok": false}
+	elif intent.has("response_text"):
+		return {"ok": false}
+	return {"ok": true, "intent": intent, "text": read_result.text}
 
 
 func _cleanup_stale_journal(file_name):

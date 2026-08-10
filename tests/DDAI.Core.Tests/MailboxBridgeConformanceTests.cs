@@ -10,6 +10,23 @@ namespace DDAI.Core.Tests;
 public sealed class MailboxBridgeConformanceTests
 {
     [Fact]
+    public void GdscriptMutationIntentSchemaMatchesReferenceModel()
+    {
+        var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
+        var writer = FunctionBody(script, "_mutation_intent_payload");
+
+        foreach (var field in new[]
+                 {
+                     "schema_version", "request_id", "request_fingerprint", "plan_fingerprint", "command", "state",
+                 })
+        {
+            Assert.Contains("\"" + field + "\"", writer, StringComparison.Ordinal);
+        }
+        Assert.Contains("if response_text != null:", writer, StringComparison.Ordinal);
+        Assert.Contains("intent[\"response_text\"] = response_text", writer, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void MutationIntent_RejectsOversizeExecutedResponseBeforeConfirmation()
     {
         var root = Path.Combine(Path.GetTempPath(), "ddai-mutation-size-tests", Guid.NewGuid().ToString("N"));
@@ -164,6 +181,29 @@ public sealed class MailboxBridgeConformanceTests
                 Directory.Delete(root, recursive: true);
             }
         }
+    }
+
+    private static string FunctionBody(string script, string functionName)
+    {
+        var marker = "func " + functionName + "(";
+        var start = script.IndexOf(marker, StringComparison.Ordinal);
+        Assert.True(start >= 0, $"Expected GDScript function {functionName}.");
+        var next = script.IndexOf("\nfunc ", start + marker.Length, StringComparison.Ordinal);
+        return next < 0 ? script[start..] : script[start..next];
+    }
+
+    private static string FindRepositoryRoot()
+    {
+        for (var directory = new DirectoryInfo(Directory.GetCurrentDirectory()); directory is not null; directory = directory.Parent)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, "README.md")) &&
+                Directory.Exists(Path.Combine(directory.FullName, "src", "DDAI.Core")))
+            {
+                return directory.FullName;
+            }
+        }
+
+        throw new DirectoryNotFoundException("Could not locate the DDAI repository root.");
     }
 }
 
