@@ -68,17 +68,26 @@ public sealed class DungeondraftModPackageTests
     }
 
     [Fact]
-    public void Gdscript_AvoidsDictionaryEmptyCallThatCrashesDungeondraftReleaseRuntime()
+    public void Gdscript_AvoidsRuntimeCallsProvenToCrashDungeondraft1201()
     {
         var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
         var processBody = FunctionBody(script, "_process_one_request");
         var advanceBody = FunctionBody(script, "_advance_claim_state");
         var reconcileBody = FunctionBody(script, "_reconcile_request_duplicate");
+        var activeModsBody = FunctionBody(script, "_active_mods_payload");
 
-        Assert.DoesNotContain(".empty()", script, StringComparison.Ordinal);
-        Assert.Contains("if claim.size() == 0:", processBody, StringComparison.Ordinal);
-        Assert.Contains("if validation_error.size() > 0:", advanceBody, StringComparison.Ordinal);
-        Assert.Contains("_validate_request(duplicate, file_name).size() == 0", reconcileBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("claim.empty()", processBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("claim.size()", processBody, StringComparison.Ordinal);
+        Assert.Contains("if not claim.has(\"path\"):", processBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("validation_error.empty()", advanceBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("validation_error.size()", advanceBody, StringComparison.Ordinal);
+        Assert.Contains("if validation_error.has(\"code\"):", advanceBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("_validate_request(duplicate, file_name).empty()", reconcileBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("_validate_request(duplicate, file_name).size()", reconcileBody, StringComparison.Ordinal);
+        Assert.Contains("not _validate_request(duplicate, file_name).has(\"code\")", reconcileBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("mods.keys()", activeModsBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("Global", activeModsBody, StringComparison.Ordinal);
+        Assert.Contains("return {\"available\": false, \"values\": []}", activeModsBody, StringComparison.Ordinal);
     }
 
     [Fact]
