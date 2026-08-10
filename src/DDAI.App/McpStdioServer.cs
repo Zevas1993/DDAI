@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Text.Json;
 using DDAI.Core.Mailbox;
+using DDAI.Core.MapPlans;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -20,6 +21,7 @@ public static class McpStdioServer
         builder.Services.AddSingleton(new AtomicMailbox(options.MailboxRoot));
         builder.Services.AddSingleton(timeProvider);
         builder.Services.AddSingleton<DdaiStatusService>();
+        builder.Services.AddSingleton<DdaiPlanService>();
         builder.Services.AddSingleton(new DdaiMcpRuntimeOptions(options.Timeout));
         builder.Services
             .AddMcpServer(server => server.ServerInfo = new Implementation
@@ -35,7 +37,7 @@ public static class McpStdioServer
     }
 }
 
-public sealed record DdaiMcpRuntimeOptions(TimeSpan StatusTimeout);
+public sealed record DdaiMcpRuntimeOptions(TimeSpan RequestTimeout);
 
 [McpServerToolType]
 public sealed class DdaiTools
@@ -57,7 +59,33 @@ public sealed class DdaiTools
         DdaiMcpRuntimeOptions runtimeOptions,
         CancellationToken cancellationToken)
     {
-        var result = await statusService.GetStatusAsync(runtimeOptions.StatusTimeout, cancellationToken);
+        var result = await statusService.GetStatusAsync(runtimeOptions.RequestTimeout, cancellationToken);
         return JsonSerializer.Serialize(result, JsonOptions);
     }
+
+    [McpServerTool(
+        Name = "ddai_validate_plan",
+        ReadOnly = true,
+        Destructive = false,
+        Idempotent = true,
+        OpenWorld = false)]
+    [Description("Validate one grid-relative rectangular-room plan without changing Dungeondraft.")]
+    public static string ValidatePlan(MapPlan plan, DdaiPlanService planService) =>
+        JsonSerializer.Serialize(planService.Validate(plan), JsonOptions);
+
+    [McpServerTool(
+        Name = "ddai_apply_plan",
+        ReadOnly = false,
+        Destructive = true,
+        Idempotent = true,
+        OpenWorld = false)]
+    [Description("Create one native rectangular wall in the open blank Dungeondraft map. The same request_id is idempotent.")]
+    public static async Task<string> ApplyPlanAsync(
+        MapPlan plan,
+        DdaiPlanService planService,
+        DdaiMcpRuntimeOptions runtimeOptions,
+        CancellationToken cancellationToken) =>
+        JsonSerializer.Serialize(
+            await planService.ApplyAsync(plan, runtimeOptions.RequestTimeout, cancellationToken),
+            JsonOptions);
 }

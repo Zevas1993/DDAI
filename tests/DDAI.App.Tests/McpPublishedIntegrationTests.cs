@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
 using DDAI.Core.Mailbox;
+using DDAI.Core.MapPlans;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 
@@ -43,6 +44,8 @@ public sealed class McpPublishedIntegrationTests
         await using var client = await McpClient.CreateAsync(transport, cancellationToken: deadline.Token);
         var tools = await client.ListToolsAsync(cancellationToken: deadline.Token);
         Assert.Contains(tools, tool => tool.Name == "ddai_status");
+        Assert.Contains(tools, tool => tool.Name == "ddai_validate_plan");
+        Assert.Contains(tools, tool => tool.Name == "ddai_apply_plan");
 
         var result = await client.CallToolAsync(
             "ddai_status",
@@ -53,6 +56,29 @@ public sealed class McpPublishedIntegrationTests
         Assert.True(document.RootElement.GetProperty("success").GetBoolean());
         Assert.Equal("ready", document.RootElement.GetProperty("payload").GetProperty("state").GetString());
 
+        var plan = ValidPlan("published-plan-001");
+        var arguments = new Dictionary<string, object?> { ["plan"] = plan };
+        var validationResult = await client.CallToolAsync(
+            "ddai_validate_plan",
+            arguments,
+            cancellationToken: deadline.Token);
+        var validationText = Assert.IsType<TextContentBlock>(Assert.Single(validationResult.Content)).Text;
+        using var validationDocument = JsonDocument.Parse(validationText);
+        Assert.True(validationDocument.RootElement.GetProperty("valid").GetBoolean());
+
+        var applyResult = await client.CallToolAsync(
+            "ddai_apply_plan",
+            arguments,
+            cancellationToken: deadline.Token);
+        var applyText = Assert.IsType<TextContentBlock>(Assert.Single(applyResult.Content)).Text;
+        using var applyDocument = JsonDocument.Parse(applyText);
+        Assert.True(applyDocument.RootElement.GetProperty("success").GetBoolean());
+        var payload = applyDocument.RootElement.GetProperty("payload");
+        Assert.Equal("room-entrance", payload.GetProperty("room_id").GetString());
+        Assert.Equal(1, payload.GetProperty("created_walls").GetInt32());
+        Assert.Equal("Use Dungeondraft Undo once", payload.GetProperty("undo_instruction").GetString());
+        Assert.Equal(MapPlanJson.Fingerprint(plan), payload.GetProperty("plan_fingerprint").GetString());
+
         workerCancellation.Cancel();
         try
         {
@@ -62,6 +88,16 @@ public sealed class McpPublishedIntegrationTests
         {
         }
     }
+
+    private static MapPlan ValidPlan(string requestId) => new()
+    {
+        SchemaVersion = MapPlan.CurrentSchemaVersion,
+        RequestId = requestId,
+        BaseRevision = 0,
+        Mode = MapOperationMode.Add,
+        Canvas = new MapCanvas(40, 30),
+        Rooms = [new MapRoom("room-entrance", 8, 7, 10, 8)],
+    };
 
     private static string PublishSingleFile(string outputDirectory)
     {

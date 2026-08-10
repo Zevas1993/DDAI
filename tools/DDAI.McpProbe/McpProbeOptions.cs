@@ -5,7 +5,9 @@ namespace DDAI.McpProbe;
 public sealed record McpProbeOptions(
     string ExecutablePath,
     string MailboxRoot,
-    TimeSpan Timeout)
+    TimeSpan Timeout,
+    string ToolName,
+    string? PlanFilePath)
 {
     public static McpProbeOptions Parse(string[] args)
     {
@@ -14,6 +16,8 @@ public sealed record McpProbeOptions(
         string? executable = null;
         string? mailboxRoot = null;
         string? timeoutText = null;
+        string? toolName = null;
+        string? planFile = null;
 
         for (var index = 0; index < args.Length; index += 2)
         {
@@ -39,6 +43,12 @@ public sealed record McpProbeOptions(
                     break;
                 case "--timeout-ms":
                     timeoutText = value;
+                    break;
+                case "--tool":
+                    toolName = value;
+                    break;
+                case "--plan-file":
+                    planFile = value;
                     break;
                 default:
                     throw new ArgumentException($"Unknown option '{name}'.", nameof(args));
@@ -66,9 +76,38 @@ public sealed record McpProbeOptions(
             throw new ArgumentException("--timeout-ms must be a positive integer.", nameof(args));
         }
 
+        toolName ??= "ddai_status";
+        if (toolName is not "ddai_status" and not "ddai_validate_plan" and not "ddai_apply_plan")
+        {
+            throw new ArgumentException("--tool must be ddai_status, ddai_validate_plan, or ddai_apply_plan.", nameof(args));
+        }
+
+        if (toolName == "ddai_status")
+        {
+            if (planFile is not null)
+            {
+                throw new ArgumentException("--plan-file cannot be used with ddai_status.", nameof(args));
+            }
+        }
+        else
+        {
+            if (string.IsNullOrWhiteSpace(planFile) || !Path.IsPathFullyQualified(planFile))
+            {
+                throw new ArgumentException("Plan tools require --plan-file with an absolute path.", nameof(args));
+            }
+
+            planFile = Path.GetFullPath(planFile);
+            if (!File.Exists(planFile))
+            {
+                throw new ArgumentException("--plan-file must identify an existing regular file.", nameof(args));
+            }
+        }
+
         return new McpProbeOptions(
             executable,
             Path.GetFullPath(mailboxRoot),
-            TimeSpan.FromMilliseconds(timeoutMs));
+            TimeSpan.FromMilliseconds(timeoutMs),
+            toolName,
+            planFile);
     }
 }
