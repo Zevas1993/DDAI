@@ -1,6 +1,7 @@
 <Solution>
   <Project Path="src/DDAI.Core/DDAI.Core.csproj" />
   <Project Path="src/DDAI.App/DDAI.App.csproj" />
+  <Project Path="tools/DDAI.McpProbe/DDAI.McpProbe.csproj" />
   <Project Path="tests/DDAI.Core.Tests/DDAI.Core.Tests.csproj" />
   <Project Path="tests/DDAI.App.Tests/DDAI.App.Tests.csproj" />
 </Solution>

@@ -15,6 +15,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\DDAI.App\DDAI.App.csproj" />
     <ProjectReference Include="..\..\src\DDAI.Core\DDAI.Core.csproj" />
+    <ProjectReference Include="..\..\tools\DDAI.McpProbe\DDAI.McpProbe.csproj" />
   </ItemGroup>
 
   <ItemGroup>
