@@ -37,7 +37,7 @@ public static class MapPlanValidator
                 $"Schema version '{plan.SchemaVersion}' is not supported."));
         }
 
-        if (string.IsNullOrWhiteSpace(plan.RequestId))
+        if (!SafeIdentifier.IsSafe(plan.RequestId))
         {
             issues.Add(new MapPlanValidationIssue(
                 "invalid_request_id",
@@ -79,6 +79,23 @@ public static class MapPlanValidator
             }
         }
 
+        if (plan.Rooms is null)
+        {
+            issues.Add(new MapPlanValidationIssue(
+                "invalid_rooms",
+                "rooms",
+                "Rooms cannot be null."));
+        }
+
         return new MapPlanValidationResult(issues);
     }
+}
+
+internal static class SafeIdentifier
+{
+    public static bool IsSafe(string? value) =>
+        !string.IsNullOrWhiteSpace(value) &&
+        value is not "." and not ".." &&
+        !value.Contains('/') &&
+        !value.Contains('\\');
 }

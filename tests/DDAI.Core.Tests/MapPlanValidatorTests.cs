@@ -42,6 +42,20 @@ public sealed class MapPlanValidatorTests
         Assert.Equal("request_id", issue.Path);
     }
 
+    [Theory]
+    [InlineData(".")]
+    [InlineData("..")]
+    [InlineData("unsafe/id")]
+    [InlineData("unsafe\\id")]
+    public void Validate_RejectsUnsafeRequestId(string requestId)
+    {
+        var plan = ValidPlan() with { RequestId = requestId };
+
+        var issue = Assert.Single(MapPlanValidator.Validate(plan).Issues);
+
+        Assert.Equal(("invalid_request_id", "request_id"), (issue.Code, issue.Path));
+    }
+
     [Fact]
     public void Validate_RejectsNegativeBaseRevision()
     {
@@ -141,4 +155,33 @@ public sealed class MapPlanValidatorTests
         var issue = Assert.Single(result.Issues);
         Assert.Equal(("invalid_canvas", "canvas"), (issue.Code, issue.Path));
     }
+
+    [Fact]
+    public void Validate_ReportsNullRoomsAfterEnvelopeIssues()
+    {
+        var plan = ValidPlan() with
+        {
+            SchemaVersion = "2.0",
+            Rooms = null!,
+        };
+
+        var result = MapPlanValidator.Validate(plan);
+
+        Assert.Equal(
+        [
+            ("unsupported_schema_version", "schema_version"),
+            ("invalid_rooms", "rooms"),
+        ],
+            result.Issues.Select(issue => (issue.Code, issue.Path)));
+    }
+
+    private static MapPlan ValidPlan() => new()
+    {
+        SchemaVersion = MapPlan.CurrentSchemaVersion,
+        RequestId = "room-job-001",
+        BaseRevision = 0,
+        Mode = MapOperationMode.Add,
+        Canvas = new MapCanvas(40, 30),
+        Rooms = [new MapRoom("room-entrance", 8, 7, 10, 8)],
+    };
 }
