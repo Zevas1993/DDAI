@@ -10,7 +10,7 @@ The connector currently exposes three MCP tools:
 - `ddai_validate_plan` validates the supported map-plan subset without changing the map.
 - `ddai_apply_plan` creates one axis-aligned rectangular room as one closed native Dungeondraft wall operation.
 
-The mutation slice is deliberately narrow: schema `1.0`, `mode: "add"`, `base_revision: 0`, one in-bounds room, and a canvas declaration that exactly matches the open map. A successful operation is editable, is removed by one normal Dungeondraft Undo action, and survives save/reopen.
+The mutation slice is deliberately narrow: schema `1.0`, `mode: "add"`, `base_revision: 0`, one in-bounds room, and a canvas declaration that exactly matches the open map. The open map must be blank and the interactive Wall tool must be idle. Blankness is an operator precondition that the current bridge cannot inspect; a busy Wall tool is rejected before mutation. A successful operation is editable, is removed by one normal Dungeondraft Undo action, and survives save/reopen.
 
 This is not yet the complete natural-language map builder. Floors, doors, objects, lights, multiple rooms, map inspection, export, the ChatGPT relay, and release ZIP packaging remain future work.
 
@@ -23,6 +23,8 @@ This is not yet the complete natural-language map builder. Floors, doors, object
 - Local atomic mailbox under Dungeondraft's `user://ddai`
 - Local MCP `stdio`; no inbound port or firewall rule
 - No Dungeondraft binaries or purchased assets are included or modified
+
+The wall finalization route is certified only for Dungeondraft 1.2.0.1. Support for another Dungeondraft version requires fresh live apply, Undo, and save/reopen certification.
 
 ## Build and verify
 

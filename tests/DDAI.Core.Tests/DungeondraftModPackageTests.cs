@@ -97,7 +97,7 @@ public sealed class DungeondraftModPackageTests
     }
 
     [Fact]
-    public void Gdscript_ExecutesExactlyOneDocumentedClosedNativeWallWithCleanup()
+    public void Gdscript_ExecutesExactlyOneLiveCertifiedClosedNativeWallWithCleanup()
     {
         var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
         var advance = FunctionBody(script, "_advance_apply_plan_claim");
@@ -143,6 +143,24 @@ public sealed class DungeondraftModPackageTests
         Assert.Contains("_advance_journaled_response(claim, request, request_fingerprint, journal_path, response_path, key", advance, StringComparison.Ordinal);
         Assert.DoesNotContain("get_property_list", executor, StringComparison.Ordinal);
         Assert.DoesNotContain("Custom Snap", executor, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Gdscript_FailsClosedWhenTheInteractiveWallToolIsNotIdle()
+    {
+        var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
+        var advance = FunctionBody(script, "_advance_apply_plan_claim");
+        var preflight = FunctionBody(script, "_runtime_room_preflight");
+
+        Assert.Contains("var wall_tool = Global.Editor.Tools[\"WallTool\"]", preflight, StringComparison.Ordinal);
+        Assert.Contains("wall_tool.isDrawing", preflight, StringComparison.Ordinal);
+        Assert.Contains("Global.WorldUI.EditArcPoint", preflight, StringComparison.Ordinal);
+        Assert.Contains("Global.WorldUI.Polyline.size() > 0", preflight, StringComparison.Ordinal);
+        Assert.Contains("wall_tool_busy", preflight, StringComparison.Ordinal);
+        Assert.DoesNotContain("Global.WorldUI.ClearPolyline()", preflight, StringComparison.Ordinal);
+        Assert.True(
+            advance.IndexOf("_runtime_room_preflight", StringComparison.Ordinal) <
+            advance.IndexOf("_write_mutation_intent(prepared_path", StringComparison.Ordinal));
     }
 
     [Fact]

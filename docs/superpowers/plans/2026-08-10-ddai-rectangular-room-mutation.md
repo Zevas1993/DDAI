@@ -4,7 +4,7 @@
 
 **Goal:** Add `ddai_validate_plan` and crash-safe, idempotent `ddai_apply_plan` tools that create one native rectangular Dungeondraft wall and prove normal Dungeondraft undo removes it.
 
-**Architecture:** Extend the existing `MapPlan` contract with one grid-relative room, keep validation and MCP orchestration in `ddai.exe`, and send one canonical `apply_plan` request through the existing atomic mailbox. The GDScript bridge writes an immutable prepared mutation intent before calling documented `World`, `Level`, `WorldUI`, and `WallTool` APIs; a restart after the uncertain native boundary returns `mutation_outcome_unknown` instead of replaying the room.
+**Architecture:** Extend the existing `MapPlan` contract with one grid-relative room, keep validation and MCP orchestration in `ddai.exe`, and send one canonical `apply_plan` request through the existing atomic mailbox. The GDScript bridge writes an immutable prepared mutation intent before calling the fixed Dungeondraft 1.2.0.1 `World`, `Level`, `WorldUI`, and `WallTool` surface; a restart after the uncertain native boundary returns `mutation_outcome_unknown` instead of replaying the room.
 
 **Tech Stack:** .NET 9, C# 13, xUnit 2.9.2, official `ModelContextProtocol` 1.4.1 SDK, Godot 3.x-compatible GDScript, Windows PowerShell, atomic JSON mailbox, Dungeondraft 1.2.0.1.
 
@@ -16,9 +16,9 @@
 - Keep Dungeondraft free of inbound network listeners; all loaded-mod communication stays beneath `user://ddai` and the existing 1 MiB mailbox cap.
 - Preserve the strict wire timestamp language, canonical request naming, correlation checks, non-overwriting atomic publication, conflict retention, and one-durable-transition-at-a-time recovery model.
 - Preserve status behavior and the currently live-stable prohibition on zero-argument Dictionary built-ins in production GDScript.
-- Use only the fixed documented runtime surface: `Global.World.Width`, `Height`, `GridSize`, `CurrentLevelId`, `GetLevelByID(id)`, `Level.Walls.get_children()`, `Global.Editor.Tools["WallTool"]`, `Global.WorldUI`, `Tool.Enable()`, `WorldUI.ClearPolyline()`, `WorldUI.AddPolyPoint()`, `WallTool.Confirm()`, and `Tool.Disable()`.
+- Use only the fixed, version-certified runtime surface: `Global.World.Width`, `Height`, `GridSize`, `CurrentLevelId`, `GetLevelByID(id)`, `Level.Walls.get_children()`, `Global.Editor.Tools["WallTool"]`, `WallTool.isDrawing`, `Global.WorldUI`, `WorldUI.EditArcPoint`, `WorldUI.Polyline`, `Tool.Enable()`, `WorldUI.ClearPolyline()`, `WorldUI.AddPolyPoint()`, `WallTool.EndWall(true)`, and `Tool.Disable()`. `EndWall(bool)` appears in the current official mod API reference but is still treated as an exact-version dependency requiring fresh live certification for any target beyond 1.2.0.1.
 - Do not use runtime reflection, `get_property_list`, private scene construction, fixed pixel-size guesses, direct `.dungeondraft_map` editing, or Custom Snap as a dependency.
-- `ddai_apply_plan` supports exactly one room, `mode: "add"`, `base_revision: 0`, and an explicit blank-map operator precondition in this slice.
+- `ddai_apply_plan` supports exactly one room, `mode: "add"`, `base_revision: 0`, an explicit blank-map operator precondition, and an enforceable idle-Wall-tool precondition in this slice.
 - The same request ID and canonical-plan fingerprint is idempotent. The same request ID with different plan content fails closed.
 - Never automatically replay a prepared mutation after process restart. Retain an ambiguous intent and publish `mutation_outcome_unknown`.
 - Do not claim programmatic undo. A successful result says `undo_available: true` only after live proof that one normal Dungeondraft Undo removes the whole wall.
@@ -582,7 +582,7 @@ git commit -m "feat: model crash-safe map mutations"
 
 ---
 
-### Task 5: Implement the documented GDScript rectangular-wall executor
+### Task 5: Implement the live-certified GDScript rectangular-wall executor
 
 **Files:**
 - Modify: `mods/DDAI/scripts/ddai_bridge.gd`
@@ -598,9 +598,11 @@ git commit -m "feat: model crash-safe map mutations"
 - Produces: `_execute_rectangular_room(plan, plan_fingerprint) -> Dictionary` containing a correlated response body.
 - Uses immutable files under `user://ddai/mutation-intents` with the Task 4 schema.
 
+**Live-certification correction:** The original 0.2.0 five-point `Confirm()` sequence was rejected by live acceptance because `Confirm()` appended the live cursor and produced an open wall with diagonal segments. Version 0.2.1 uses four supplied corners plus `EndWall(true)`, the lower-level finalizer listed in the current official WallTool reference. The exact route is certified only for Dungeondraft 1.2.0.1. Preflight also rejects retained interactive wall/arc/polyline state before creating a mutation intent.
+
 - [ ] **Step 1: Write failing static package and durability-parity tests**
 
-Require the manifest/script versions and exact supported commands. Add static assertions that the apply executor contains every documented token and in this order:
+Require the manifest/script versions and exact supported commands. Add static assertions that the apply executor contains every live-certified token and in this order:
 
 ```text
 Global.World.Width
@@ -610,16 +612,19 @@ Global.World.CurrentLevelId
 Global.World.GetLevelByID
 level.Walls.get_children()
 Global.Editor.Tools["WallTool"]
+wall_tool.isDrawing
+Global.WorldUI.EditArcPoint
+Global.WorldUI.Polyline.size()
 wall_tool.Enable()
 Global.WorldUI.ClearPolyline()
 Global.WorldUI.AddPolyPoint
-wall_tool.Confirm()
+wall_tool.EndWall(true)
 level.Walls.get_children()
 Global.WorldUI.ClearPolyline()
 wall_tool.Disable()
 ```
 
-Require five explicit `AddPolyPoint` call sites in rectangle order and the fifth point to equal the first. Require canvas comparison and pre-wall count before any intent or `Enable()` call. Require prepared intent publication before `Confirm()`. Require confirmed intent publication only after wall count increases by exactly one and cleanup completes.
+Require four explicit `AddPolyPoint` call sites in rectangle order. Require canvas comparison, pre-wall count, and idle checks before any intent or `Enable()` call. A busy wall tool must return `wall_tool_busy` without clearing the user's polyline. Require prepared intent publication before `EndWall(true)`. Require confirmed intent publication only after wall count increases by exactly one and cleanup completes.
 
 Require restart recovery to route prepared-only intents to `mutation_outcome_unknown` without any call to `_execute_rectangular_room`. Require the `_mutation_active` guard and a `mutation_busy` route before `wall_tool.Enable()`. Preserve the existing no-zero-argument-Dictionary-method assertions.
 
@@ -631,7 +636,7 @@ Run:
 dotnet test tests/DDAI.Core.Tests/DDAI.Core.Tests.csproj -c Release --no-restore --filter "FullyQualifiedName~DungeondraftModPackageTests|FullyQualifiedName~MailboxBridgeConformanceTests"
 ```
 
-Expected: failures for version, command list, missing plan validator, missing intent routes, and missing documented wall sequence.
+Expected: failures for version, command list, missing plan validator, missing intent routes, and missing live-certified wall sequence.
 
 - [ ] **Step 3: Add strict GDScript plan validation**
 
@@ -656,7 +661,7 @@ After strict field/type checks, build `_plan_fingerprint_input(plan)` using the 
 
 Create `mutation-intents` during startup and add `_prepared_mutation_keys = {}` at script scope. When a prepared file is created in the current session, assign `_prepared_mutation_keys[key] = true`; only `_prepared_mutation_keys.has(key)` authorizes the subsequent native call.
 
-Add `_mutation_active = false`. Set it immediately before entering the documented tool sequence and clear it on every normal/error cleanup exit. A second mutation path while true returns `mutation_busy`; it must not call `Enable`, `AddPolyPoint`, or `Confirm`. Status and duplicate reconciliation remain outside the native executor and cannot re-enter it.
+Add `_mutation_active = false`. Set it immediately before entering the live-certified tool sequence and clear it on every normal/error cleanup exit. A second mutation path while true returns `mutation_busy`; it must not call `Enable`, `AddPolyPoint`, or `EndWall`. Status and duplicate reconciliation remain outside the native executor and cannot re-enter it.
 
 On startup or recovery, prepared without confirmed/ambiguous creates an immutable ambiguous intent and exact failure response with:
 
@@ -685,7 +690,7 @@ var wall_tool = Global.Editor.Tools["WallTool"]
 var walls_before = level.Walls.get_children().size()
 ```
 
-Reject null/nonpositive values and canvas mismatch before writing the prepared intent. Verify `Global.Editor`, its `Tools` dictionary, the `WallTool` key/value, `Global.WorldUI`, the current level, and `level.Walls` before dereferencing or enabling anything. Use stable preflight codes `map_not_available`, `canvas_unavailable`, `grid_scale_unavailable`, `active_level_unavailable`, `wall_tool_unavailable`, `wall_count_unavailable`, and `canvas_mismatch`; each pre-intent failure must leave `mutation-intents` empty. For the five points `(x,y)`, `(x+w,y)`, `(x+w,y+h)`, `(x,y+h)`, `(x,y)`, multiply validated grid coordinates by `grid_size` and issue five explicit `AddPolyPoint` calls in that order. Call `Confirm()` exactly once, read `walls_after`, then call the cleanup helper (`ClearPolyline` and `Disable`) before evaluating or returning the result. A cleanup failure returns `cleanup_failed`; a post-count other than exactly `walls_before + 1` returns `wall_creation_unverified` and retains intent evidence. Only the exact count plus successful cleanup creates the confirmed success response:
+Reject null/nonpositive values and canvas mismatch before writing the prepared intent. Verify `Global.Editor`, its `Tools` dictionary, the `WallTool` key/value, `Global.WorldUI`, the current level, and `level.Walls` before dereferencing or enabling anything. Fail with `wall_tool_busy` if `wall_tool.isDrawing`, `Global.WorldUI.EditArcPoint`, or `Global.WorldUI.Polyline.size() > 0`; do not clear the user's interactive state. Use stable preflight codes `map_not_available`, `canvas_unavailable`, `grid_scale_unavailable`, `active_level_unavailable`, `wall_tool_unavailable`, `wall_tool_busy`, `wall_count_unavailable`, and `canvas_mismatch`; each pre-intent failure must leave `mutation-intents` empty. For the four points `(x,y)`, `(x+w,y)`, `(x+w,y+h)`, `(x,y+h)`, multiply validated grid coordinates by `grid_size` and issue four explicit `AddPolyPoint` calls in that order. Call `EndWall(true)` exactly once to close the fourth point to the first, read `walls_after`, then call the cleanup helper (`ClearPolyline` and `Disable`) before evaluating or returning the result. A cleanup failure returns `cleanup_failed`; a post-count other than exactly `walls_before + 1` returns `wall_creation_unverified` and retains intent evidence. Only the exact count plus successful cleanup creates the confirmed success response:
 
 ```gdscript
 {

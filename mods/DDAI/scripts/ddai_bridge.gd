@@ -308,6 +308,9 @@ func _runtime_room_preflight(plan):
 		return {"ok": false, "error": _error("wall_count_unavailable", "The active level wall count is unavailable.", "")}
 	if Global.Editor == null or typeof(Global.Editor.Tools) != TYPE_DICTIONARY or not Global.Editor.Tools.has("WallTool") or Global.Editor.Tools["WallTool"] == null or Global.WorldUI == null:
 		return {"ok": false, "error": _error("wall_tool_unavailable", "The documented Dungeondraft wall tool is unavailable.", "")}
+	var wall_tool = Global.Editor.Tools["WallTool"]
+	if wall_tool.isDrawing or Global.WorldUI.EditArcPoint or Global.WorldUI.Polyline.size() > 0:
+		return {"ok": false, "error": _error("wall_tool_busy", "Finish or cancel the current manual wall before applying an AI room.", "")}
 	return {"ok": true}
 
 
