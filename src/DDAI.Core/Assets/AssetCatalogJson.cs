@@ -17,28 +17,33 @@ public static class AssetReference
 
         ArgumentNullException.ThrowIfNull(resourceIdentity);
 
-        var normalizedPackId = packId?.Normalize(NormalizationForm.FormKC).Trim().ToLowerInvariant() ?? string.Empty;
+        var normalizedPackId = NormalizePackId(packId);
         var input = string.Concat(normalizedPackId, "\n", category, "\n", resourceIdentity);
         return "sha256:" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(input))).ToLowerInvariant();
     }
+
+    internal static string NormalizePackId(string? packId) =>
+        packId?.Normalize(NormalizationForm.FormKC).Trim().ToLowerInvariant() ?? string.Empty;
 }
 
 public static class AssetCatalogJson
 {
     public const int MaximumJsonBytes = 1024 * 1024;
 
-    public static JsonSerializerOptions SerializerOptions { get; } = new()
+    private static readonly JsonSerializerOptions WireSerializerOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
         UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
         WriteIndented = false,
     };
 
+    public static JsonSerializerOptions SerializerOptions => new(WireSerializerOptions);
+
     public static string SerializeManifest(AssetCatalogManifest manifest)
     {
         ArgumentNullException.ThrowIfNull(manifest);
         ValidateManifest(manifest);
-        return JsonSerializer.Serialize(manifest, SerializerOptions);
+        return SerializeBounded(manifest);
     }
 
     public static AssetCatalogManifest DeserializeManifest(string json)
@@ -46,7 +51,7 @@ public static class AssetCatalogJson
         using var document = ParseBounded(json);
         ValidateManifestWireShape(document.RootElement);
 
-        var manifest = JsonSerializer.Deserialize<AssetCatalogManifest>(json, SerializerOptions)
+        var manifest = JsonSerializer.Deserialize<AssetCatalogManifest>(json, WireSerializerOptions)
             ?? throw new JsonException("Asset catalog manifest cannot be JSON null.");
         ValidateManifest(manifest);
         return manifest;
@@ -54,12 +59,22 @@ public static class AssetCatalogJson
 
     public static string SerializeEntries(IReadOnlyList<AssetCatalogEntry> entries)
     {
+        return SerializeChunk(entries);
+    }
+
+    public static string SerializeChunk(IReadOnlyList<AssetCatalogEntry> entries)
+    {
         ArgumentNullException.ThrowIfNull(entries);
         ValidateEntries(entries);
-        return JsonSerializer.Serialize(entries, SerializerOptions);
+        return SerializeBounded(entries);
     }
 
     public static IReadOnlyList<AssetCatalogEntry> DeserializeEntries(string json)
+    {
+        return DeserializeChunk(json);
+    }
+
+    public static IReadOnlyList<AssetCatalogEntry> DeserializeChunk(string json)
     {
         using var document = ParseBounded(json);
         if (document.RootElement.ValueKind != JsonValueKind.Array)
@@ -75,10 +90,21 @@ public static class AssetCatalogJson
                 ["asset_ref", "category", "display_name", "resource_fingerprint", "pack_id", "pack_name", "search_terms", "tags", "preview_hash", "allow_third_party_use", "generated"]);
         }
 
-        var entries = JsonSerializer.Deserialize<IReadOnlyList<AssetCatalogEntry>>(json, SerializerOptions)
+        var entries = JsonSerializer.Deserialize<IReadOnlyList<AssetCatalogEntry>>(json, WireSerializerOptions)
             ?? throw new JsonException("Asset catalog entries cannot be JSON null.");
         ValidateEntries(entries);
         return entries;
+    }
+
+    private static string SerializeBounded<T>(T value)
+    {
+        var json = JsonSerializer.Serialize(value, WireSerializerOptions);
+        if (Encoding.UTF8.GetByteCount(json) > MaximumJsonBytes)
+        {
+            throw new JsonException("Asset catalog JSON exceeds the 1 MiB limit.");
+        }
+
+        return json;
     }
 
     public static string ComputeCatalogFingerprint(AssetCatalogManifest manifest)
@@ -319,7 +345,7 @@ public static class AssetCatalogJson
 
             RequireNonBlank(entry.DisplayName, "display name");
             RequireHash(entry.ResourceFingerprint, "resource fingerprint");
-            RequireOptionalNonBlank(entry.PackId, "pack id");
+            RequireCanonicalPackId(entry.PackId);
             RequireOptionalNonBlank(entry.PackName, "pack name");
             RequireStrings(entry.SearchTerms, "search terms");
             RequireStrings(entry.Tags, "tags");
@@ -389,6 +415,20 @@ public static class AssetCatalogJson
         if (value is not null)
         {
             RequireNonBlank(value, name);
+        }
+    }
+
+    private static void RequireCanonicalPackId(string? value)
+    {
+        if (value is null)
+        {
+            return;
+        }
+
+        RequireNonBlank(value, "pack id");
+        if (!string.Equals(value, AssetReference.NormalizePackId(value), StringComparison.Ordinal))
+        {
+            throw new JsonException("Pack id must use Unicode Form KC, be trimmed, and use invariant lowercase.");
         }
     }
 

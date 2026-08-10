@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using DDAI.Core.Assets;
 
 namespace DDAI.Core.Tests.Assets;
@@ -40,6 +41,24 @@ public sealed class AssetCatalogContractTests
         Assert.Equal(
             AssetReference.Create(null, "Objects", "res://chair.png"),
             AssetReference.Create(string.Empty, "Objects", "res://chair.png"));
+    }
+
+    [Fact]
+    public void SerializeAndDeserializeChunk_RequireCanonicalPublicPackIdentifiers()
+    {
+        var canonical = ValidEntry() with { PackId = "pack café" };
+
+        var json = AssetCatalogJson.SerializeChunk([canonical]);
+        var parsed = Assert.Single(AssetCatalogJson.DeserializeChunk(json));
+
+        Assert.Contains("\"pack_id\"", json, StringComparison.Ordinal);
+        Assert.Equal("pack café", parsed.PackId);
+
+        var noncanonical = canonical with { PackId = "  PＡＣＫ Café  " };
+        Assert.Throws<JsonException>(() => AssetCatalogJson.SerializeChunk([noncanonical]));
+
+        var invalidWire = JsonSerializer.Serialize(new[] { noncanonical });
+        Assert.Throws<JsonException>(() => AssetCatalogJson.DeserializeChunk(invalidWire));
     }
 
     [Fact]
@@ -130,6 +149,40 @@ public sealed class AssetCatalogContractTests
         var oversized = "{" + new string(' ', (1024 * 1024) + 1) + "}";
 
         Assert.Throws<JsonException>(() => AssetCatalogJson.DeserializeManifest(oversized));
+    }
+
+    [Fact]
+    public void SerializeManifest_RejectsJsonOverOneMiB()
+    {
+        var seed = ValidManifest() with
+        {
+            Errors = [new AssetCatalogError("preview_failed", new string('x', AssetCatalogJson.MaximumJsonBytes), null)],
+        };
+        var manifest = seed with { CatalogFingerprint = AssetCatalogJson.ComputeCatalogFingerprint(seed) };
+
+        Assert.Throws<JsonException>(() => AssetCatalogJson.SerializeManifest(manifest));
+    }
+
+    [Fact]
+    public void SerializeChunk_RejectsJsonOverOneMiB()
+    {
+        var entry = ValidEntry() with { DisplayName = new string('x', AssetCatalogJson.MaximumJsonBytes) };
+
+        Assert.Throws<JsonException>(() => AssetCatalogJson.SerializeChunk([entry]));
+    }
+
+    [Fact]
+    public void ExternalSerializerOptionMutation_CannotWeakenProductionWireBehavior()
+    {
+        var externalOptions = AssetCatalogJson.SerializerOptions;
+        externalOptions.WriteIndented = true;
+        externalOptions.NumberHandling = JsonNumberHandling.AllowReadingFromString;
+
+        var json = AssetCatalogJson.SerializeManifest(ValidManifest());
+        var quotedRevision = json.Replace("\"catalog_revision\":3", "\"catalog_revision\":\"3\"", StringComparison.Ordinal);
+
+        Assert.DoesNotContain("\n", json, StringComparison.Ordinal);
+        Assert.Throws<JsonException>(() => AssetCatalogJson.DeserializeManifest(quotedRevision));
     }
 
     [Fact]
