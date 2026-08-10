@@ -136,3 +136,16 @@ Research and live inspection found that the configured path selected the `custom
 - `config.ini` SHA-256 remained `565BE11265F38109BE28C017DF7A44C3FE32542B808975724CD25422D5B13397` before and after.
 - `%LOCALAPPDATA%\DDAI\DungeondraftMods\custom_snap` was absent before and after, proving the running-app consolidation gate.
 - Remaining live sequence: user closes Dungeondraft normally; setup copies/verifies Custom Snap and activates both IDs; user launches Dungeondraft normally; diagnosis and status must then prove a fresh heartbeat and correlated response.
+
+## First live-load crash investigation and compatibility fix
+
+- The first activated launch started Dungeondraft `1.2.0.1` as PID `48328`, loaded DDAI, and wrote runtime receipt/session `1786329501-11981` plus heartbeat slots `0` and `1` at `2026-08-10T02:38:21Z`. This supersedes the earlier `installed_not_observed` result: the bridge was loaded and its `start()` routine completed.
+- About two seconds later Windows recorded `APPCRASH` / `0xc0000005` at Dungeondraft RVA `0x13e07ca` and created `C:\Users\ChrisBoyd\AppData\Local\CrashDumps\Dungeondraft.exe.48328.dmp`. No status request completed.
+- Dump register and disassembly evidence identifies the fault in Godot's built-in Variant method dispatcher. The caller is the GDScript VM; the receiver Variant type is `18` (`Dictionary`), the argument count is `0`, and the dispatcher dereferenced a missing method entry at offset `0x38`. The executable's adjacent embedded source strings identify `core\variant_call.cpp` and `_VariantCall::FuncData::call`.
+- DDAI's first polling path used `claim.empty()` immediately after `_claim_next_request()`. The bridge had three Dictionary `.empty()` calls. In this optimized Dungeondraft runtime, an unavailable built-in method entry crashes natively instead of returning a script-level invalid-method error.
+- RED: the new focused compatibility test failed on the existing first-poll `claim.empty()` expression.
+- GREEN: all three Dictionary emptiness checks now use `size()` comparisons; the compatibility test forbids `.empty()` anywhere in the bridge. Focused mod-package tests passed `6/6`.
+- Fresh full Release verification passed `301/301` (`225` core and `76` app), with `0` failed and `0` skipped. Release build succeeded with `0` warnings and `0` errors.
+- Fresh one-file artifact: `artifacts/dungeondraft-mod-consolidation/win-x64/ddai.exe`, `73,810,837` bytes, SHA-256 `AD350E62CB9DEAD169B8C474725B740A60BBED61C51135DDC695E9D5FD9E8C9F`.
+- With Dungeondraft closed, setup returned exit `0`, `repaired` / `setup_complete`. Installed executable and artifact hashes match. Installed and source bridge hashes both equal `60C9962DCEC79D171B1C86540B5A05A988506FBF0D8178BDA179A0BF3ECDC368`. Claude, Gemini, Dungeondraft config, and the consolidated Custom Snap copy were already current and unchanged.
+- Remaining live acceptance: launch Dungeondraft normally, confirm the process remains alive, then require a fresh heartbeat and a correlated `status` response. No automatic relaunch was performed.

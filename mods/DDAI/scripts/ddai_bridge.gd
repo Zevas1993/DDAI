@@ -45,7 +45,7 @@ func _ensure_mailbox_directories():
 
 func _process_one_request():
 	var claim = _claim_next_request()
-	if claim.empty():
+	if claim.size() == 0:
 		return
 	_run_claim_state_machine(claim)
 
@@ -76,7 +76,7 @@ func _advance_claim_state(claim):
 		return _fail_claim_without_loss(claim, _error("malformed_request", "Request JSON must contain an object envelope.", ""))
 	var request = parsed.result
 	var validation_error = _validate_request(request, claim.file_name)
-	if not validation_error.empty():
+	if validation_error.size() > 0:
 		return _fail_claim_without_loss(claim, validation_error)
 
 	var canonical_request_text = _canonical_request_text(request)
@@ -295,7 +295,7 @@ func _reconcile_request_duplicate(file_name, canonical_processing_text):
 		var duplicate_parsed = JSON.parse(duplicate_read.text)
 		if duplicate_parsed.error == OK and typeof(duplicate_parsed.result) == TYPE_DICTIONARY:
 			var duplicate = duplicate_parsed.result
-			if _validate_request(duplicate, file_name).empty() and _canonical_request_text(duplicate) == canonical_processing_text:
+			if _validate_request(duplicate, file_name).size() == 0 and _canonical_request_text(duplicate) == canonical_processing_text:
 				var remove_result = _remove_file(request_path)
 				if remove_result == "removed" or remove_result == "missing":
 					return "reconciled"

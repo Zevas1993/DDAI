@@ -68,6 +68,20 @@ public sealed class DungeondraftModPackageTests
     }
 
     [Fact]
+    public void Gdscript_AvoidsDictionaryEmptyCallThatCrashesDungeondraftReleaseRuntime()
+    {
+        var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
+        var processBody = FunctionBody(script, "_process_one_request");
+        var advanceBody = FunctionBody(script, "_advance_claim_state");
+        var reconcileBody = FunctionBody(script, "_reconcile_request_duplicate");
+
+        Assert.DoesNotContain(".empty()", script, StringComparison.Ordinal);
+        Assert.Contains("if claim.size() == 0:", processBody, StringComparison.Ordinal);
+        Assert.Contains("if validation_error.size() > 0:", advanceBody, StringComparison.Ordinal);
+        Assert.Contains("_validate_request(duplicate, file_name).size() == 0", reconcileBody, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Gdscript_TimestampValidatorEnforcesCanonicalWireLanguageAndUtcBounds()
     {
         var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
