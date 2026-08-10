@@ -33,7 +33,8 @@ public sealed record LocalSetupResult(
     string InstalledExecutable,
     string ModPath,
     IReadOnlyList<ClientConfigUpdate> ConfigUpdates,
-    DungeondraftConfigUpdate DungeondraftConfig);
+    DungeondraftConfigUpdate DungeondraftConfig,
+    DungeondraftModConsolidationUpdate ModConsolidation);
 
 public sealed record LocalDiagnosisResult(
     string State,
@@ -41,7 +42,8 @@ public sealed record LocalDiagnosisResult(
     string InstalledExecutable,
     string ModPath,
     string Message,
-    DungeondraftConfigUpdate DungeondraftConfig);
+    DungeondraftConfigUpdate DungeondraftConfig,
+    DungeondraftModConsolidationUpdate ModConsolidation);
 
 public sealed record LocalUninstallResult(
     string State,
@@ -49,7 +51,8 @@ public sealed record LocalUninstallResult(
     string InstalledExecutable,
     string ModPath,
     IReadOnlyList<ClientConfigUpdate> ConfigUpdates,
-    DungeondraftConfigUpdate DungeondraftConfig);
+    DungeondraftConfigUpdate DungeondraftConfig,
+    DungeondraftModConsolidationUpdate ModConsolidation);
 
 public sealed class LocalSetupException(string message, Exception? innerException = null) : Exception(message, innerException);
 
@@ -104,39 +107,68 @@ public sealed class LocalSetupService
     {
         ArgumentNullException.ThrowIfNull(paths);
         ValidateSetupInputs(paths);
+        var previousMetadata = TryReadOwnedMetadata(paths.MetadataPath, paths.InstalledExecutable);
+        var previousConfigReceipt = previousMetadata?.DungeondraftConfig;
+        var previousConsolidationReceipt = GetCustomSnapReceipt(previousMetadata);
         var transaction = new DungeondraftConfigTransaction(timeProvider);
+        var consolidator = new DungeondraftModConsolidator();
         DungeondraftConfigTransactionPlan? configPlan = null;
+        DungeondraftModConsolidationPlan? consolidationPlan = null;
         DungeondraftConfigUpdate configUpdate;
+        DungeondraftModConsolidationUpdate consolidationUpdate;
         if (processProbe.IsRunning())
         {
             configUpdate = ConfigUpdate("activation_pending", paths);
+            consolidationUpdate = ConsolidationUpdate("deferred_dungeondraft_running");
         }
         else if (!File.Exists(paths.DungeondraftConfigPath))
         {
             configUpdate = ConfigUpdate("activation_pending_config_missing", paths);
+            consolidationUpdate = ConsolidationUpdate("not_planned");
         }
         else
         {
-            configPlan = transaction.PlanSetup(paths.DungeondraftConfigPath, paths.ModsDirectory);
+            configPlan = transaction.PlanSetup(
+                paths.DungeondraftConfigPath,
+                paths.ModsDirectory,
+                [DungeondraftConfigEditor.CustomSnapModId, DungeondraftConfigEditor.DdaiModId]);
             configUpdate = ConfigUpdate("planned", paths, configPlan.Ownership);
+            var customSnapSource = previousConsolidationReceipt?.SourceDirectory
+                ?? configPlan.Ownership.PreviousModsDirectory;
+            if (string.IsNullOrWhiteSpace(customSnapSource))
+            {
+                throw new DungeondraftConfigException(
+                    "The previous Custom Snap directory is unavailable, so mod consolidation cannot be proven.");
+            }
+
+            consolidationPlan = consolidator.PlanCustomSnap(customSnapSource, paths.ModsDirectory);
+            consolidationUpdate = ConsolidationUpdate("planned");
         }
 
-        var previousMetadata = TryReadOwnedMetadata(paths.MetadataPath, paths.InstalledExecutable);
-        var previousReceipt = previousMetadata?.DungeondraftConfig;
         var connectorState = InstallConnector(paths);
         var modState = InstallMod(paths);
         var configs = ClientConfigMerger.Setup(paths.ConfigTargets, paths.InstalledExecutable, timeProvider);
+        if (consolidationPlan is not null)
+        {
+            consolidationUpdate = consolidator.Apply(consolidationPlan);
+        }
+
         if (configPlan is not null)
         {
             configUpdate = transaction.Apply(configPlan);
-            var receipt = previousReceipt ?? configPlan.Ownership;
+            var configReceipt = previousConfigReceipt ?? configPlan.Ownership;
+            var consolidationReceipt = previousConsolidationReceipt ?? consolidationUpdate.Receipt
+                ?? throw new LocalSetupException("Custom Snap consolidation did not produce an ownership receipt.");
+            var consolidationReceipts = new[] { consolidationReceipt };
             try
             {
-                if (previousMetadata?.DungeondraftConfig != receipt)
+                if (previousMetadata?.DungeondraftConfig != configReceipt ||
+                    !ReceiptsEqual(previousMetadata?.ConsolidatedMods, consolidationReceipts))
                 {
-                    WriteInstallMetadata(paths, receipt);
+                    WriteInstallMetadata(paths, configReceipt, consolidationReceipts);
                 }
-                configUpdate = configUpdate with { Ownership = receipt };
+                configUpdate = configUpdate with { Ownership = configReceipt };
+                consolidationUpdate = consolidationUpdate with { Receipt = consolidationReceipt };
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
             {
@@ -149,7 +181,7 @@ public sealed class LocalSetupService
 
         var state = connectorState == "installed" ? "installed"
             : connectorState == "repaired" || modState == "repaired" ? "repaired"
-            : configs.Any(update => update.Changed) || modState == "installed" ? "installed"
+            : configs.Any(update => update.Changed) || modState == "installed" || consolidationUpdate.Changed ? "installed"
             : "already_current";
 
         if (configUpdate.State is "activation_pending" or "activation_pending_config_missing")
@@ -162,7 +194,8 @@ public sealed class LocalSetupService
                 paths.InstalledExecutable,
                 paths.InstalledModDirectory,
                 configs,
-                configUpdate);
+                configUpdate,
+                consolidationUpdate);
         }
 
         return new LocalSetupResult(
@@ -171,7 +204,8 @@ public sealed class LocalSetupService
             paths.InstalledExecutable,
             paths.InstalledModDirectory,
             configs,
-            configUpdate);
+            configUpdate,
+            consolidationUpdate);
     }
 
     public LocalDiagnosisResult Diagnose(LocalSetupPaths paths)
@@ -185,7 +219,8 @@ public sealed class LocalSetupService
                 paths.InstalledExecutable,
                 paths.InstalledModDirectory,
                 "The DDAI executable installation is missing or its ownership metadata is invalid.",
-                ConfigUpdate("not_checked", paths));
+                ConfigUpdate("not_checked", paths),
+                ConsolidationUpdate("not_checked"));
         }
 
         if (!Directory.Exists(paths.InstalledModDirectory) || !IsOwnedMod(paths.InstalledModDirectory))
@@ -196,7 +231,8 @@ public sealed class LocalSetupService
                 paths.InstalledExecutable,
                 paths.InstalledModDirectory,
                 "The DDAI mod is not installed in the configured per-user custom Mods root.",
-                ConfigUpdate("not_checked", paths));
+                ConfigUpdate("not_checked", paths),
+                ConsolidationUpdate("not_checked"));
         }
 
         if (HasFreshHeartbeat(paths.DungeondraftUserDataDirectory))
@@ -207,7 +243,8 @@ public sealed class LocalSetupService
                 paths.InstalledExecutable,
                 paths.InstalledModDirectory,
                 "Dungeondraft has loaded the DDAI mod and its heartbeat is fresh.",
-                ConfigUpdate("runtime_observed", paths));
+                ConfigUpdate("runtime_observed", paths),
+                ConsolidationUpdate("runtime_observed"));
         }
 
         if (processProbe.IsRunning())
@@ -218,7 +255,8 @@ public sealed class LocalSetupService
                 paths.InstalledExecutable,
                 paths.InstalledModDirectory,
                 "Dungeondraft is running without a fresh DDAI heartbeat. Close it normally before retrying setup; DDAI did not change the running application.",
-                ConfigUpdate("activation_pending", paths));
+                ConfigUpdate("activation_pending", paths),
+                ConsolidationUpdate("deferred_dungeondraft_running"));
         }
 
         if (!File.Exists(paths.DungeondraftConfigPath))
@@ -229,15 +267,35 @@ public sealed class LocalSetupService
                 paths.InstalledExecutable,
                 paths.InstalledModDirectory,
                 "Dungeondraft config.ini is missing, so DDAI cannot activate the bridge automatically.",
-                ConfigUpdate("activation_pending_config_missing", paths));
+                ConfigUpdate("activation_pending_config_missing", paths),
+                ConsolidationUpdate("not_planned"));
         }
+
+        var metadata = TryReadOwnedMetadata(paths.MetadataPath, paths.InstalledExecutable);
+        var consolidationReceipt = GetCustomSnapReceipt(metadata);
+        var consolidationCurrent = consolidationReceipt is not null &&
+            new DungeondraftModConsolidator().IsCurrent(consolidationReceipt);
+        if (!consolidationCurrent)
+        {
+            return new LocalDiagnosisResult(
+                "activation_pending",
+                "activation_pending_mod_consolidation",
+                paths.InstalledExecutable,
+                paths.InstalledModDirectory,
+                "The managed Custom Snap copy is missing or differs from its proven source.",
+                ConfigUpdate("not_checked", paths),
+                ConsolidationUpdate("missing_or_conflicting", consolidationReceipt));
+        }
+
+        var currentConsolidation = ConsolidationUpdate("already_current", consolidationReceipt);
 
         bool configured;
         try
         {
             configured = DungeondraftConfigEditor.IsConfigured(
                 File.ReadAllBytes(paths.DungeondraftConfigPath),
-                paths.ModsDirectory);
+                paths.ModsDirectory,
+                [DungeondraftConfigEditor.CustomSnapModId, DungeondraftConfigEditor.DdaiModId]);
         }
         catch (Exception exception) when (exception is DungeondraftConfigException or IOException or UnauthorizedAccessException)
         {
@@ -252,7 +310,8 @@ public sealed class LocalSetupService
                 paths.InstalledExecutable,
                 paths.InstalledModDirectory,
                 "Dungeondraft config.ini does not safely select the DDAI Mods root and bridge.",
-                ConfigUpdate("activation_pending_config_mismatch", paths));
+                ConfigUpdate("activation_pending_config_mismatch", paths),
+                currentConsolidation);
         }
 
         return new LocalDiagnosisResult(
@@ -261,7 +320,8 @@ public sealed class LocalSetupService
             paths.InstalledExecutable,
             paths.InstalledModDirectory,
             "Dungeondraft is configured for DDAI. Launch or reload it normally and wait for the runtime heartbeat.",
-            ConfigUpdate("configured_waiting_for_reload", paths));
+            ConfigUpdate("configured_waiting_for_reload", paths),
+            currentConsolidation);
     }
 
     public LocalUninstallResult Uninstall(LocalSetupPaths paths, string currentExecutablePath)
@@ -276,10 +336,15 @@ public sealed class LocalSetupService
                 paths.InstalledExecutable,
                 paths.InstalledModDirectory,
                 [],
-                ConfigUpdate("retained_dungeondraft_running", paths));
+                ConfigUpdate("retained_dungeondraft_running", paths),
+                ConsolidationUpdate("deferred_dungeondraft_running"));
         }
 
         var metadata = TryReadOwnedMetadata(paths.MetadataPath, paths.InstalledExecutable);
+        var consolidationReceipt = GetCustomSnapReceipt(metadata);
+        var consolidationUpdate = ConsolidationUpdate(
+            consolidationReceipt is null ? "retained_unproven_user_content" : "retained_user_content",
+            consolidationReceipt);
         DungeondraftConfigUpdate configUpdate;
         if (metadata?.DungeondraftConfig is not null && File.Exists(paths.DungeondraftConfigPath))
         {
@@ -315,7 +380,8 @@ public sealed class LocalSetupService
                 paths.InstalledExecutable,
                 paths.InstalledModDirectory,
                 configs,
-                configUpdate);
+                configUpdate,
+                consolidationUpdate);
         }
 
         if (File.Exists(paths.InstalledExecutable))
@@ -334,7 +400,8 @@ public sealed class LocalSetupService
             paths.InstalledExecutable,
             paths.InstalledModDirectory,
             configs,
-            configUpdate);
+            configUpdate,
+            consolidationUpdate);
     }
 
     private static void ValidateSetupInputs(LocalSetupPaths paths)
@@ -404,7 +471,8 @@ public sealed class LocalSetupService
             "0.1.0",
             Path.GetFullPath(paths.InstalledExecutable),
             timeProvider.GetUtcNow(),
-            existingMetadata?.DungeondraftConfig);
+            existingMetadata?.DungeondraftConfig,
+            existingMetadata?.ConsolidatedMods);
         WriteJsonAtomically(paths.MetadataPath, metadata);
         return targetExists || metadataExists ? "repaired" : "installed";
     }
@@ -619,14 +687,18 @@ public sealed class LocalSetupService
         }
     }
 
-    private void WriteInstallMetadata(LocalSetupPaths paths, DungeondraftConfigOwnership? ownership)
+    private void WriteInstallMetadata(
+        LocalSetupPaths paths,
+        DungeondraftConfigOwnership? ownership,
+        IReadOnlyList<DungeondraftModConsolidationReceipt>? consolidatedMods)
     {
         var metadata = new InstallMetadata(
             Owner,
             "0.1.0",
             Path.GetFullPath(paths.InstalledExecutable),
             timeProvider.GetUtcNow(),
-            ownership);
+            ownership,
+            consolidatedMods);
         WriteJsonAtomically(paths.MetadataPath, metadata);
     }
 
@@ -635,6 +707,39 @@ public sealed class LocalSetupService
         LocalSetupPaths paths,
         DungeondraftConfigOwnership? ownership = null) =>
         new(state, paths.DungeondraftConfigPath, Changed: false, BackupPath: null, ownership);
+
+    private static DungeondraftModConsolidationUpdate ConsolidationUpdate(
+        string state,
+        DungeondraftModConsolidationReceipt? receipt = null) =>
+        new(state, Changed: false, receipt);
+
+    private static DungeondraftModConsolidationReceipt? GetCustomSnapReceipt(InstallMetadata? metadata)
+    {
+        if (metadata?.ConsolidatedMods is null || metadata.ConsolidatedMods.Count == 0)
+        {
+            return null;
+        }
+
+        if (metadata.ConsolidatedMods.Count != 1 ||
+            metadata.ConsolidatedMods[0].ModId != DungeondraftConfigEditor.CustomSnapModId)
+        {
+            throw new LocalSetupException("DDAI installation metadata contains ambiguous mod-consolidation ownership.");
+        }
+
+        return metadata.ConsolidatedMods[0];
+    }
+
+    private static bool ReceiptsEqual(
+        IReadOnlyList<DungeondraftModConsolidationReceipt>? left,
+        IReadOnlyList<DungeondraftModConsolidationReceipt>? right)
+    {
+        if (left is null || right is null)
+        {
+            return left is null && right is null;
+        }
+
+        return left.SequenceEqual(right);
+    }
 
     private static void WriteJsonAtomically<T>(string target, T value)
     {
@@ -661,5 +766,6 @@ public sealed class LocalSetupService
         string Version,
         string ExecutablePath,
         DateTimeOffset InstalledAt,
-        DungeondraftConfigOwnership? DungeondraftConfig = null);
+        DungeondraftConfigOwnership? DungeondraftConfig = null,
+        IReadOnlyList<DungeondraftModConsolidationReceipt>? ConsolidatedMods = null);
 }

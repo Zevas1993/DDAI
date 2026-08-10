@@ -63,6 +63,8 @@ public sealed class SetupLifecycleTests
         Assert.False(File.Exists(installedExecutable));
         Assert.False(File.Exists(Path.Combine(sandbox.InstallRoot, "install-metadata.json")));
         Assert.False(Directory.Exists(Path.Combine(sandbox.ModsDirectory, "DDAI")));
+        Assert.True(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
+        Assert.True(Directory.Exists(sandbox.OriginalModsDirectory));
         Assert.Equal("keep-install", File.ReadAllText(sandbox.InstallSentinel));
         Assert.Equal("keep-mod", File.ReadAllText(sandbox.ForeignModSentinel));
         Assert.Null(JsonNode.Parse(File.ReadAllText(sandbox.ClaudePath))!["mcpServers"]!["ddai"]);
@@ -166,8 +168,27 @@ public sealed class SetupLifecycleTests
         Assert.Equal("activation_pending", result.State);
         Assert.Equal("activation_pending_dungeondraft_running", result.Code);
         Assert.Equal("activation_pending", result.DungeondraftConfig.State);
+        Assert.Equal("deferred_dungeondraft_running", result.ModConsolidation.State);
+        Assert.False(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
         Assert.Equal(original, File.ReadAllBytes(sandbox.ConfigPath));
         Assert.Empty(Directory.GetFiles(sandbox.UserDataDirectory, "config.ini.ddai-backup-*.ini"));
+    }
+
+    [Fact]
+    public void Setup_RunningDungeondraftDoesNotParseInvalidConfigOrCopyCustomSnap()
+    {
+        using var sandbox = new LifecycleSandbox();
+        File.WriteAllText(sandbox.ClaudePath, "{}");
+        File.WriteAllText(sandbox.GeminiPath, "{}");
+        File.WriteAllText(sandbox.ConfigPath, "[Mods]\nactive_mods=[ bare ]\n");
+        var original = File.ReadAllBytes(sandbox.ConfigPath);
+        var service = new LocalSetupService(new FixedTimeProvider(), new StubProcessProbe(true));
+
+        var result = service.Setup(sandbox.Paths);
+
+        Assert.Equal("activation_pending_dungeondraft_running", result.Code);
+        Assert.Equal(original, File.ReadAllBytes(sandbox.ConfigPath));
+        Assert.False(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
     }
 
     [Fact]
@@ -206,6 +227,7 @@ public sealed class SetupLifecycleTests
         Assert.Equal("activation_pending", result.State);
         Assert.Equal("activation_pending_config_missing", result.Code);
         Assert.Equal("activation_pending_config_missing", result.DungeondraftConfig.State);
+        Assert.Equal("not_planned", result.ModConsolidation.State);
         Assert.False(File.Exists(sandbox.ConfigPath));
         Assert.True(File.Exists(sandbox.Paths.InstalledExecutable));
     }
@@ -229,12 +251,19 @@ public sealed class SetupLifecycleTests
         Assert.Contains("Lievven.Snappy_Mod", Encoding.UTF8.GetString(configured));
         Assert.Contains(DungeondraftConfigEditor.DdaiModId, Encoding.UTF8.GetString(configured));
         Assert.NotNull(metadata["dungeondraft_config"]);
+        Assert.NotNull(metadata["consolidated_mods"]);
+        Assert.Equal("copied", first.ModConsolidation.State);
+        Assert.True(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
+        Assert.Equal(
+            File.ReadAllBytes(Path.Combine(sandbox.OriginalModsDirectory, "snappy_mod.ddmod")),
+            File.ReadAllBytes(Path.Combine(sandbox.CopiedCustomSnapDirectory, "snappy_mod.ddmod")));
         var metadataBytes = File.ReadAllBytes(sandbox.Paths.MetadataPath);
 
         var second = service.Setup(sandbox.Paths);
 
         Assert.Equal("already_current", second.State);
         Assert.Equal("already_current", second.DungeondraftConfig.State);
+        Assert.Equal("already_current", second.ModConsolidation.State);
         Assert.Equal(configured, File.ReadAllBytes(sandbox.ConfigPath));
         Assert.Equal(metadataBytes, File.ReadAllBytes(sandbox.Paths.MetadataPath));
         Assert.Single(Directory.GetFiles(sandbox.UserDataDirectory, "config.ini.ddai-backup-*.ini"));
@@ -283,9 +312,14 @@ public sealed class SetupLifecycleTests
 
         Assert.Equal("uninstalled", result.State);
         Assert.Equal("updated", result.DungeondraftConfig.State);
+        Assert.Equal("retained_user_content", result.ModConsolidation.State);
         Assert.Contains("Lievven.Snappy_Mod", config);
         Assert.DoesNotContain(DungeondraftConfigEditor.DdaiModId, config);
-        Assert.Contains("mods_directory=\"D:\\\\DungeonDraft\\\\Dungeondraft\\\\mods\\\\custom_snap\"", config);
+        Assert.Contains(
+            "mods_directory=\"" + sandbox.OriginalModsDirectory.Replace("\\", "\\\\", StringComparison.Ordinal) + "\"",
+            config);
+        Assert.True(Directory.Exists(sandbox.OriginalModsDirectory));
+        Assert.True(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
     }
 
     [Fact]
@@ -306,6 +340,7 @@ public sealed class SetupLifecycleTests
         Assert.Equal(configured, File.ReadAllBytes(sandbox.ConfigPath));
         Assert.True(File.Exists(sandbox.Paths.MetadataPath));
         Assert.True(Directory.Exists(sandbox.Paths.InstalledModDirectory));
+        Assert.True(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
     }
 
     [Fact]
@@ -367,6 +402,41 @@ public sealed class SetupLifecycleTests
         Assert.Null(JsonNode.Parse(File.ReadAllText(sandbox.ClaudePath))!["mcpServers"]);
     }
 
+    [Fact]
+    public void Setup_ConflictingCopiedCustomSnapFailsBeforeConfigMutation()
+    {
+        using var sandbox = new LifecycleSandbox();
+        File.WriteAllText(sandbox.ClaudePath, "{}");
+        File.WriteAllText(sandbox.GeminiPath, "{}");
+        Directory.CreateDirectory(sandbox.CopiedCustomSnapDirectory);
+        File.WriteAllText(Path.Combine(sandbox.CopiedCustomSnapDirectory, "foreign.txt"), "keep");
+        var original = File.ReadAllBytes(sandbox.ConfigPath);
+        var service = new LocalSetupService(new FixedTimeProvider(), new StubProcessProbe(false));
+
+        Assert.Throws<DungeondraftConfigException>(() => service.Setup(sandbox.Paths));
+
+        Assert.Equal(original, File.ReadAllBytes(sandbox.ConfigPath));
+        Assert.False(File.Exists(sandbox.Paths.InstalledExecutable));
+        Assert.Equal("keep", File.ReadAllText(Path.Combine(sandbox.CopiedCustomSnapDirectory, "foreign.txt")));
+    }
+
+    [Fact]
+    public void Diagnose_MissingCopiedCustomSnapReportsConsolidationPending()
+    {
+        using var sandbox = new LifecycleSandbox();
+        File.WriteAllText(sandbox.ClaudePath, "{}");
+        File.WriteAllText(sandbox.GeminiPath, "{}");
+        var service = new LocalSetupService(new FixedTimeProvider(), new StubProcessProbe(false));
+        _ = service.Setup(sandbox.Paths);
+        Directory.Delete(sandbox.CopiedCustomSnapDirectory, recursive: true);
+
+        var result = service.Diagnose(sandbox.Paths);
+
+        Assert.Equal("activation_pending", result.State);
+        Assert.Equal("activation_pending_mod_consolidation", result.Code);
+        Assert.Equal("missing_or_conflicting", result.ModConsolidation.State);
+    }
+
     private static void WriteFreshHeartbeat(string userDataDirectory)
     {
         var directory = Path.Combine(userDataDirectory, "ddai", "runtime-heartbeats");
@@ -386,6 +456,7 @@ public sealed class SetupLifecycleTests
             Root = Path.Combine(Path.GetTempPath(), "ddai-lifecycle-tests", Guid.NewGuid().ToString("N"));
             SourceExecutable = Path.Combine(Root, "source", "ddai.exe");
             SourceModDirectory = Path.Combine(Root, "source", "mod");
+            OriginalModsDirectory = Path.Combine(Root, "original-mods", "custom_snap");
             InstallRoot = Path.Combine(Root, "install");
             ModsDirectory = Path.Combine(InstallRoot, "DungeondraftMods");
             UserDataDirectory = Path.Combine(Root, "DungeondraftUserData");
@@ -393,14 +464,20 @@ public sealed class SetupLifecycleTests
             GeminiPath = Path.Combine(Root, ".gemini", "settings.json");
             Directory.CreateDirectory(Path.GetDirectoryName(SourceExecutable)!);
             Directory.CreateDirectory(SourceModDirectory);
+            Directory.CreateDirectory(Path.Combine(OriginalModsDirectory, "scripts"));
             Directory.CreateDirectory(InstallRoot);
             Directory.CreateDirectory(Path.GetDirectoryName(ClaudePath)!);
             Directory.CreateDirectory(Path.GetDirectoryName(GeminiPath)!);
             Directory.CreateDirectory(UserDataDirectory);
             File.WriteAllBytes(SourceExecutable, [0x44, 0x44, 0x41, 0x49]);
             File.WriteAllText(
+                Path.Combine(OriginalModsDirectory, "snappy_mod.ddmod"),
+                "{\"name\":\"Custom Snap Mod\",\"unique_id\":\"Lievven.Snappy_Mod\",\"dd_version\":\"1.1.0.6\"}");
+            File.WriteAllText(Path.Combine(OriginalModsDirectory, "scripts", "snappy_mod.gd"), "extends Node\n");
+            File.WriteAllText(
                 Path.Combine(UserDataDirectory, "config.ini"),
-                "; keep\r\n[Mods]\r\nactive_mods=[ \"Lievven.Snappy_Mod\" ]\r\nmods_directory=\"D:\\\\DungeonDraft\\\\Dungeondraft\\\\mods\\\\custom_snap\"\r\n");
+                "; keep\r\n[Mods]\r\nactive_mods=[ \"Lievven.Snappy_Mod\" ]\r\nmods_directory=\"" +
+                OriginalModsDirectory.Replace("\\", "\\\\", StringComparison.Ordinal) + "\"\r\n");
             CopyDirectory(Path.Combine(FindRepositoryRoot(), "mods", "DDAI"), SourceModDirectory);
             InstallSentinel = Path.Combine(InstallRoot, "foreign-sentinel.txt");
             ForeignModSentinel = Path.Combine(ModsDirectory, "OtherMod", "sentinel.txt");
@@ -419,12 +496,14 @@ public sealed class SetupLifecycleTests
         public string Root { get; }
         public string SourceExecutable { get; }
         public string SourceModDirectory { get; }
+        public string OriginalModsDirectory { get; }
         public string InstallRoot { get; }
         public string ModsDirectory { get; }
         public string UserDataDirectory { get; }
         public string ClaudePath { get; }
         public string GeminiPath { get; }
         public string ConfigPath => Path.Combine(UserDataDirectory, "config.ini");
+        public string CopiedCustomSnapDirectory => Path.Combine(ModsDirectory, "custom_snap");
         public string InstallSentinel { get; }
         public string ForeignModSentinel { get; }
         public LocalSetupPaths Paths { get; }

@@ -58,9 +58,8 @@ public sealed class DungeondraftModConsolidatorTests
         Directory.CreateDirectory(sandbox.DestinationDirectory);
         File.WriteAllText(Path.Combine(sandbox.DestinationDirectory, "foreign.txt"), "keep");
         var destinationBefore = Snapshot(sandbox.DestinationDirectory);
-        var plan = consolidator.PlanCustomSnap(sandbox.SourceDirectory, sandbox.ManagedRoot);
-
-        Assert.Throws<DungeondraftConfigException>(() => consolidator.Apply(plan));
+        Assert.Throws<DungeondraftConfigException>(() =>
+            consolidator.PlanCustomSnap(sandbox.SourceDirectory, sandbox.ManagedRoot));
 
         Assert.Equal(sourceBefore, Snapshot(sandbox.SourceDirectory));
         Assert.Equal(destinationBefore, Snapshot(sandbox.DestinationDirectory));

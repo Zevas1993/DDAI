@@ -34,6 +34,7 @@ public sealed class DungeondraftActivationPublishedTests : IClassFixture<Publish
             Assert.Equal("activation_pending_dungeondraft_running", result["code"]!.GetValue<string>());
             Assert.Equal(originalConfig, File.ReadAllBytes(sandbox.ConfigPath));
             Assert.Empty(Directory.GetFiles(sandbox.UserDataDirectory, "config.ini.ddai-backup-*.ini"));
+            Assert.False(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
             return;
         }
 
@@ -46,6 +47,9 @@ public sealed class DungeondraftActivationPublishedTests : IClassFixture<Publish
         Assert.Contains("Lievven.Snappy_Mod", configText);
         Assert.Contains(DungeondraftConfigEditor.DdaiModId, configText);
         Assert.Contains(sandbox.ModsDirectory.Replace("\\", "\\\\", StringComparison.Ordinal), configText);
+        Assert.Equal(
+            File.ReadAllBytes(Path.Combine(sandbox.OriginalModsDirectory, "snappy_mod.ddmod")),
+            File.ReadAllBytes(Path.Combine(sandbox.CopiedCustomSnapDirectory, "snappy_mod.ddmod")));
 
         var second = sandbox.Run("setup");
 

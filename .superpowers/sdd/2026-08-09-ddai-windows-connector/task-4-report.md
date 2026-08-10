@@ -105,3 +105,34 @@ This section supersedes the manual Mods-directory selection guidance above. The 
 - `C:\Users\ChrisBoyd\AppData\Roaming\Dungeondraft\config.ini` SHA-256 was `D3A1EF7C3C16D2EA9ACF1FBB01D76E0193723BF5FAD49FC59F122E6A6E4B0E15` both before and after setup.
 - Installed `diagnose --json` returned exit `2` with the same activation-pending code. Installed `status --json --timeout-ms 1500` returned exit `2` / `status_timeout`; no live bridge heartbeat or correlated status response exists yet.
 - Remaining acceptance step: after the user closes Dungeondraft normally, rerun fresh setup, verify the exact backup and both mod IDs, then launch Dungeondraft normally and require `runtime_heartbeat_fresh` plus a correlated status response.
+
+## Custom Snap consolidation extension
+
+Research and live inspection found that the configured path selected the `custom_snap` mod directory itself, while DDAI lived in a separate per-user root. Dungeondraft expects one selected parent directory containing individual mod subfolders. The connector now consolidates an exact local Custom Snap copy beside DDAI rather than pointing Dungeondraft at the installation directory or stranding Custom Snap.
+
+- Design commit: `8cd4cf0` (`docs: design safe Dungeondraft mod consolidation`).
+- Plan commit: `2a9bf76` (`docs: plan Custom Snap consolidation`).
+- Required-ID/config receipt commit: `2250f86` (`feat: preserve required Dungeondraft mods`).
+- Hash-verified copy commit: `b321328` (`feat: consolidate Custom Snap safely`).
+- The strict config transaction now activates exactly one `Lievven.Snappy_Mod` and exactly one `org.ddai.status_bridge`, preserves unrelated IDs/duplicates, and records the decoded original Mods directory alongside its exact literal.
+- `DungeondraftModConsolidator` requires exactly one top-level Custom Snap manifest, rejects foreign IDs, traversal, overlapping trees, links/reparse points, source changes, and conflicting destinations, and verifies relative paths, lengths, and SHA-256 hashes before atomically publishing `%LOCALAPPDATA%\DDAI\DungeondraftMods\custom_snap`.
+- The original Custom Snap directory is never moved, renamed, edited, overwritten, or deleted. Uninstall removes only DDAI and reports the copied Custom Snap as retained user content.
+- Running-app setup does not read `config.ini` for activation and does not copy Custom Snap. Closed-app setup preflights both plans before installation mutation, copies/verifies Custom Snap, applies the exact config transaction, and persists both receipts compatibly with legacy metadata.
+- Diagnosis adds `activation_pending_mod_consolidation` and requires the receipt's source and destination to remain byte-equivalent before reporting configured-waiting. Fresh-heartbeat precedence remains unchanged.
+
+### Consolidation verification
+
+- Focused lifecycle/published/MCP gate: `22/22` passed.
+- Full Release suite: `300/300` passed (`224` core and `76` app), `0` failed, `0` skipped.
+- Release build: succeeded with `0` warnings and `0` errors.
+- Published one-file Windows x64 artifact: `artifacts/dungeondraft-mod-consolidation/win-x64/ddai.exe`, `73,810,837` bytes, SHA-256 `C78D138440A7B0DE5EEDC527C8D25667677A5ECAB576181E7681B0698FBCB01C`.
+- GitNexus index: `1,599` nodes, `3,524` edges, `109` flows. `LocalSetupService` impact is medium (`14` direct dependents, one CLI process); `DungeondraftModConsolidator` impact is low (`2` direct dependents: setup and diagnosis). The full lifecycle and CLI suites cover those paths.
+
+### Current-machine safe-defer proof
+
+- Dungeondraft PID `46492` remained open and was not controlled, closed, or restarted.
+- The fresh artifact was installed to `%LOCALAPPDATA%\DDAI\ddai.exe`; installed SHA-256 matches the published hash.
+- Setup emitted one JSON document and returned exit `2`, `activation_pending_dungeondraft_running`, with `mod_consolidation.state=deferred_dungeondraft_running`.
+- `config.ini` SHA-256 remained `565BE11265F38109BE28C017DF7A44C3FE32542B808975724CD25422D5B13397` before and after.
+- `%LOCALAPPDATA%\DDAI\DungeondraftMods\custom_snap` was absent before and after, proving the running-app consolidation gate.
+- Remaining live sequence: user closes Dungeondraft normally; setup copies/verifies Custom Snap and activates both IDs; user launches Dungeondraft normally; diagnosis and status must then prove a fresh heartbeat and correlated response.

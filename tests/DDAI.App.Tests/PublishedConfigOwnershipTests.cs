@@ -179,14 +179,21 @@ internal sealed class PublishedLifecycleSandbox : IDisposable
         InstallRoot = Path.Combine(Root, "install");
         ModsDirectory = Path.Combine(InstallRoot, "DungeondraftMods");
         UserDataDirectory = Path.Combine(Root, "DungeondraftUserData");
+        OriginalModsDirectory = Path.Combine(Root, "original-mods", "custom_snap");
         ClaudePath = Path.Combine(Root, "Claude", "claude_desktop_config.json");
         GeminiPath = Path.Combine(Root, ".gemini", "settings.json");
         Directory.CreateDirectory(Path.GetDirectoryName(ClaudePath)!);
         Directory.CreateDirectory(Path.GetDirectoryName(GeminiPath)!);
         Directory.CreateDirectory(UserDataDirectory);
+        Directory.CreateDirectory(Path.Combine(OriginalModsDirectory, "scripts"));
+        File.WriteAllText(
+            Path.Combine(OriginalModsDirectory, "snappy_mod.ddmod"),
+            "{\"name\":\"Custom Snap Mod\",\"unique_id\":\"Lievven.Snappy_Mod\",\"dd_version\":\"1.1.0.6\"}");
+        File.WriteAllText(Path.Combine(OriginalModsDirectory, "scripts", "snappy_mod.gd"), "extends Node\n");
         File.WriteAllText(
             Path.Combine(UserDataDirectory, "config.ini"),
-            "[Mods]\r\nactive_mods=[ \"Lievven.Snappy_Mod\" ]\r\nmods_directory=\"D:\\\\DungeonDraft\\\\Dungeondraft\\\\mods\\\\custom_snap\"\r\n");
+            "[Mods]\r\nactive_mods=[ \"Lievven.Snappy_Mod\" ]\r\nmods_directory=\"" +
+            OriginalModsDirectory.Replace("\\", "\\\\", StringComparison.Ordinal) + "\"\r\n");
         SourceExecutable = sourceExecutable;
         SourceModDirectory = Path.Combine(PublishedExecutableFixture.FindRepositoryRoot(), "mods", "DDAI");
     }
@@ -197,12 +204,14 @@ internal sealed class PublishedLifecycleSandbox : IDisposable
     public string InstallRoot { get; }
     public string ModsDirectory { get; }
     public string UserDataDirectory { get; }
+    public string OriginalModsDirectory { get; }
     public string ClaudePath { get; }
     public string GeminiPath { get; }
     public string InstalledExecutable => Path.Combine(InstallRoot, "ddai.exe");
     public string MetadataPath => Path.Combine(InstallRoot, "install-metadata.json");
     public string InstalledModDirectory => Path.Combine(ModsDirectory, "DDAI");
     public string ConfigPath => Path.Combine(UserDataDirectory, "config.ini");
+    public string CopiedCustomSnapDirectory => Path.Combine(ModsDirectory, "custom_snap");
 
     public ProcessResult Run(string command) => PublishedExecutableFixture.RunProcess(
         SourceExecutable,

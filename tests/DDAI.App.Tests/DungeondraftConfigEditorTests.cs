@@ -242,4 +242,29 @@ public sealed class DungeondraftConfigEditorTests
         Assert.False(DungeondraftConfigEditor.IsConfigured(wrongDirectory, @"C:\DDAI\Mods"));
         Assert.False(DungeondraftConfigEditor.IsConfigured(missingMod, @"C:\DDAI\Mods"));
     }
+
+    [Fact]
+    public void IsConfigured_RequiredIdsRejectsAConfigMissingCustomSnap()
+    {
+        var onlyDdai = Encoding.UTF8.GetBytes(
+            "[Mods]\nactive_mods=[ \"org.ddai.status_bridge\" ]\nmods_directory=\"C:\\\\DDAI\\\\Mods\"\n");
+
+        Assert.False(DungeondraftConfigEditor.IsConfigured(
+            onlyDdai,
+            @"C:\DDAI\Mods",
+            [DungeondraftConfigEditor.CustomSnapModId, DungeondraftConfigEditor.DdaiModId]));
+    }
+
+    [Fact]
+    public void IsConfigured_RequiredIdsRejectsDuplicates()
+    {
+        var duplicate = Encoding.UTF8.GetBytes(
+            "[Mods]\nactive_mods=[ \"Lievven.Snappy_Mod\", \"org.ddai.status_bridge\", \"org.ddai.status_bridge\" ]\n" +
+            "mods_directory=\"C:\\\\DDAI\\\\Mods\"\n");
+
+        Assert.False(DungeondraftConfigEditor.IsConfigured(
+            duplicate,
+            @"C:\DDAI\Mods",
+            [DungeondraftConfigEditor.CustomSnapModId, DungeondraftConfigEditor.DdaiModId]));
+    }
 }

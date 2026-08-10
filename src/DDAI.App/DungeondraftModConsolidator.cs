@@ -69,6 +69,19 @@ public sealed class DungeondraftModConsolidator
             throw new DungeondraftConfigException("The Custom Snap manifest is invalid or unreadable.", exception);
         }
 
+        if (Directory.Exists(destination))
+        {
+            RequireSnapshotsEqual(
+                files,
+                SnapshotDirectory(destination),
+                "The managed Custom Snap destination contains different files; refusing to overwrite it.");
+        }
+        else if (File.Exists(destination))
+        {
+            throw new DungeondraftConfigException(
+                "The managed Custom Snap destination is an existing file; refusing to overwrite it.");
+        }
+
         return new DungeondraftModConsolidationPlan(
             source,
             destination,

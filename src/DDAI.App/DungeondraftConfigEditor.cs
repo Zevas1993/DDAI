@@ -177,9 +177,21 @@ public static class DungeondraftConfigEditor
         return document.CreateEdit(originalBytes, ownership);
     }
 
-    public static bool IsConfigured(byte[] bytes, string managedModsDirectory)
+    public static bool IsConfigured(byte[] bytes, string managedModsDirectory) =>
+        IsConfigured(bytes, managedModsDirectory, [DdaiModId]);
+
+    public static bool IsConfigured(
+        byte[] bytes,
+        string managedModsDirectory,
+        IReadOnlyList<string> requiredModIds)
     {
         ArgumentNullException.ThrowIfNull(bytes);
+        if (requiredModIds is null || requiredModIds.Count == 0 ||
+            requiredModIds.Any(string.IsNullOrWhiteSpace))
+        {
+            throw new DungeondraftConfigException("At least one nonblank required Dungeondraft mod ID is required.");
+        }
+
         var managedPath = NormalizeAbsolutePath(managedModsDirectory);
         var document = ConfigDocument.Parse(bytes);
         var mods = document.FindModsSection();
@@ -190,9 +202,11 @@ public static class DungeondraftConfigEditor
 
         var active = document.FindOwnedKey(mods.Value, "active_mods");
         var directory = document.FindOwnedKey(mods.Value, "mods_directory");
+        var activeIds = active is null ? [] : ParseStringArray(active.Value.Value);
         return active is not null
             && directory is not null
-            && ParseStringArray(active.Value.Value).Contains(DdaiModId, StringComparer.Ordinal)
+            && requiredModIds.Distinct(StringComparer.Ordinal)
+                .All(required => activeIds.Count(value => string.Equals(value, required, StringComparison.Ordinal)) == 1)
             && PathsEqual(ParseString(directory.Value.Value), managedPath);
     }
 
