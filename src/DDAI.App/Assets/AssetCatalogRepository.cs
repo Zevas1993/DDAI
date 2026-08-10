@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Collections.Immutable;
 using System.ComponentModel;
+using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -102,9 +103,12 @@ public sealed class AssetCatalogRepository
             var previewPath = Path.Combine(previewsRoot, previewHash + ".png");
             RequireBeneath(previewsRoot, previewPath);
             var bytes = ReadBoundedFile(previewPath, MaximumPreviewBytes);
-            return IsBoundedPng(bytes) && string.Equals(Hash(bytes), previewHash, StringComparison.Ordinal)
-                ? bytes
-                : null;
+            if (!IsBoundedPng(bytes) || !string.Equals(Hash(bytes), previewHash, StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            return HasDecodableImageData(bytes) ? bytes : null;
         }
         catch (Exception exception) when (exception is IOException
             or UnauthorizedAccessException
@@ -412,7 +416,8 @@ public sealed class AssetCatalogRepository
         var hasHeader = false;
         var hasPalette = false;
         var hasImageData = false;
-        var colorType = -1;
+        PngHeader header = default;
+        using var imageData = new MemoryStream();
         while (offset < bytes.Length)
         {
             if (bytes.Length - offset < 12)
@@ -436,7 +441,7 @@ public sealed class AssetCatalogRepository
 
             if (!hasHeader)
             {
-                if (!type.SequenceEqual("IHDR"u8) || data.Length != 13 || !IsValidHeader(data, out colorType))
+                if (!type.SequenceEqual("IHDR"u8) || data.Length != 13 || !IsValidHeader(data, out header))
                 {
                     return false;
                 }
@@ -446,7 +451,7 @@ public sealed class AssetCatalogRepository
             else if (type.SequenceEqual("PLTE"u8))
             {
                 if (hasPalette || hasImageData || data.Length == 0 || data.Length % 3 != 0 || data.Length > 768 ||
-                    colorType is 0 or 4)
+                    header.ColorType is 0 or 4)
                 {
                     return false;
                 }
@@ -455,16 +460,18 @@ public sealed class AssetCatalogRepository
             }
             else if (type.SequenceEqual("IDAT"u8))
             {
-                if (data.Length == 0 || colorType == 3 && !hasPalette)
+                if (data.Length == 0 || header.ColorType == 3 && !hasPalette)
                 {
                     return false;
                 }
 
                 hasImageData = true;
+                imageData.Write(data);
             }
             else if (type.SequenceEqual("IEND"u8))
             {
-                return data.Length == 0 && hasImageData && offset + 12 + (int)dataLength == bytes.Length;
+                return data.Length == 0 && hasImageData && offset + 12 + (int)dataLength == bytes.Length &&
+                    HasDecodableImageData(imageData.ToArray(), header);
             }
             else if ((type[0] & 0x20) == 0)
             {
@@ -477,18 +484,19 @@ public sealed class AssetCatalogRepository
         return false;
     }
 
-    private static bool IsValidHeader(ReadOnlySpan<byte> header, out int colorType)
+    private static bool IsValidHeader(ReadOnlySpan<byte> header, out PngHeader parsedHeader)
     {
         var width = BinaryPrimitives.ReadUInt32BigEndian(header);
         var height = BinaryPrimitives.ReadUInt32BigEndian(header.Slice(4));
         var bitDepth = header[8];
-        colorType = header[9];
+        var colorType = header[9];
+        parsedHeader = default;
         if (width is 0 or > 256 || height is 0 or > 256 || header[10] != 0 || header[11] != 0 || header[12] > 1)
         {
             return false;
         }
 
-        return colorType switch
+        var valid = colorType switch
         {
             0 => bitDepth is 1 or 2 or 4 or 8 or 16,
             2 => bitDepth is 8 or 16,
@@ -496,7 +504,187 @@ public sealed class AssetCatalogRepository
             4 or 6 => bitDepth is 8 or 16,
             _ => false,
         };
+        if (valid)
+        {
+            parsedHeader = new PngHeader((int)width, (int)height, bitDepth, colorType, header[12] == 1);
+        }
+
+        return valid;
     }
+
+    private static bool HasDecodableImageData(ReadOnlySpan<byte> pngBytes)
+    {
+        if (!TryReadPngData(pngBytes, out var imageData, out var header))
+        {
+            return false;
+        }
+
+        return HasDecodableImageData(imageData, header);
+    }
+
+    private static bool TryReadPngData(ReadOnlySpan<byte> bytes, out byte[] imageData, out PngHeader header)
+    {
+        imageData = [];
+        header = default;
+        var offset = 8;
+        using var output = new MemoryStream();
+        while (offset < bytes.Length)
+        {
+            if (bytes.Length - offset < 12)
+            {
+                return false;
+            }
+
+            var dataLength = BinaryPrimitives.ReadUInt32BigEndian(bytes.Slice(offset, 4));
+            if (dataLength > int.MaxValue || dataLength > bytes.Length - offset - 12)
+            {
+                return false;
+            }
+
+            var type = bytes.Slice(offset + 4, 4);
+            var data = bytes.Slice(offset + 8, (int)dataLength);
+            if (type.SequenceEqual("IHDR"u8))
+            {
+                if (data.Length != 13 || !IsValidHeader(data, out header))
+                {
+                    return false;
+                }
+            }
+            else if (type.SequenceEqual("IDAT"u8))
+            {
+                output.Write(data);
+            }
+            else if (type.SequenceEqual("IEND"u8))
+            {
+                imageData = output.ToArray();
+                return data.Length == 0 && offset + 12 + (int)dataLength == bytes.Length;
+            }
+
+            offset += 12 + (int)dataLength;
+        }
+
+        return false;
+    }
+
+    private static bool HasDecodableImageData(byte[] imageData, PngHeader header)
+    {
+        if (!TryGetDecodedByteCount(header, out var decodedByteCount))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var compressed = new MemoryStream(imageData, writable: false);
+            using var zlib = new ZLibStream(compressed, CompressionMode.Decompress);
+            var decoded = new byte[decodedByteCount];
+            var read = 0;
+            while (read < decoded.Length)
+            {
+                var count = zlib.Read(decoded, read, decoded.Length - read);
+                if (count == 0)
+                {
+                    return false;
+                }
+
+                read += count;
+            }
+
+            if (zlib.ReadByte() != -1)
+            {
+                return false;
+            }
+
+            return HasValidScanlineFilters(decoded, header);
+        }
+        catch (InvalidDataException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryGetDecodedByteCount(PngHeader header, out int byteCount)
+    {
+        try
+        {
+            var bitsPerPixel = header.ColorType switch
+            {
+                0 or 3 => header.BitDepth,
+                2 => checked(header.BitDepth * 3),
+                4 => checked(header.BitDepth * 2),
+                6 => checked(header.BitDepth * 4),
+                _ => 0,
+            };
+            long total = 0;
+            foreach (var pass in EnumeratePasses(header))
+            {
+                var rowBytes = checked((pass.Width * bitsPerPixel + 7) / 8);
+                total = checked(total + (long)pass.Height * (rowBytes + 1));
+            }
+
+            byteCount = checked((int)total);
+            return true;
+        }
+        catch (OverflowException)
+        {
+            byteCount = 0;
+            return false;
+        }
+    }
+
+    private static bool HasValidScanlineFilters(ReadOnlySpan<byte> decoded, PngHeader header)
+    {
+        var bitsPerPixel = header.ColorType switch
+        {
+            0 or 3 => header.BitDepth,
+            2 => header.BitDepth * 3,
+            4 => header.BitDepth * 2,
+            6 => header.BitDepth * 4,
+            _ => 0,
+        };
+        var offset = 0;
+        foreach (var pass in EnumeratePasses(header))
+        {
+            var rowBytes = (pass.Width * bitsPerPixel + 7) / 8;
+            for (var row = 0; row < pass.Height; row++)
+            {
+                if (offset >= decoded.Length || decoded[offset] > 4)
+                {
+                    return false;
+                }
+
+                offset += rowBytes + 1;
+            }
+        }
+
+        return offset == decoded.Length;
+    }
+
+    private static IEnumerable<PngPass> EnumeratePasses(PngHeader header)
+    {
+        if (!header.Interlaced)
+        {
+            yield return new PngPass(header.Width, header.Height);
+            yield break;
+        }
+
+        int[] startsX = [0, 4, 0, 2, 0, 1, 0];
+        int[] startsY = [0, 0, 4, 0, 2, 0, 1];
+        int[] stepsX = [8, 8, 4, 4, 2, 2, 1];
+        int[] stepsY = [8, 8, 8, 4, 4, 2, 2];
+        for (var pass = 0; pass < startsX.Length; pass++)
+        {
+            var width = PassLength(header.Width, startsX[pass], stepsX[pass]);
+            var height = PassLength(header.Height, startsY[pass], stepsY[pass]);
+            if (width > 0 && height > 0)
+            {
+                yield return new PngPass(width, height);
+            }
+        }
+    }
+
+    private static int PassLength(int length, int start, int step) =>
+        length <= start ? 0 : (length - start + step - 1) / step;
 
     private static uint ComputePngCrc(ReadOnlySpan<byte> type, ReadOnlySpan<byte> data)
     {
@@ -543,6 +731,15 @@ public sealed class AssetCatalogRepository
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagOpenReparsePoint = 0x00200000;
+
+    private readonly record struct PngHeader(
+        int Width,
+        int Height,
+        int BitDepth,
+        int ColorType,
+        bool Interlaced);
+
+    private readonly record struct PngPass(int Width, int Height);
 
     private enum FileInfoByHandleClass
     {

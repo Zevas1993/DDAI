@@ -257,6 +257,17 @@ public sealed class AssetCatalogRepositoryTests
     }
 
     [Fact]
+    public void OpenPreview_RejectsCrcCorrectPngWithUndecodableImageData()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete();
+        var repository = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
+        var corrupted = PngFixture.WithUndecodableIdat();
+        var hash = sandbox.WritePreviewForContent(corrupted);
+
+        Assert.Null(repository.OpenPreview(hash));
+    }
+
+    [Fact]
     public void OpenPreview_RejectsPreviewReparsePointThroughOpenedHandle()
     {
         using var sandbox = CatalogSandbox.CreateComplete();
@@ -489,6 +500,14 @@ public sealed class AssetCatalogRepositoryTests
             BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(16, 4), width);
             BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(20, 4), height);
             BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(29, 4), ComputeCrc(bytes.AsSpan(12, 17)));
+            return bytes;
+        }
+
+        public static byte[] WithUndecodableIdat()
+        {
+            var bytes = OneByOne.ToArray();
+            bytes[41] = 0;
+            BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(54, 4), ComputeCrc(bytes.AsSpan(37, 17)));
             return bytes;
         }
 
