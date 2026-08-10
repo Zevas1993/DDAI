@@ -44,12 +44,11 @@ public sealed class DungeondraftActivationPublishedTests : IClassFixture<Publish
         Assert.Equal(originalConfig, File.ReadAllBytes(backupPath));
         var configured = File.ReadAllBytes(sandbox.ConfigPath);
         var configText = File.ReadAllText(sandbox.ConfigPath);
-        Assert.Contains("Lievven.Snappy_Mod", configText);
+        Assert.DoesNotContain("Lievven.Snappy_Mod", configText);
         Assert.Contains(DungeondraftConfigEditor.DdaiModId, configText);
         Assert.Contains(sandbox.ModsDirectory.Replace("\\", "\\\\", StringComparison.Ordinal), configText);
-        Assert.Equal(
-            File.ReadAllBytes(Path.Combine(sandbox.OriginalModsDirectory, "snappy_mod.ddmod")),
-            File.ReadAllBytes(Path.Combine(sandbox.CopiedCustomSnapDirectory, "snappy_mod.ddmod")));
+        Assert.False(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
+        Assert.True(File.Exists(Path.Combine(sandbox.OriginalModsDirectory, "snappy_mod.ddmod")));
 
         var second = sandbox.Run("setup");
 

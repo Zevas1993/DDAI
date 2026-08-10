@@ -63,7 +63,7 @@ public sealed class SetupLifecycleTests
         Assert.False(File.Exists(installedExecutable));
         Assert.False(File.Exists(Path.Combine(sandbox.InstallRoot, "install-metadata.json")));
         Assert.False(Directory.Exists(Path.Combine(sandbox.ModsDirectory, "DDAI")));
-        Assert.True(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
+        Assert.False(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
         Assert.True(Directory.Exists(sandbox.OriginalModsDirectory));
         Assert.Equal("keep-install", File.ReadAllText(sandbox.InstallSentinel));
         Assert.Equal("keep-mod", File.ReadAllText(sandbox.ForeignModSentinel));
@@ -233,11 +233,14 @@ public sealed class SetupLifecycleTests
     }
 
     [Fact]
-    public void Setup_ClosedActivatesBothModsPersistsReceiptAndIsByteIdempotent()
+    public void Setup_ClosedActivatesDdaiWithoutRequiringOrCopyingCustomSnap()
     {
         using var sandbox = new LifecycleSandbox();
         File.WriteAllText(sandbox.ClaudePath, "{}");
         File.WriteAllText(sandbox.GeminiPath, "{}");
+        File.WriteAllText(
+            sandbox.ConfigPath,
+            "[Mods]\nactive_mods=[ ]\nmods_directory=\"D:\\\\UnrelatedMods\"\n");
         var original = File.ReadAllBytes(sandbox.ConfigPath);
         var service = new LocalSetupService(new AdvancingTimeProvider(), new StubProcessProbe(false));
 
@@ -248,22 +251,19 @@ public sealed class SetupLifecycleTests
         Assert.Equal("updated", first.DungeondraftConfig.State);
         Assert.NotNull(first.DungeondraftConfig.BackupPath);
         Assert.Equal(original, File.ReadAllBytes(first.DungeondraftConfig.BackupPath!));
-        Assert.Contains("Lievven.Snappy_Mod", Encoding.UTF8.GetString(configured));
+        Assert.DoesNotContain("Lievven.Snappy_Mod", Encoding.UTF8.GetString(configured));
         Assert.Contains(DungeondraftConfigEditor.DdaiModId, Encoding.UTF8.GetString(configured));
         Assert.NotNull(metadata["dungeondraft_config"]);
-        Assert.NotNull(metadata["consolidated_mods"]);
-        Assert.Equal("copied", first.ModConsolidation.State);
-        Assert.True(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
-        Assert.Equal(
-            File.ReadAllBytes(Path.Combine(sandbox.OriginalModsDirectory, "snappy_mod.ddmod")),
-            File.ReadAllBytes(Path.Combine(sandbox.CopiedCustomSnapDirectory, "snappy_mod.ddmod")));
+        Assert.Null(metadata["consolidated_mods"]);
+        Assert.Equal("not_required", first.ModConsolidation.State);
+        Assert.False(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
         var metadataBytes = File.ReadAllBytes(sandbox.Paths.MetadataPath);
 
         var second = service.Setup(sandbox.Paths);
 
         Assert.Equal("already_current", second.State);
         Assert.Equal("already_current", second.DungeondraftConfig.State);
-        Assert.Equal("already_current", second.ModConsolidation.State);
+        Assert.Equal("not_required", second.ModConsolidation.State);
         Assert.Equal(configured, File.ReadAllBytes(sandbox.ConfigPath));
         Assert.Equal(metadataBytes, File.ReadAllBytes(sandbox.Paths.MetadataPath));
         Assert.Single(Directory.GetFiles(sandbox.UserDataDirectory, "config.ini.ddai-backup-*.ini"));
@@ -312,14 +312,14 @@ public sealed class SetupLifecycleTests
 
         Assert.Equal("uninstalled", result.State);
         Assert.Equal("updated", result.DungeondraftConfig.State);
-        Assert.Equal("retained_user_content", result.ModConsolidation.State);
+        Assert.Equal("retained_unproven_user_content", result.ModConsolidation.State);
         Assert.Contains("Lievven.Snappy_Mod", config);
         Assert.DoesNotContain(DungeondraftConfigEditor.DdaiModId, config);
         Assert.Contains(
             "mods_directory=\"" + sandbox.OriginalModsDirectory.Replace("\\", "\\\\", StringComparison.Ordinal) + "\"",
             config);
         Assert.True(Directory.Exists(sandbox.OriginalModsDirectory));
-        Assert.True(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
+        Assert.False(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
     }
 
     [Fact]
@@ -340,7 +340,7 @@ public sealed class SetupLifecycleTests
         Assert.Equal(configured, File.ReadAllBytes(sandbox.ConfigPath));
         Assert.True(File.Exists(sandbox.Paths.MetadataPath));
         Assert.True(Directory.Exists(sandbox.Paths.InstalledModDirectory));
-        Assert.True(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
+        Assert.False(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
     }
 
     [Fact]
@@ -403,38 +403,45 @@ public sealed class SetupLifecycleTests
     }
 
     [Fact]
-    public void Setup_ConflictingCopiedCustomSnapFailsBeforeConfigMutation()
+    public void Setup_ForeignInactiveCustomSnapDirectoryIsPreservedAndDoesNotBlockDdai()
     {
         using var sandbox = new LifecycleSandbox();
         File.WriteAllText(sandbox.ClaudePath, "{}");
         File.WriteAllText(sandbox.GeminiPath, "{}");
+        File.WriteAllText(
+            sandbox.ConfigPath,
+            "[Mods]\nactive_mods=[ ]\nmods_directory=\"D:\\\\UnrelatedMods\"\n");
         Directory.CreateDirectory(sandbox.CopiedCustomSnapDirectory);
         File.WriteAllText(Path.Combine(sandbox.CopiedCustomSnapDirectory, "foreign.txt"), "keep");
-        var original = File.ReadAllBytes(sandbox.ConfigPath);
         var service = new LocalSetupService(new FixedTimeProvider(), new StubProcessProbe(false));
 
-        Assert.Throws<DungeondraftConfigException>(() => service.Setup(sandbox.Paths));
+        var result = service.Setup(sandbox.Paths);
 
-        Assert.Equal(original, File.ReadAllBytes(sandbox.ConfigPath));
-        Assert.False(File.Exists(sandbox.Paths.InstalledExecutable));
         Assert.Equal("keep", File.ReadAllText(Path.Combine(sandbox.CopiedCustomSnapDirectory, "foreign.txt")));
+        Assert.True(File.Exists(sandbox.Paths.InstalledExecutable));
+        Assert.True(Directory.Exists(sandbox.Paths.InstalledModDirectory));
+        Assert.Equal("not_required", result.ModConsolidation.State);
+        Assert.DoesNotContain("Lievven.Snappy_Mod", File.ReadAllText(sandbox.ConfigPath));
     }
 
     [Fact]
-    public void Diagnose_MissingCopiedCustomSnapReportsConsolidationPending()
+    public void Diagnose_DoesNotRequireHistoricalCustomSnapCopy()
     {
         using var sandbox = new LifecycleSandbox();
         File.WriteAllText(sandbox.ClaudePath, "{}");
         File.WriteAllText(sandbox.GeminiPath, "{}");
+        File.WriteAllText(
+            sandbox.ConfigPath,
+            "[Mods]\nactive_mods=[ ]\nmods_directory=\"D:\\\\UnrelatedMods\"\n");
         var service = new LocalSetupService(new FixedTimeProvider(), new StubProcessProbe(false));
         _ = service.Setup(sandbox.Paths);
-        Directory.Delete(sandbox.CopiedCustomSnapDirectory, recursive: true);
 
         var result = service.Diagnose(sandbox.Paths);
 
-        Assert.Equal("activation_pending", result.State);
-        Assert.Equal("activation_pending_mod_consolidation", result.Code);
-        Assert.Equal("missing_or_conflicting", result.ModConsolidation.State);
+        Assert.False(Directory.Exists(sandbox.CopiedCustomSnapDirectory));
+        Assert.Equal("configured", result.State);
+        Assert.Equal("configured_waiting_for_reload", result.Code);
+        Assert.Equal("not_required", result.ModConsolidation.State);
     }
 
     private static void WriteFreshHeartbeat(string userDataDirectory)

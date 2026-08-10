@@ -109,11 +109,9 @@ public sealed class LocalSetupService
         ValidateSetupInputs(paths);
         var previousMetadata = TryReadOwnedMetadata(paths.MetadataPath, paths.InstalledExecutable);
         var previousConfigReceipt = previousMetadata?.DungeondraftConfig;
-        var previousConsolidationReceipt = GetCustomSnapReceipt(previousMetadata);
+        var historicalCustomSnapReceipt = GetCustomSnapReceipt(previousMetadata);
         var transaction = new DungeondraftConfigTransaction(timeProvider);
-        var consolidator = new DungeondraftModConsolidator();
         DungeondraftConfigTransactionPlan? configPlan = null;
-        DungeondraftModConsolidationPlan? consolidationPlan = null;
         DungeondraftConfigUpdate configUpdate;
         DungeondraftModConsolidationUpdate consolidationUpdate;
         if (processProbe.IsRunning())
@@ -128,47 +126,27 @@ public sealed class LocalSetupService
         }
         else
         {
-            configPlan = transaction.PlanSetup(
-                paths.DungeondraftConfigPath,
-                paths.ModsDirectory,
-                [DungeondraftConfigEditor.CustomSnapModId, DungeondraftConfigEditor.DdaiModId]);
+            configPlan = transaction.PlanSetup(paths.DungeondraftConfigPath, paths.ModsDirectory);
             configUpdate = ConfigUpdate("planned", paths, configPlan.Ownership);
-            var customSnapSource = previousConsolidationReceipt?.SourceDirectory
-                ?? configPlan.Ownership.PreviousModsDirectory;
-            if (string.IsNullOrWhiteSpace(customSnapSource))
-            {
-                throw new DungeondraftConfigException(
-                    "The previous Custom Snap directory is unavailable, so mod consolidation cannot be proven.");
-            }
-
-            consolidationPlan = consolidator.PlanCustomSnap(customSnapSource, paths.ModsDirectory);
-            consolidationUpdate = ConsolidationUpdate("planned");
+            consolidationUpdate = ConsolidationUpdate(
+                historicalCustomSnapReceipt is null ? "not_required" : "retained_user_content",
+                historicalCustomSnapReceipt);
         }
 
         var connectorState = InstallConnector(paths);
         var modState = InstallMod(paths);
         var configs = ClientConfigMerger.Setup(paths.ConfigTargets, paths.InstalledExecutable, timeProvider);
-        if (consolidationPlan is not null)
-        {
-            consolidationUpdate = consolidator.Apply(consolidationPlan);
-        }
-
         if (configPlan is not null)
         {
             configUpdate = transaction.Apply(configPlan);
             var configReceipt = previousConfigReceipt ?? configPlan.Ownership;
-            var consolidationReceipt = previousConsolidationReceipt ?? consolidationUpdate.Receipt
-                ?? throw new LocalSetupException("Custom Snap consolidation did not produce an ownership receipt.");
-            var consolidationReceipts = new[] { consolidationReceipt };
             try
             {
-                if (previousMetadata?.DungeondraftConfig != configReceipt ||
-                    !ReceiptsEqual(previousMetadata?.ConsolidatedMods, consolidationReceipts))
+                if (previousMetadata?.DungeondraftConfig != configReceipt)
                 {
-                    WriteInstallMetadata(paths, configReceipt, consolidationReceipts);
+                    WriteInstallMetadata(paths, configReceipt, previousMetadata?.ConsolidatedMods);
                 }
                 configUpdate = configUpdate with { Ownership = configReceipt };
-                consolidationUpdate = consolidationUpdate with { Receipt = consolidationReceipt };
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
             {
@@ -273,29 +251,16 @@ public sealed class LocalSetupService
 
         var metadata = TryReadOwnedMetadata(paths.MetadataPath, paths.InstalledExecutable);
         var consolidationReceipt = GetCustomSnapReceipt(metadata);
-        var consolidationCurrent = consolidationReceipt is not null &&
-            new DungeondraftModConsolidator().IsCurrent(consolidationReceipt);
-        if (!consolidationCurrent)
-        {
-            return new LocalDiagnosisResult(
-                "activation_pending",
-                "activation_pending_mod_consolidation",
-                paths.InstalledExecutable,
-                paths.InstalledModDirectory,
-                "The managed Custom Snap copy is missing or differs from its proven source.",
-                ConfigUpdate("not_checked", paths),
-                ConsolidationUpdate("missing_or_conflicting", consolidationReceipt));
-        }
-
-        var currentConsolidation = ConsolidationUpdate("already_current", consolidationReceipt);
+        var currentConsolidation = ConsolidationUpdate(
+            consolidationReceipt is null ? "not_required" : "retained_user_content",
+            consolidationReceipt);
 
         bool configured;
         try
         {
             configured = DungeondraftConfigEditor.IsConfigured(
                 File.ReadAllBytes(paths.DungeondraftConfigPath),
-                paths.ModsDirectory,
-                [DungeondraftConfigEditor.CustomSnapModId, DungeondraftConfigEditor.DdaiModId]);
+                paths.ModsDirectory);
         }
         catch (Exception exception) when (exception is DungeondraftConfigException or IOException or UnauthorizedAccessException)
         {
@@ -727,18 +692,6 @@ public sealed class LocalSetupService
         }
 
         return metadata.ConsolidatedMods[0];
-    }
-
-    private static bool ReceiptsEqual(
-        IReadOnlyList<DungeondraftModConsolidationReceipt>? left,
-        IReadOnlyList<DungeondraftModConsolidationReceipt>? right)
-    {
-        if (left is null || right is null)
-        {
-            return left is null && right is null;
-        }
-
-        return left.SequenceEqual(right);
     }
 
     private static void WriteJsonAtomically<T>(string target, T value)

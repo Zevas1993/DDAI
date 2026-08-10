@@ -194,7 +194,7 @@ internal sealed class PublishedLifecycleSandbox : IDisposable
             "func load_local_settings():\n    var data = Global.ModMapData[TOOL_ID]\n    if data == null or data.empty():\n        return\n");
         File.WriteAllText(
             Path.Combine(UserDataDirectory, "config.ini"),
-            "[Mods]\r\nactive_mods=[ \"Lievven.Snappy_Mod\" ]\r\nmods_directory=\"" +
+            "[Mods]\r\nactive_mods=[ ]\r\nmods_directory=\"" +
             OriginalModsDirectory.Replace("\\", "\\\\", StringComparison.Ordinal) + "\"\r\n");
         SourceExecutable = sourceExecutable;
         SourceModDirectory = Path.Combine(PublishedExecutableFixture.FindRepositoryRoot(), "mods", "DDAI");
