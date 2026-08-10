@@ -473,7 +473,9 @@ public sealed class SetupLifecycleTests
             File.WriteAllText(
                 Path.Combine(OriginalModsDirectory, "snappy_mod.ddmod"),
                 "{\"name\":\"Custom Snap Mod\",\"unique_id\":\"Lievven.Snappy_Mod\",\"dd_version\":\"1.1.0.6\"}");
-            File.WriteAllText(Path.Combine(OriginalModsDirectory, "scripts", "snappy_mod.gd"), "extends Node\n");
+            File.WriteAllText(
+                Path.Combine(OriginalModsDirectory, "scripts", "snappy_mod.gd"),
+                "func load_local_settings():\n    var data = Global.ModMapData[TOOL_ID]\n    if data == null or data.empty():\n        return\n");
             File.WriteAllText(
                 Path.Combine(UserDataDirectory, "config.ini"),
                 "; keep\r\n[Mods]\r\nactive_mods=[ \"Lievven.Snappy_Mod\" ]\r\nmods_directory=\"" +

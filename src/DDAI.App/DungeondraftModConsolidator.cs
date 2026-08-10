@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -18,6 +19,7 @@ public sealed record DungeondraftModConsolidationPlan(
     IReadOnlyList<DungeondraftModFile> Files)
 {
     public string ManagedModsDirectory { get; init; } = Path.GetDirectoryName(DestinationDirectory) ?? string.Empty;
+    public IReadOnlyList<DungeondraftModFile> DestinationFiles { get; init; } = [];
 }
 
 public sealed record DungeondraftModConsolidationUpdate(
@@ -28,6 +30,9 @@ public sealed record DungeondraftModConsolidationUpdate(
 public sealed class DungeondraftModConsolidator
 {
     private const string DestinationName = "custom_snap";
+    private static readonly string CompatibilityScriptRelativePath = Path.Combine("scripts", "snappy_mod.gd");
+    private static readonly byte[] UnsupportedEmptyCall = Encoding.UTF8.GetBytes("data.empty()");
+    private static readonly byte[] CompatibleEmptyCheck = Encoding.UTF8.GetBytes("data.size() == 0");
 
     public DungeondraftModConsolidationPlan PlanCustomSnap(
         string sourceDirectory,
@@ -69,12 +74,20 @@ public sealed class DungeondraftModConsolidator
             throw new DungeondraftConfigException("The Custom Snap manifest is invalid or unreadable.", exception);
         }
 
+        var destinationFiles = BuildDestinationSnapshot(source, files);
+        RequireSnapshotsEqual(
+            files,
+            SnapshotDirectory(source),
+            "Custom Snap changed while compatibility planning was in progress.");
+
         if (Directory.Exists(destination))
         {
-            RequireSnapshotsEqual(
-                files,
-                SnapshotDirectory(destination),
-                "The managed Custom Snap destination contains different files; refusing to overwrite it.");
+            var currentDestination = SnapshotDirectory(destination);
+            if (!SnapshotsEqual(destinationFiles, currentDestination) && !SnapshotsEqual(files, currentDestination))
+            {
+                throw new DungeondraftConfigException(
+                    "The managed Custom Snap destination contains different files; refusing to overwrite it.");
+            }
         }
         else if (File.Exists(destination))
         {
@@ -89,6 +102,7 @@ public sealed class DungeondraftModConsolidator
             files)
         {
             ManagedModsDirectory = managedRoot,
+            DestinationFiles = destinationFiles,
         };
     }
 
@@ -105,15 +119,25 @@ public sealed class DungeondraftModConsolidator
         {
             var sourceFiles = SnapshotDirectory(plan.SourceDirectory);
             RequireSnapshotsEqual(plan.Files, sourceFiles, "Custom Snap changed after consolidation was planned.");
+            RequireSnapshotsEqual(
+                plan.DestinationFiles,
+                BuildDestinationSnapshot(plan.SourceDirectory, plan.Files),
+                "The Custom Snap compatibility plan is no longer valid.");
 
             if (Directory.Exists(plan.DestinationDirectory))
             {
                 var destinationFiles = SnapshotDirectory(plan.DestinationDirectory);
+                if (SnapshotsEqual(plan.DestinationFiles, destinationFiles))
+                {
+                    return new DungeondraftModConsolidationUpdate("already_current", Changed: false, receipt);
+                }
+
                 RequireSnapshotsEqual(
                     plan.Files,
                     destinationFiles,
                     "The managed Custom Snap destination contains different files; refusing to overwrite it.");
-                return new DungeondraftModConsolidationUpdate("already_current", Changed: false, receipt);
+                ApplyCompatibilityUpgrade(plan);
+                return new DungeondraftModConsolidationUpdate("updated", Changed: true, receipt);
             }
 
             if (File.Exists(plan.DestinationDirectory))
@@ -134,13 +158,20 @@ public sealed class DungeondraftModConsolidator
                     var sourcePath = ResolveRelativePath(plan.SourceDirectory, file.RelativePath);
                     var stagePath = ResolveRelativePath(stage, file.RelativePath);
                     Directory.CreateDirectory(Path.GetDirectoryName(stagePath)!);
-                    CopyFileDurably(sourcePath, stagePath);
+                    if (string.Equals(file.RelativePath, CompatibilityScriptRelativePath, StringComparison.Ordinal))
+                    {
+                        WriteBytesDurably(stagePath, TransformCompatibilityScript(File.ReadAllBytes(sourcePath)));
+                    }
+                    else
+                    {
+                        CopyFileDurably(sourcePath, stagePath);
+                    }
                 }
 
                 sourceFiles = SnapshotDirectory(plan.SourceDirectory);
                 var stagedFiles = SnapshotDirectory(stage);
                 RequireSnapshotsEqual(plan.Files, sourceFiles, "Custom Snap changed while it was being copied.");
-                RequireSnapshotsEqual(plan.Files, stagedFiles, "The staged Custom Snap copy did not verify byte-for-byte.");
+                RequireSnapshotsEqual(plan.DestinationFiles, stagedFiles, "The staged Custom Snap copy did not verify byte-for-byte.");
                 Directory.Move(stage, plan.DestinationDirectory);
             }
             finally
@@ -185,7 +216,7 @@ public sealed class DungeondraftModConsolidator
                 return false;
             }
 
-            return SnapshotsEqual(plan.Files, SnapshotDirectory(receipt.DestinationDirectory));
+            return SnapshotsEqual(plan.DestinationFiles, SnapshotDirectory(receipt.DestinationDirectory));
         }
         catch (Exception exception) when (exception is DungeondraftConfigException or IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
         {
@@ -218,6 +249,129 @@ public sealed class DungeondraftModConsolidator
             {
                 throw new DungeondraftConfigException("The Custom Snap consolidation plan contains an invalid file entry.");
             }
+        }
+
+        var expectedDestination = BuildDestinationSnapshot(source, plan.Files);
+        RequireSnapshotsEqual(
+            expectedDestination,
+            plan.DestinationFiles,
+            "The Custom Snap consolidation plan contains an invalid compatibility snapshot.");
+    }
+
+    private static IReadOnlyList<DungeondraftModFile> BuildDestinationSnapshot(
+        string sourceDirectory,
+        IReadOnlyList<DungeondraftModFile> sourceFiles)
+    {
+        if (sourceFiles.Count(file => string.Equals(
+                file.RelativePath,
+                CompatibilityScriptRelativePath,
+                StringComparison.Ordinal)) != 1)
+        {
+            throw new DungeondraftConfigException(
+                "Custom Snap must contain exactly one scripts\\snappy_mod.gd compatibility target.");
+        }
+
+        return sourceFiles.Select(file =>
+        {
+            if (!string.Equals(file.RelativePath, CompatibilityScriptRelativePath, StringComparison.Ordinal))
+            {
+                return file;
+            }
+
+            var sourcePath = ResolveRelativePath(sourceDirectory, file.RelativePath);
+            var transformed = TransformCompatibilityScript(File.ReadAllBytes(sourcePath));
+            return new DungeondraftModFile(
+                file.RelativePath,
+                transformed.LongLength,
+                Convert.ToHexString(SHA256.HashData(transformed)));
+        }).ToArray();
+    }
+
+    private static byte[] TransformCompatibilityScript(byte[] source)
+    {
+        var unsupportedOffsets = FindOffsets(source, UnsupportedEmptyCall);
+        var compatibleOffsets = FindOffsets(source, CompatibleEmptyCheck);
+        if (unsupportedOffsets.Count == 0 && compatibleOffsets.Count == 1)
+        {
+            return source;
+        }
+
+        if (unsupportedOffsets.Count != 1 || compatibleOffsets.Count != 0)
+        {
+            throw new DungeondraftConfigException(
+                "Custom Snap's local-settings compatibility call is missing or ambiguous.");
+        }
+
+        var offset = unsupportedOffsets[0];
+        var transformed = new byte[source.Length - UnsupportedEmptyCall.Length + CompatibleEmptyCheck.Length];
+        source.AsSpan(0, offset).CopyTo(transformed);
+        CompatibleEmptyCheck.CopyTo(transformed.AsSpan(offset));
+        source.AsSpan(offset + UnsupportedEmptyCall.Length)
+            .CopyTo(transformed.AsSpan(offset + CompatibleEmptyCheck.Length));
+        return transformed;
+    }
+
+    private static List<int> FindOffsets(byte[] source, byte[] value)
+    {
+        var offsets = new List<int>();
+        for (var index = 0; index <= source.Length - value.Length; index++)
+        {
+            if (source.AsSpan(index, value.Length).SequenceEqual(value))
+            {
+                offsets.Add(index);
+            }
+        }
+
+        return offsets;
+    }
+
+    private static void ApplyCompatibilityUpgrade(DungeondraftModConsolidationPlan plan)
+    {
+        var sourcePath = ResolveRelativePath(plan.SourceDirectory, CompatibilityScriptRelativePath);
+        var destinationPath = ResolveRelativePath(plan.DestinationDirectory, CompatibilityScriptRelativePath);
+        var originalBytes = File.ReadAllBytes(sourcePath);
+        var replacementBytes = TransformCompatibilityScript(originalBytes);
+        var stagePath = Path.Combine(
+            plan.ManagedModsDirectory,
+            $".{DestinationName}.ddai-stage-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            WriteBytesDurably(stagePath, replacementBytes);
+            RequireSnapshotsEqual(
+                plan.Files,
+                SnapshotDirectory(plan.DestinationDirectory),
+                "The managed Custom Snap destination changed before compatibility upgrade.");
+            File.Move(stagePath, destinationPath, overwrite: true);
+            RequireSnapshotsEqual(
+                plan.DestinationFiles,
+                SnapshotDirectory(plan.DestinationDirectory),
+                "The managed Custom Snap compatibility upgrade did not verify.");
+        }
+        catch
+        {
+            TryDeleteFile(stagePath);
+            try
+            {
+                if (!File.ReadAllBytes(destinationPath).AsSpan().SequenceEqual(originalBytes))
+                {
+                    var rollbackPath = stagePath + ".rollback";
+                    WriteBytesDurably(rollbackPath, originalBytes);
+                    File.Move(rollbackPath, destinationPath, overwrite: true);
+                }
+            }
+            catch (Exception rollbackException) when (rollbackException is IOException or UnauthorizedAccessException)
+            {
+                throw new DungeondraftConfigException(
+                    "The managed Custom Snap compatibility upgrade failed and could not be rolled back.",
+                    rollbackException);
+            }
+
+            throw;
+        }
+        finally
+        {
+            TryDeleteFile(stagePath);
+            TryDeleteFile(stagePath + ".rollback");
         }
     }
 
@@ -391,6 +545,33 @@ public sealed class DungeondraftModConsolidator
             FileOptions.WriteThrough);
         input.CopyTo(output);
         output.Flush(flushToDisk: true);
+    }
+
+    private static void WriteBytesDurably(string destination, byte[] bytes)
+    {
+        using var output = new FileStream(
+            destination,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 81920,
+            FileOptions.WriteThrough);
+        output.Write(bytes);
+        output.Flush(flushToDisk: true);
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 
     private static void TryDeleteDirectory(string path)

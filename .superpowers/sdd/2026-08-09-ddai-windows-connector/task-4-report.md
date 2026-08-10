@@ -149,3 +149,19 @@ Research and live inspection found that the configured path selected the `custom
 - Fresh one-file artifact: `artifacts/dungeondraft-mod-consolidation/win-x64/ddai.exe`, `73,810,837` bytes, SHA-256 `AD350E62CB9DEAD169B8C474725B740A60BBED61C51135DDC695E9D5FD9E8C9F`.
 - With Dungeondraft closed, setup returned exit `0`, `repaired` / `setup_complete`. Installed executable and artifact hashes match. Installed and source bridge hashes both equal `60C9962DCEC79D171B1C86540B5A05A988506FBF0D8178BDA179A0BF3ECDC368`. Claude, Gemini, Dungeondraft config, and the consolidated Custom Snap copy were already current and unchanged.
 - Remaining live acceptance: launch Dungeondraft normally, confirm the process remains alive, then require a fresh heartbeat and a correlated `status` response. No automatic relaunch was performed.
+
+### Second-crash correction: Custom Snap blank-map startup
+
+The first-crash attribution to DDAI's `claim.empty()` was incomplete. The DDAI compatibility change is harmless and remains regression-covered, but a second new-map attempt crashed at the same native address before producing any new DDAI receipt or heartbeat.
+
+- Second dump: `C:\Users\ChrisBoyd\AppData\Local\CrashDumps\Dungeondraft.exe.46304.dmp`, PID `46304`, Windows event time `2026-08-09 22:54:37-04:00`.
+- Both dumps have the same `0xc0000005`, RVA `0x13e07ca`, GDScript VM caller, Variant receiver type `18` (`Dictionary`), zero arguments, instruction pointer, register pattern, and stack prefix.
+- Custom Snap `start()` calls `load_local_settings()` before constructing its tool UI. On a new blank map, that function reads `Global.ModMapData[TOOL_ID]` and line `1239` called `data.empty()`. This is the matching blank-map Dictionary/zero-argument path; Custom Snap's manifest targets older Dungeondraft `1.1.0.6`, while the installed runtime is `1.2.0.1`.
+- RED: focused tests proved that the existing consolidator copied the incompatible call unchanged, treated an exact legacy copy as current, and accepted scripts with missing or ambiguous compatibility targets.
+- GREEN: consolidation now performs one exact byte-level transformation in only the managed `scripts\snappy_mod.gd`: `data.empty()` becomes `data.size() == 0`. It requires exactly one known source or already-compatible target, preserves every other byte/file, hashes the expected transformed tree, upgrades an exact legacy copy atomically, rolls back publication failure, remains idempotent, and rejects foreign/ambiguous content.
+- Custom Snap's MIT license permits modification and redistribution while its license remains in the copied tree. The original installation directory is still never edited.
+- Focused consolidator tests passed `9/9`; the full app suite passed `78/78`; the fresh full Release suite passed `303/303` (`225` core and `78` app). Release build succeeded with `0` warnings and `0` errors.
+- Fresh artifact: `73,814,933` bytes, SHA-256 `78FE12A1DED12C2BBEA93E68D73C0B9D314173603FA2060BA1BE87EF5C90CF9A`.
+- Live closed-app upgrade returned exit `0`, `repaired` / `setup_complete`, with `mod_consolidation.state=updated`. Original script SHA-256 remained `4D51ED7D0C7884755D47CF88E2F5FAE27AB602B0A073CE057FDBC181867FF7BF`; managed script changed to `BB9397F8CDB922874EA893DEBFA350F3B8269E395909307B071C25DB9BC457AB`. The config hash remained `D3721701103FF98FFEF66355FD0D2F9F22B7DDC4147A9613FC135A5037AE910D`.
+- Installed line proof: original line `1239` still contains `data.empty()`; the managed copy's line `1239` contains `data.size() == 0`. A subsequent diagnosis reports the managed Custom Snap copy as `already_current`.
+- Remaining live acceptance is unchanged: user launches Dungeondraft normally, opens a new map, then diagnosis and status must prove process stability, a fresh heartbeat, and a correlated response.

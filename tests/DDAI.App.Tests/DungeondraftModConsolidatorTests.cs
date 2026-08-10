@@ -6,7 +6,7 @@ namespace DDAI.App.Tests;
 public sealed class DungeondraftModConsolidatorTests
 {
     [Fact]
-    public void Apply_CopiesExactSourcePreservesItAndIsIdempotent()
+    public void Apply_CopiesCompatibilityPatchedSourcePreservesItAndIsIdempotent()
     {
         using var sandbox = new ConsolidationSandbox();
         var sourceBefore = Snapshot(sandbox.SourceDirectory);
@@ -22,9 +22,35 @@ public sealed class DungeondraftModConsolidatorTests
         Assert.Equal("already_current", second.State);
         Assert.False(second.Changed);
         Assert.Equal(sourceBefore, Snapshot(sandbox.SourceDirectory));
-        Assert.Equal(sourceBefore, Snapshot(sandbox.DestinationDirectory));
+        Assert.NotEqual(sourceBefore, Snapshot(sandbox.DestinationDirectory));
+        Assert.Contains("data.empty()", File.ReadAllText(sandbox.SourceScriptPath), StringComparison.Ordinal);
+        Assert.DoesNotContain("data.empty()", File.ReadAllText(sandbox.DestinationScriptPath), StringComparison.Ordinal);
+        Assert.Contains("data.size() == 0", File.ReadAllText(sandbox.DestinationScriptPath), StringComparison.Ordinal);
         Assert.True(consolidator.IsCurrent(first.Receipt!));
         AssertNoStages(sandbox.ManagedRoot);
+    }
+
+    [Fact]
+    public void Apply_UpgradesExactLegacyCopyToCompatibilityPatchedCopy()
+    {
+        using var sandbox = new ConsolidationSandbox();
+        var sourceBefore = Snapshot(sandbox.SourceDirectory);
+        CopyTree(sandbox.SourceDirectory, sandbox.DestinationDirectory);
+        Assert.Equal(sourceBefore, Snapshot(sandbox.DestinationDirectory));
+        var consolidator = new DungeondraftModConsolidator();
+
+        var first = consolidator.Apply(
+            consolidator.PlanCustomSnap(sandbox.SourceDirectory, sandbox.ManagedRoot));
+        var second = consolidator.Apply(
+            consolidator.PlanCustomSnap(sandbox.SourceDirectory, sandbox.ManagedRoot));
+
+        Assert.Equal("updated", first.State);
+        Assert.True(first.Changed);
+        Assert.Equal("already_current", second.State);
+        Assert.Equal(sourceBefore, Snapshot(sandbox.SourceDirectory));
+        Assert.Contains("data.size() == 0", File.ReadAllText(sandbox.DestinationScriptPath), StringComparison.Ordinal);
+        AssertNoStages(sandbox.ManagedRoot);
+        Assert.Empty(Directory.GetDirectories(sandbox.ManagedRoot, ".custom_snap.ddai-backup-*"));
     }
 
     [Fact]
@@ -45,6 +71,22 @@ public sealed class DungeondraftModConsolidatorTests
 
         File.Delete(Path.Combine(sandbox.SourceDirectory, "second.ddmod"));
         sandbox.WriteManifest("foreign.mod");
+        Assert.Throws<DungeondraftConfigException>(() =>
+            consolidator.PlanCustomSnap(sandbox.SourceDirectory, sandbox.ManagedRoot));
+    }
+
+    [Fact]
+    public void PlanCustomSnap_RejectsUnsupportedOrAmbiguousCompatibilityTarget()
+    {
+        using var sandbox = new ConsolidationSandbox();
+        var consolidator = new DungeondraftModConsolidator();
+        File.WriteAllText(sandbox.SourceScriptPath, "extends Node\n");
+        Assert.Throws<DungeondraftConfigException>(() =>
+            consolidator.PlanCustomSnap(sandbox.SourceDirectory, sandbox.ManagedRoot));
+
+        File.WriteAllText(
+            sandbox.SourceScriptPath,
+            "func load_local_settings():\n    data.empty()\n    data.empty()\n");
         Assert.Throws<DungeondraftConfigException>(() =>
             consolidator.PlanCustomSnap(sandbox.SourceDirectory, sandbox.ManagedRoot));
     }
@@ -140,8 +182,21 @@ public sealed class DungeondraftModConsolidatorTests
                 StringComparer.Ordinal),
             StringComparer.Ordinal);
 
-    private static void AssertNoStages(string managedRoot) =>
+    private static void AssertNoStages(string managedRoot)
+    {
         Assert.Empty(Directory.GetDirectories(managedRoot, ".custom_snap.ddai-stage-*"));
+        Assert.Empty(Directory.GetFiles(managedRoot, ".custom_snap.ddai-stage-*"));
+    }
+
+    private static void CopyTree(string source, string destination)
+    {
+        foreach (var sourcePath in Directory.GetFiles(source, "*", SearchOption.AllDirectories))
+        {
+            var destinationPath = Path.Combine(destination, Path.GetRelativePath(source, sourcePath));
+            Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+            File.Copy(sourcePath, destinationPath);
+        }
+    }
 
     private sealed class ConsolidationSandbox : IDisposable
     {
@@ -155,7 +210,9 @@ public sealed class DungeondraftModConsolidatorTests
             Directory.CreateDirectory(ManagedRoot);
             ManifestPath = Path.Combine(SourceDirectory, "snappy_mod.ddmod");
             WriteManifest(DungeondraftConfigEditor.CustomSnapModId);
-            File.WriteAllText(Path.Combine(SourceDirectory, "scripts", "snappy_mod.gd"), "extends Node\n");
+            File.WriteAllText(
+                SourceScriptPath,
+                "func load_local_settings():\n    var data = Global.ModMapData[TOOL_ID]\n    if data == null or data.empty():\n        return\n");
             File.WriteAllBytes(Path.Combine(SourceDirectory, "icons", "snap.png"), [0x89, 0x50, 0x4E, 0x47]);
             File.WriteAllText(Path.Combine(SourceDirectory, "README.md"), "Custom Snap", Encoding.UTF8);
         }
@@ -165,6 +222,8 @@ public sealed class DungeondraftModConsolidatorTests
         public string ManagedRoot { get; }
         public string ManifestPath { get; }
         public string DestinationDirectory => Path.Combine(ManagedRoot, "custom_snap");
+        public string SourceScriptPath => Path.Combine(SourceDirectory, "scripts", "snappy_mod.gd");
+        public string DestinationScriptPath => Path.Combine(DestinationDirectory, "scripts", "snappy_mod.gd");
 
         public void WriteManifest(string uniqueId) =>
             File.WriteAllText(
