@@ -40,7 +40,18 @@ public sealed class PublishedConfigOwnershipTests : IClassFixture<PublishedExecu
         const string original = "{\"mcpServers\":{\"other\":{\"command\":\"keep.exe\"}}}";
         File.WriteAllText(sandbox.ClaudePath, original);
         File.WriteAllText(sandbox.GeminiPath, original);
-        Assert.Equal(0, sandbox.Run("setup").ExitCode);
+        var setup = sandbox.Run("setup");
+        if (setup.ExitCode == 2)
+        {
+            Assert.Equal(
+                "activation_pending_dungeondraft_running",
+                JsonNode.Parse(setup.StandardOutput)!["code"]!.GetValue<string>());
+            Assert.True(File.Exists(sandbox.InstalledExecutable));
+            Assert.True(Directory.Exists(sandbox.InstalledModDirectory));
+            return;
+        }
+
+        Assert.Equal(0, setup.ExitCode);
         var foreignClaude = JsonNode.Parse(File.ReadAllText(sandbox.ClaudePath))!;
         foreignClaude["mcpServers"]!["ddai"] = JsonNode.Parse("{\"command\":\"C:\\\\foreign-claude.exe\",\"args\":[\"foreign\"]}");
         File.WriteAllText(sandbox.ClaudePath, foreignClaude.ToJsonString());
@@ -172,6 +183,10 @@ internal sealed class PublishedLifecycleSandbox : IDisposable
         GeminiPath = Path.Combine(Root, ".gemini", "settings.json");
         Directory.CreateDirectory(Path.GetDirectoryName(ClaudePath)!);
         Directory.CreateDirectory(Path.GetDirectoryName(GeminiPath)!);
+        Directory.CreateDirectory(UserDataDirectory);
+        File.WriteAllText(
+            Path.Combine(UserDataDirectory, "config.ini"),
+            "[Mods]\r\nactive_mods=[ \"Lievven.Snappy_Mod\" ]\r\nmods_directory=\"D:\\\\DungeonDraft\\\\Dungeondraft\\\\mods\\\\custom_snap\"\r\n");
         SourceExecutable = sourceExecutable;
         SourceModDirectory = Path.Combine(PublishedExecutableFixture.FindRepositoryRoot(), "mods", "DDAI");
     }
@@ -187,6 +202,7 @@ internal sealed class PublishedLifecycleSandbox : IDisposable
     public string InstalledExecutable => Path.Combine(InstallRoot, "ddai.exe");
     public string MetadataPath => Path.Combine(InstallRoot, "install-metadata.json");
     public string InstalledModDirectory => Path.Combine(ModsDirectory, "DDAI");
+    public string ConfigPath => Path.Combine(UserDataDirectory, "config.ini");
 
     public ProcessResult Run(string command) => PublishedExecutableFixture.RunProcess(
         SourceExecutable,

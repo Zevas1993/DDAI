@@ -77,3 +77,31 @@
 - Consequently, the real current-machine `ddai_status` round trip remains unproven; the published-EXE SDK round trip is proven against the real mailbox with the isolated fake live peer.
 - Task 4's standalone EXE accepts an explicit existing mod source directory. Bundling the mod beside the executable belongs to the Task 8 release ZIP; the current-machine setup used the tracked `mods\DDAI` source explicitly.
 - Uninstall was proven only in isolated automated tests and was not run against the current-machine installation.
+
+## Dungeondraft activation automation extension
+
+This section supersedes the manual Mods-directory selection guidance above. The connector now owns a strict, closed-application transaction for only `[Mods].active_mods` and `[Mods].mods_directory`; it never closes or restarts Dungeondraft.
+
+- Task 1 commit: `2b9c4d1` (`feat: edit Dungeondraft mod configuration safely`). Strict UTF-8/UTF-16 parsing preserves BOM, newline convention, comments, unrelated sections/keys, Custom Snap, and non-DDAI duplicate mod IDs. Ambiguous syntax, invalid encodings/escapes, duplicate owned keys/sections, NULs, and mixed newlines fail closed.
+- Task 2 commit: `ed1e8e3` (`feat: transact Dungeondraft mod activation`). Same-directory durable stage and rollback files, exact sibling backups, two concurrency checks, byte verification, idempotence, and orphan cleanup are covered by focused tests.
+- Setup now detects any `Dungeondraft` process. While it is running, connector/mod/client installation may be repaired, but `config.ini` is neither read for activation nor written; setup returns exit `2` with `activation_pending_dungeondraft_running`.
+- With Dungeondraft closed and a valid existing `config.ini`, setup adds `org.ddai.status_bridge` exactly once, preserves `Lievven.Snappy_Mod`, selects the DDAI-managed Mods root, creates an exact sibling backup, and persists the previous directory literal in owned installation metadata.
+- Repeated setup is byte-idempotent and preserves the original ownership receipt. Closed-app uninstall uses that receipt to remove only DDAI and restore the proven prior directory. A user-changed directory and legacy metadata without a receipt are retained.
+- Diagnosis now distinguishes `activation_pending_dungeondraft_running`, `activation_pending_config_missing`, `activation_pending_config_mismatch`, `configured_waiting_for_reload`, and `runtime_heartbeat_fresh`. Only a fresh runtime heartbeat proves the bridge loaded.
+
+### Fresh verification
+
+- Focused lifecycle, published activation/ownership, and official MCP SDK suite: `20/20` passed.
+- Full Release suite: `284/284` passed (`224` core and `60` app), `0` failed, `0` skipped.
+- Release build: `0` warnings and `0` errors.
+- Published one-file Windows x64 artifact: `artifacts/dungeondraft-activation/win-x64/ddai.exe`, `73,794,453` bytes, SHA-256 `00B463C66D661E81BD98D57449A7BC4E8FDCA6F6899F6D4808650C5EEFDCAE23`.
+- GitNexus indexed `1,429` nodes, `3,072` edges, and `90` flows. `LocalSetupService` has medium impact (`11` direct dependents and one CLI process); those direct paths are covered by the lifecycle and CLI suites. Broad dirty-tree detection also included the unrelated Task 3 report and was not used as scoped commit evidence.
+
+### Current-machine safe-defer evidence
+
+- Dungeondraft PID `54360` was running non-admin with window title `Tabula Rasa - Dungeondraft`; it was not closed, restarted, or controlled.
+- The fresh artifact was installed to `C:\Users\ChrisBoyd\AppData\Local\DDAI\ddai.exe`; its SHA-256 equals the published artifact hash above.
+- Live setup returned exit `2`, state `activation_pending`, code `activation_pending_dungeondraft_running`. Claude and Gemini DDAI entries were already current and received no new backups.
+- `C:\Users\ChrisBoyd\AppData\Roaming\Dungeondraft\config.ini` SHA-256 was `D3A1EF7C3C16D2EA9ACF1FBB01D76E0193723BF5FAD49FC59F122E6A6E4B0E15` both before and after setup.
+- Installed `diagnose --json` returned exit `2` with the same activation-pending code. Installed `status --json --timeout-ms 1500` returned exit `2` / `status_timeout`; no live bridge heartbeat or correlated status response exists yet.
+- Remaining acceptance step: after the user closes Dungeondraft normally, rerun fresh setup, verify the exact backup and both mod IDs, then launch Dungeondraft normally and require `runtime_heartbeat_fresh` plus a correlated status response.

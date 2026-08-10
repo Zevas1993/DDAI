@@ -3,7 +3,11 @@ using DDAI.Core.Mailbox;
 
 namespace DDAI.App;
 
-public sealed class CliApplication(TextWriter stdout, TextWriter stderr, TimeProvider timeProvider)
+public sealed class CliApplication(
+    TextWriter stdout,
+    TextWriter stderr,
+    TimeProvider timeProvider,
+    IDungeondraftProcessProbe? processProbe = null)
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -32,11 +36,14 @@ public sealed class CliApplication(TextWriter stdout, TextWriter stderr, TimePro
                 return status.Success ? 0 : 2;
             }
 
-            var setupService = new LocalSetupService(timeProvider);
+            var setupService = processProbe is null
+                ? new LocalSetupService(timeProvider)
+                : new LocalSetupService(timeProvider, processProbe);
             if (options.Command == DdaiCommand.Setup)
             {
-                await WriteJsonAsync(setupService.Setup(options.SetupPaths));
-                return 0;
+                var setup = setupService.Setup(options.SetupPaths);
+                await WriteJsonAsync(setup);
+                return setup.State == "activation_pending" ? 2 : 0;
             }
 
             if (options.Command == DdaiCommand.Diagnose)
@@ -55,7 +62,7 @@ public sealed class CliApplication(TextWriter stdout, TextWriter stderr, TimePro
             await stderr.WriteLineAsync(exception.Message);
             return 64;
         }
-        catch (Exception exception) when (exception is ClientConfigException or LocalSetupException or IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (exception is ClientConfigException or LocalSetupException or DungeondraftConfigException or IOException or UnauthorizedAccessException)
         {
             if (options?.Command != DdaiCommand.Serve)
             {
