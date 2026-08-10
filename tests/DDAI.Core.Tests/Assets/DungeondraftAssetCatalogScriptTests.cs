@@ -30,15 +30,23 @@ public sealed class DungeondraftAssetCatalogScriptTests
     public void Script_BoundsPerFrameWorkPreviewsAndChunkPayloads()
     {
         var script = ReadCatalogScript();
+        var previewPreparation = FunctionBody(script, "_prepare_preview");
 
         Assert.Equal("8", ConstantValue(script, "MAX_ASSETS_PER_TICK"));
         Assert.Equal("256", ConstantValue(script, "MAX_PREVIEW_EDGE"));
         Assert.Equal("262144", ConstantValue(script, "MAX_PREVIEW_BYTES"));
         Assert.Equal("900000", ConstantValue(script, "MAX_CHUNK_BYTES"));
         Assert.Contains("HashingContext.HASH_SHA256", script, StringComparison.Ordinal);
-        Assert.Contains("texture.get_data().duplicate()", script, StringComparison.Ordinal);
+        Assert.Contains("var source_image = texture.get_data()", previewPreparation, StringComparison.Ordinal);
+        Assert.Contains("source_image == null", previewPreparation, StringComparison.Ordinal);
+        Assert.Contains("var image = source_image.duplicate()", previewPreparation, StringComparison.Ordinal);
+        Assert.True(
+            previewPreparation.IndexOf("source_image == null", StringComparison.Ordinal) <
+            previewPreparation.IndexOf("source_image.duplicate()", StringComparison.Ordinal));
         Assert.Contains("Image.INTERPOLATE_LANCZOS", script, StringComparison.Ordinal);
         Assert.Contains("save_png_to_buffer()", script, StringComparison.Ordinal);
+        Assert.Contains("func _advance_preview_publication_state():", script, StringComparison.Ordinal);
+        Assert.Contains("func _advance_preview_finalization_state():", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -63,10 +71,14 @@ public sealed class DungeondraftAssetCatalogScriptTests
         Assert.Contains("catalog/snapshots", script, StringComparison.Ordinal);
         Assert.Contains("catalog/previews", script, StringComparison.Ordinal);
         Assert.Contains("catalog/current.json", script, StringComparison.Ordinal);
+        Assert.Contains("current-slot-0.json", script, StringComparison.Ordinal);
+        Assert.Contains("current-slot-1.json", script, StringComparison.Ordinal);
         Assert.True(
             publisher.IndexOf("MANIFEST_FILE_NAME", StringComparison.Ordinal) <
+            publisher.IndexOf("CURRENT_SLOT_FILE_NAMES", StringComparison.Ordinal) &&
+            publisher.IndexOf("CURRENT_SLOT_FILE_NAMES", StringComparison.Ordinal) <
             publisher.IndexOf("CURRENT_POINTER_FILE_NAME", StringComparison.Ordinal),
-            "The immutable manifest must be published before the mutable current pointer.");
+            "The immutable manifest and recoverable slot must be published before the mutable current pointer.");
     }
 
     [Fact]
@@ -87,6 +99,15 @@ public sealed class DungeondraftAssetCatalogScriptTests
         Assert.Contains("catalog_fingerprint", script, StringComparison.Ordinal);
         Assert.Contains("entry_count", script, StringComparison.Ordinal);
         Assert.Contains("byte_count", script, StringComparison.Ordinal);
+        Assert.Contains("MAX_ERROR_RECORDS", script, StringComparison.Ordinal);
+        Assert.Contains("MAX_MANIFEST_BYTES", script, StringComparison.Ordinal);
+        Assert.Contains("errors_truncated", script, StringComparison.Ordinal);
+        Assert.Contains("func _receipt_is_newer(", script, StringComparison.Ordinal);
+        Assert.Contains("_manifest_text.to_utf8().size() > MAX_MANIFEST_BYTES", script, StringComparison.Ordinal);
+        Assert.Contains("return catalog_root.get_base_dir() + \"/private/pack-normalization\"", script, StringComparison.Ordinal);
+        Assert.Contains("+ \"/requests/\"", script, StringComparison.Ordinal);
+        Assert.Contains("+ \"/responses/\"", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("non-ASCII IDs become null", script, StringComparison.Ordinal);
     }
 
     private static string ReadCatalogScript() => File.ReadAllText(

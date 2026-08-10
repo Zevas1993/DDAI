@@ -8,6 +8,7 @@ const MAXIMUM_MESSAGE_BYTES = 1048576
 const POLL_INTERVAL_SECONDS = 0.25
 const HEARTBEAT_INTERVAL_SECONDS = 10.0
 const SUPPORTED_COMMANDS = ["status", "apply_plan"]
+const RUNTIME_RECEIPT_SLOT_PATHS = ["user://ddai/runtime-receipt-slot-0.json", "user://ddai/runtime-receipt-slot-1.json"]
 
 var _poll_elapsed = POLL_INTERVAL_SECONDS
 var _heartbeat_elapsed = HEARTBEAT_INTERVAL_SECONDS
@@ -865,7 +866,9 @@ func _write_runtime_receipt():
 		"supported_commands": SUPPORTED_COMMANDS,
 	}
 	_write_json_atomically(MAILBOX_ROOT + "/runtime-receipts/" + _session_id + ".json", receipt)
-	_replace_json_atomically("user://ddai/runtime-receipt.json", receipt)
+	var slot_path = RUNTIME_RECEIPT_SLOT_PATHS[_select_runtime_receipt_slot()]
+	_replace_json_recoverably(slot_path, receipt)
+	_replace_json_recoverably("user://ddai/runtime-receipt.json", receipt)
 
 
 func _write_heartbeat():
@@ -898,13 +901,11 @@ func _write_json_atomically(destination_path, payload):
 	return _write_text_atomically(destination_path, to_json(payload))
 
 
-func _replace_json_atomically(destination_path, payload):
+func _replace_json_recoverably(destination_path, payload):
 	var directory = Directory.new()
 	directory.make_dir_recursive(destination_path.get_base_dir())
 	var temporary_path = destination_path + "." + str(OS.get_ticks_msec()) + ".next"
-	var backup_path = destination_path + ".previous"
 	directory.remove(temporary_path)
-	directory.remove(backup_path)
 	var file = File.new()
 	if file.open(temporary_path, File.WRITE) != OK:
 		return "write_failed"
@@ -913,18 +914,25 @@ func _replace_json_atomically(destination_path, payload):
 	file.close()
 	if directory.rename(temporary_path, destination_path) == OK:
 		return "replaced"
-	if not directory.file_exists(destination_path):
-		directory.remove(temporary_path)
-		return "write_failed"
-	if directory.rename(destination_path, backup_path) != OK:
-		directory.remove(temporary_path)
-		return "write_failed"
-	if directory.rename(temporary_path, destination_path) == OK:
-		directory.remove(backup_path)
-		return "replaced"
-	directory.rename(backup_path, destination_path)
 	directory.remove(temporary_path)
 	return "write_failed"
+
+
+func _select_runtime_receipt_slot():
+	var timestamps = ["", ""]
+	for index in range(RUNTIME_RECEIPT_SLOT_PATHS.size()):
+		var path = RUNTIME_RECEIPT_SLOT_PATHS[index]
+		var directory = Directory.new()
+		if not directory.file_exists(path):
+			return index
+		var read_result = _read_bounded_text(path)
+		if not read_result.ok:
+			return index
+		var parsed = JSON.parse(read_result.text)
+		if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+			return index
+		timestamps[index] = str(parsed.result.get("timestamp", ""))
+	return 0 if timestamps[0] <= timestamps[1] else 1
 
 
 func _write_text_atomically(destination_path, text):

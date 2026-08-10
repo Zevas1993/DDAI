@@ -22,7 +22,7 @@ public static class AssetReference
         return "sha256:" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(input))).ToLowerInvariant();
     }
 
-    internal static string NormalizePackId(string? packId) =>
+    public static string NormalizePackId(string? packId) =>
         packId?.Normalize(NormalizationForm.FormKC).Trim().ToLowerInvariant() ?? string.Empty;
 }
 

@@ -128,7 +128,41 @@ public sealed class AssetCatalogRepository
         RequireExistingOrdinaryDirectory(catalogRoot, "Catalog root");
         RequireExistingOrdinaryDirectory(snapshotsRoot, "Snapshots directory");
 
-        var pointerPath = Path.Combine(catalogRoot, "current.json");
+        AcceptedAssetCatalog? newest = null;
+        foreach (var pointerPath in new[]
+                 {
+                     Path.Combine(catalogRoot, "current.json"),
+                     Path.Combine(catalogRoot, "current-slot-0.json"),
+                     Path.Combine(catalogRoot, "current-slot-1.json"),
+                 })
+        {
+            AcceptedAssetCatalog candidate;
+            try
+            {
+                candidate = ReadSnapshot(pointerPath);
+            }
+            catch (Exception exception) when (IsRecoverableCatalogFailure(exception))
+            {
+                // Another pointer or slot can remain reader-visible while Godot replaces this one.
+                continue;
+            }
+
+            if (newest is null || candidate.Manifest.CatalogRevision > newest.Manifest.CatalogRevision)
+            {
+                newest = candidate;
+            }
+            else if (candidate.Manifest.CatalogRevision == newest.Manifest.CatalogRevision &&
+                     !string.Equals(candidate.Manifest.CatalogFingerprint, newest.Manifest.CatalogFingerprint, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException("Catalog pointers conflict at the same revision.");
+            }
+        }
+
+        return newest ?? throw new InvalidDataException("No complete recoverable catalog pointer is available.");
+    }
+
+    private AcceptedAssetCatalog ReadSnapshot(string pointerPath)
+    {
         RequireBeneath(catalogRoot, pointerPath);
         RequireOrdinaryPath(catalogRoot, pointerPath);
         var pointer = ReadPointer(ReadBoundedText(pointerPath, AssetCatalogJson.MaximumJsonBytes));
@@ -139,6 +173,11 @@ public sealed class AssetCatalogRepository
         if (!manifest.Complete || !string.Equals(manifest.SessionId, pointer.SessionId, StringComparison.Ordinal))
         {
             throw new InvalidDataException("The catalog pointer does not identify a complete matching snapshot.");
+        }
+
+        if (pointer.CatalogRevision is not null && pointer.CatalogRevision != manifest.CatalogRevision)
+        {
+            throw new InvalidDataException("The catalog pointer revision does not match its manifest.");
         }
 
         var entries = new List<AssetCatalogEntry>();
@@ -201,7 +240,7 @@ public sealed class AssetCatalogRepository
         return manifestPath;
     }
 
-    private static (string SessionId, string Manifest) ReadPointer(string json)
+    private static (string SessionId, string Manifest, long? CatalogRevision) ReadPointer(string json)
     {
         using var document = JsonDocument.Parse(json, new JsonDocumentOptions
         {
@@ -216,10 +255,11 @@ public sealed class AssetCatalogRepository
 
         string? sessionId = null;
         string? manifest = null;
+        long? catalogRevision = null;
         var observed = new HashSet<string>(StringComparer.Ordinal);
         foreach (var property in document.RootElement.EnumerateObject())
         {
-            if (!observed.Add(property.Name) || property.Value.ValueKind != JsonValueKind.String)
+            if (!observed.Add(property.Name))
             {
                 throw new JsonException("The catalog pointer is malformed.");
             }
@@ -227,23 +267,49 @@ public sealed class AssetCatalogRepository
             switch (property.Name)
             {
                 case "session_id":
+                    if (property.Value.ValueKind != JsonValueKind.String)
+                    {
+                        throw new JsonException("The catalog pointer session is malformed.");
+                    }
                     sessionId = property.Value.GetString();
                     break;
                 case "manifest":
+                    if (property.Value.ValueKind != JsonValueKind.String)
+                    {
+                        throw new JsonException("The catalog pointer manifest is malformed.");
+                    }
                     manifest = property.Value.GetString();
+                    break;
+                case "catalog_revision":
+                    if (!property.Value.TryGetInt64(out var revision) || revision < 0)
+                    {
+                        throw new JsonException("The catalog pointer revision is malformed.");
+                    }
+                    catalogRevision = revision;
                     break;
                 default:
                     throw new JsonException("The catalog pointer contains an unsupported property.");
             }
         }
 
-        if (observed.Count != 2 || string.IsNullOrWhiteSpace(sessionId) || string.IsNullOrWhiteSpace(manifest))
+        if (observed.Count is < 2 or > 3 || string.IsNullOrWhiteSpace(sessionId) || string.IsNullOrWhiteSpace(manifest))
         {
             throw new JsonException("The catalog pointer is missing required values.");
         }
 
-        return (sessionId, manifest);
+        return (sessionId, manifest, catalogRevision);
     }
+
+    private static bool IsRecoverableCatalogFailure(Exception exception) => exception is IOException
+        or UnauthorizedAccessException
+        or ArgumentException
+        or NotSupportedException
+        or PathTooLongException
+        or JsonException
+        or InvalidDataException
+        or CryptographicException
+        or Win32Exception
+        or OverflowException;
 
     private static AssetCatalogManifest FreezeManifest(AssetCatalogManifest manifest) => manifest with
     {

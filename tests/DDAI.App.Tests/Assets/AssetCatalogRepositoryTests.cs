@@ -41,6 +41,62 @@ public sealed class AssetCatalogRepositoryTests
     }
 
     [Fact]
+    public void TryRefresh_RecoversValidSlotAtEveryMutablePointerFaultBoundary()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete();
+        var slot = Path.Combine(sandbox.Root, "current-slot-0.json");
+        File.Copy(sandbox.CurrentPath, slot);
+
+        foreach (var currentState in new[] { "missing", "truncated", "deleted_after_stage" })
+        {
+            if (File.Exists(sandbox.CurrentPath))
+            {
+                File.Delete(sandbox.CurrentPath);
+            }
+
+            if (currentState == "truncated")
+            {
+                File.WriteAllText(sandbox.CurrentPath, "{");
+            }
+            else if (currentState == "deleted_after_stage")
+            {
+                File.WriteAllText(sandbox.CurrentPath + ".next", "{\"staged\":true}");
+            }
+
+            var repository = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
+            Assert.True(repository.TryRefresh(), currentState);
+            Assert.Equal(1, repository.GetCurrent()!.Manifest.CatalogRevision);
+        }
+    }
+
+    [Fact]
+    public void TryRefresh_IgnoresMalformedSlotWhenAnotherSlotIsRecoverable()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete();
+        File.Copy(sandbox.CurrentPath, Path.Combine(sandbox.Root, "current-slot-0.json"));
+        File.WriteAllText(Path.Combine(sandbox.Root, "current-slot-1.json"), "{\"manifest\":\"../escape.json\",\"session_id\":\"attacker\"}");
+        File.Delete(sandbox.CurrentPath);
+
+        var repository = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
+
+        Assert.True(repository.TryRefresh());
+        Assert.Equal("catalog-session", repository.GetCurrent()!.Manifest.SessionId);
+    }
+
+    [Fact]
+    public void TryRefresh_RejectsConflictingSnapshotsAtTheSameRevision()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete();
+        File.Copy(sandbox.CurrentPath, Path.Combine(sandbox.Root, "current-slot-0.json"));
+        sandbox.PublishConflictingSlotAtSameRevision();
+
+        var repository = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
+
+        Assert.False(repository.TryRefresh());
+        Assert.Null(repository.GetCurrent());
+    }
+
+    [Fact]
     public void TryRefresh_RejectsPointerTraversalWithoutPromoting()
     {
         using var sandbox = CatalogSandbox.CreateComplete();
@@ -411,6 +467,26 @@ public sealed class AssetCatalogRepositoryTests
                 AssetCategory.All.ToDictionary(category => category, _ => 1, StringComparer.Ordinal),
                 [chunk]);
             WriteUncheckedManifest(manifest with { CatalogFingerprint = AssetCatalogJson.ComputeCatalogFingerprint(manifest) });
+        }
+
+        public void PublishConflictingSlotAtSameRevision()
+        {
+            var conflictSnapshot = Path.Combine(SnapshotsPath, "snapshot-conflict");
+            Directory.CreateDirectory(conflictSnapshot);
+            File.Copy(ChunkPath, Path.Combine(conflictSnapshot, "assets-000.json"));
+            var manifest = AssetCatalogJson.DeserializeManifest(File.ReadAllText(ManifestPath)) with
+            {
+                Errors = [new AssetCatalogError("conflict", "conflict", "Objects")],
+            };
+            manifest = manifest with { CatalogFingerprint = AssetCatalogJson.ComputeCatalogFingerprint(manifest) };
+            File.WriteAllText(Path.Combine(conflictSnapshot, "manifest.json"), AssetCatalogJson.SerializeManifest(manifest));
+            File.WriteAllText(
+                Path.Combine(Root, "current-slot-1.json"),
+                JsonSerializer.Serialize(new Dictionary<string, string>
+                {
+                    ["manifest"] = "snapshot-conflict/manifest.json",
+                    ["session_id"] = SessionId,
+                }));
         }
 
         public void WritePreview(string hash, byte[] bytes) =>

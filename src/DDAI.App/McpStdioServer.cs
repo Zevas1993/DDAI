@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Text.Json;
+using DDAI.App.Assets;
 using DDAI.Core.Mailbox;
 using DDAI.Core.MapPlans;
 using Microsoft.Extensions.DependencyInjection;
@@ -19,6 +20,8 @@ public static class McpStdioServer
         builder.Logging.AddConsole(console => console.LogToStandardErrorThreshold = LogLevel.Trace);
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
         builder.Services.AddSingleton(new AtomicMailbox(options.MailboxRoot));
+        builder.Services.AddSingleton(new AssetPackNormalizationService(options.MailboxRoot));
+        builder.Services.AddHostedService<AssetPackNormalizationWorker>();
         builder.Services.AddSingleton(timeProvider);
         builder.Services.AddSingleton<DdaiStatusService>();
         builder.Services.AddSingleton<DdaiPlanService>();

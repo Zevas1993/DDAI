@@ -15,7 +15,9 @@ public sealed class DungeondraftModPackageTests
         Assert.True(File.Exists(catalogPath), "The redistributable package must include the live asset catalog tool.");
         Assert.Contains("asset catalog", manifest.RootElement.GetProperty("description").GetString(), StringComparison.OrdinalIgnoreCase);
         Assert.Contains("user://ddai/runtime-receipt.json", bridge, StringComparison.Ordinal);
-        Assert.Contains("func _replace_json_atomically(", bridge, StringComparison.Ordinal);
+        Assert.Contains("runtime-receipt-slot-0.json", bridge, StringComparison.Ordinal);
+        Assert.Contains("runtime-receipt-slot-1.json", bridge, StringComparison.Ordinal);
+        Assert.Contains("func _replace_json_recoverably(", bridge, StringComparison.Ordinal);
     }
 
     [Fact]

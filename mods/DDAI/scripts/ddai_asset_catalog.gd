@@ -6,13 +6,20 @@ const CATALOG_ROOT = "user://ddai/catalog"
 const SNAPSHOTS_ROOT = "user://ddai/catalog/snapshots"
 const PREVIEWS_ROOT = "user://ddai/catalog/previews"
 const CURRENT_POINTER_PATH = "user://ddai/catalog/current.json"
+const RUNTIME_RECEIPT_SLOT_PATHS = ["user://ddai/runtime-receipt-slot-0.json", "user://ddai/runtime-receipt-slot-1.json"]
 const MANIFEST_FILE_NAME = "manifest.json"
 const CURRENT_POINTER_FILE_NAME = "current.json"
+const CURRENT_SLOT_FILE_NAMES = ["current-slot-0.json", "current-slot-1.json"]
 const MAX_ASSETS_PER_TICK = 8
 const MAX_PREVIEW_EDGE = 256
 const MAX_PREVIEW_BYTES = 262144
 const MAX_CHUNK_BYTES = 900000
 const MAX_RECEIPT_BYTES = 65536
+const MAX_MANIFEST_BYTES = 1048576
+const MAX_ERROR_RECORDS = 128
+const MAX_ERROR_CODE_BYTES = 64
+const MAX_ERROR_MESSAGE_BYTES = 512
+const MAX_NORMALIZATION_BYTES = 4096
 
 const CATEGORIES = [
 	"Terrain",
@@ -53,6 +60,9 @@ var _entries = []
 var _resource_lookup = {}
 var _preview_results = {}
 var _errors = []
+var _suppressed_error_count = 0
+var _preview_work = null
+var _normalization_request_pending = null
 var _chunk_build_index = 0
 var _chunk_entry_json = []
 var _chunk_payload_bytes = 2
@@ -62,24 +72,55 @@ var _chunk_receipts = []
 var _chunk_phase = "building"
 var _publishing_step = 0
 var _manifest_text = ""
+var _last_update_entry_operations = 0
+var _last_update_file_publications = 0
 
 
 class LiveRuntimeAdapter:
 	func read_runtime_receipt():
+		var newest = null
+		for path in [RUNTIME_RECEIPT_PATH] + RUNTIME_RECEIPT_SLOT_PATHS:
+			var candidate = _read_receipt(path)
+			if candidate != null and (newest == null or _receipt_is_newer(candidate, newest)):
+				newest = candidate
+		return {"ok": newest != null, "receipt": newest}
+
+	func _receipt_is_newer(candidate, current):
+		var candidate_timestamp = str(candidate.get("timestamp", ""))
+		var current_timestamp = str(current.get("timestamp", ""))
+		if candidate_timestamp != current_timestamp:
+			return candidate_timestamp > current_timestamp
+		var candidate_parts = _session_sequence(str(candidate.get("session_id", "")))
+		var current_parts = _session_sequence(str(current.get("session_id", "")))
+		if candidate_parts[0] != current_parts[0]:
+			return candidate_parts[0] > current_parts[0]
+		if candidate_parts[1] != current_parts[1]:
+			return candidate_parts[1] > current_parts[1]
+		return str(candidate.get("session_id", "")) > str(current.get("session_id", ""))
+
+	func _session_sequence(value):
+		var parts = value.split("-", false)
+		if parts.size() != 2 or not str(parts[0]).is_valid_integer() or not str(parts[1]).is_valid_integer():
+			return [-1, -1]
+		return [int(parts[0]), int(parts[1])]
+
+	func _read_receipt(path):
 		var file = File.new()
-		if not file.file_exists(RUNTIME_RECEIPT_PATH):
-			return {"ok": false}
-		if file.open(RUNTIME_RECEIPT_PATH, File.READ) != OK:
-			return {"ok": false}
+		if not file.file_exists(path):
+			return null
+		if file.open(path, File.READ) != OK:
+			return null
 		if file.get_len() > MAX_RECEIPT_BYTES:
 			file.close()
-			return {"ok": false}
+			return null
 		var text = file.get_as_text()
 		file.close()
 		var parsed = JSON.parse(text)
 		if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
-			return {"ok": false}
-		return {"ok": true, "receipt": parsed.result}
+			return null
+		if typeof(parsed.result.get("session_id", null)) != TYPE_STRING or typeof(parsed.result.get("timestamp", null)) != TYPE_STRING:
+			return null
+		return parsed.result
 
 	func get_asset_list(category):
 		return Script.GetAssetList(category)
@@ -120,16 +161,26 @@ func start():
 
 # Every update performs at most eight lightweight entry operations or one logical file publication.
 func update(_delta):
+	_last_update_entry_operations = 0
+	_last_update_file_publications = 0
 	if _state == "waiting_for_receipt":
 		_advance_waiting_for_receipt_state()
 	elif _state == "enumerating":
 		_advance_enumerating_state()
 	elif _state == "previewing":
 		_advance_previewing_state()
+	elif _state == "normalizing_pack_id":
+		_advance_pack_normalization_state()
+	elif _state == "preview_publication":
+		_advance_preview_publication_state()
+	elif _state == "preview_finalization":
+		_advance_preview_finalization_state()
 	elif _state == "writing_chunks":
 		_advance_writing_chunks_state()
 	elif _state == "publishing":
 		_advance_publishing_state()
+	if _last_update_entry_operations > MAX_ASSETS_PER_TICK or _last_update_file_publications > 1 or (_last_update_entry_operations > 0 and _last_update_file_publications > 0):
+		_state = "failed"
 
 
 func resolve_asset_ref(asset_ref):
@@ -185,7 +236,7 @@ func _advance_enumerating_state():
 	if not _enumeration_loaded:
 		var listed = _runtime_adapter.get_asset_list(category)
 		if typeof(listed) != TYPE_ARRAY:
-			_errors.append(_catalog_error("asset_enumeration_failed", "Dungeondraft did not return an asset list for this category.", category))
+			_record_error("asset_enumeration_failed", "Dungeondraft did not return an asset list for this category.", category)
 			listed = []
 		_enumeration_raw = listed
 		_enumeration_raw_index = 0
@@ -198,6 +249,7 @@ func _advance_enumerating_state():
 		var resource_identity = str(_enumeration_raw[_enumeration_raw_index])
 		_enumeration_raw_index += 1
 		processed += 1
+		_last_update_entry_operations += 1
 		if resource_identity.length() == 0 or _enumeration_seen.has(resource_identity):
 			continue
 		_enumeration_seen[resource_identity] = true
@@ -224,26 +276,63 @@ func _advance_previewing_state():
 		_asset_category_index += 1
 		_asset_index = 0
 		return
-	# Preview encoding and publication are intentionally limited to one asset per update.
+	# Preparation is in-memory only; publication and finalization have their own updates.
 	var category = category_group.category
 	var resource_identity = identities[_asset_index]
-	_asset_index += 1
 	var pack_metadata = _safe_pack_metadata(resource_identity)
-	var pack_id = _canonical_pack_id(pack_metadata.pack_id)
+	var pack_id_result = _resolve_pack_id(pack_metadata.pack_id)
+	if not pack_id_result.ok:
+		return
+	var pack_id = pack_id_result.value
 	var resource_fingerprint = _sha256_text(resource_identity)
 	var asset_ref = "sha256:" + _sha256_text(_pack_id_for_hash(pack_id) + "\n" + category + "\n" + resource_identity)
+	_preview_work = {
+		"category": category,
+		"resource_identity": resource_identity,
+		"resource_fingerprint": resource_fingerprint,
+		"asset_ref": asset_ref,
+		"pack_metadata": pack_metadata,
+		"pack_id": pack_id,
+		"preview": _prepare_preview(resource_identity),
+	}
+	_last_update_entry_operations = 1
+	_state = "preview_publication"
+
+
+func _advance_preview_publication_state():
+	var preview = _preview_work.preview
+	if preview.ok and preview.needs_write:
+		if _write_bytes_immutable(preview.path, preview.png) != "created":
+			_preview_work.preview = {"ok": false, "message": "The bounded preview could not be published."}
+	_state = "preview_finalization"
+
+
+func _advance_preview_finalization_state():
+	var asset_ref = _preview_work.asset_ref
+	var category = _preview_work.category
+	var preview = _preview_work.preview
 	var preview_hash = null
-	var preview = _create_preview(resource_identity)
 	if preview.ok:
 		preview_hash = preview.hash
 		_preview_results[asset_ref] = {"ok": true, "preview_hash": preview_hash}
 	else:
 		var error = _catalog_error("preview_not_available", "Preview unavailable for opaque asset " + asset_ref + ": " + preview.message, category)
-		_errors.append(error)
+		_record_error(error.code, error.message, error.category)
 		_preview_results[asset_ref] = {"ok": false, "error": error}
-	var entry = _build_catalog_entry(asset_ref, category, resource_identity, resource_fingerprint, pack_metadata, pack_id, preview_hash)
+	var entry = _build_catalog_entry(
+		asset_ref,
+		category,
+		_preview_work.resource_identity,
+		_preview_work.resource_fingerprint,
+		_preview_work.pack_metadata,
+		_preview_work.pack_id,
+		preview_hash)
 	_entries.append(entry)
-	_resource_lookup[asset_ref] = resource_identity
+	_resource_lookup[asset_ref] = _preview_work.resource_identity
+	_asset_index += 1
+	_preview_work = null
+	_last_update_entry_operations = 1
+	_state = "previewing"
 
 
 func _build_catalog_entry(asset_ref, category, resource_identity, resource_fingerprint, pack_metadata, pack_id, preview_hash):
@@ -286,6 +375,7 @@ func _advance_writing_chunks_state():
 			_chunk_payload_bytes += separator_bytes + entry_bytes
 			_chunk_build_index += 1
 			processed += 1
+			_last_update_entry_operations += 1
 		if _chunk_build_index < _entries.size():
 			return
 		if _chunk_entry_json.size() > 0:
@@ -321,20 +411,35 @@ func _queue_current_chunk():
 func _advance_publishing_state():
 	if _publishing_step == 0:
 		_manifest_text = _build_manifest_text()
+		if _manifest_text.to_utf8().size() > MAX_MANIFEST_BYTES:
+			_state = "failed"
+			return
 		if _write_bytes_immutable(_snapshot_root + "/" + MANIFEST_FILE_NAME, _manifest_text.to_utf8()) != "created":
 			_state = "failed"
 			return
 		_publishing_step = 1
 		return
 	if _publishing_step == 1:
+		var slot_pointer = {
+			"session_id": _session_id,
+			"manifest": _snapshot_namespace + "/" + MANIFEST_FILE_NAME,
+			"catalog_revision": _catalog_revision,
+		}
+		var slot_name = CURRENT_SLOT_FILE_NAMES[_select_current_slot()]
+		if _replace_bytes_recoverably(catalog_root + "/" + slot_name, to_json(slot_pointer).to_utf8()) != "replaced":
+			_state = "failed"
+			return
+		_publishing_step = 2
+		return
+	if _publishing_step == 2:
 		var pointer = {
 			"session_id": _session_id,
 			"manifest": _snapshot_namespace + "/" + MANIFEST_FILE_NAME,
 		}
-		if _replace_bytes_atomically(catalog_root + "/" + CURRENT_POINTER_FILE_NAME, to_json(pointer).to_utf8()) != "replaced":
+		if _replace_bytes_recoverably(catalog_root + "/" + CURRENT_POINTER_FILE_NAME, to_json(pointer).to_utf8()) != "replaced":
 			_state = "failed"
 			return
-		_publishing_step = 2
+		_publishing_step = 3
 		_state = "published"
 
 
@@ -348,7 +453,7 @@ func _build_manifest_text():
 		"complete": true,
 		"category_counts": _category_counts,
 		"chunks": _chunk_receipts,
-		"errors": _errors,
+		"errors": _published_errors(),
 	}
 	manifest.catalog_fingerprint = _catalog_fingerprint(manifest)
 	return to_json(manifest)
@@ -394,12 +499,15 @@ func _framed_boolean(name, value):
 	return name + "=" + ("true" if value else "false") + "\n"
 
 
-func _create_preview(resource_identity):
+func _prepare_preview(resource_identity):
 	var texture = _runtime_adapter.load_texture(resource_identity)
 	if texture == null or not texture.has_method("get_data"):
 		return {"ok": false, "message": "The loaded asset is not a readable texture."}
-	var image = texture.get_data().duplicate()
-	if image == null or image.get_width() <= 0 or image.get_height() <= 0:
+	var source_image = texture.get_data()
+	if source_image == null:
+		return {"ok": false, "message": "The loaded texture did not expose image data."}
+	var image = source_image.duplicate()
+	if image.get_width() <= 0 or image.get_height() <= 0:
 		return {"ok": false, "message": "The loaded texture did not expose image data."}
 	if image.get_width() > MAX_PREVIEW_EDGE or image.get_height() > MAX_PREVIEW_EDGE:
 		var scale = min(float(MAX_PREVIEW_EDGE) / float(image.get_width()), float(MAX_PREVIEW_EDGE) / float(image.get_height()))
@@ -415,12 +523,10 @@ func _create_preview(resource_identity):
 	var preview_path = _previews_root() + "/" + preview_hash + ".png"
 	var validation = _validate_existing_preview(preview_path, preview_hash)
 	if validation == "valid":
-		return {"ok": true, "hash": preview_hash}
+		return {"ok": true, "hash": preview_hash, "needs_write": false}
 	if validation == "invalid":
 		return {"ok": false, "message": "A conflicting content-addressed preview already exists."}
-	if _write_bytes_immutable(preview_path, png) != "created":
-		return {"ok": false, "message": "The bounded preview could not be published."}
-	return {"ok": true, "hash": preview_hash}
+	return {"ok": true, "hash": preview_hash, "needs_write": true, "path": preview_path, "png": png}
 
 
 func _validate_existing_preview(path, expected_hash):
@@ -449,17 +555,68 @@ func _safe_pack_metadata(resource_identity):
 	}
 
 
-func _canonical_pack_id(value):
+func _resolve_pack_id(value):
 	if value == null:
-		return null
-	var normalized = str(value).strip_edges().to_lower()
-	if normalized.length() == 0:
-		return null
-	# ASCII IDs are already Unicode Form KC; non-ASCII IDs become null because Godot 3 has no NFKC API.
-	for index in range(normalized.length()):
-		if normalized.ord_at(index) > 127:
-			return null
-	return normalized
+		return {"ok": true, "value": null}
+	var raw_value = str(value)
+	var ascii_only = true
+	for index in range(raw_value.length()):
+		if raw_value.ord_at(index) > 127:
+			ascii_only = false
+			break
+	if ascii_only:
+		var normalized_ascii = raw_value.strip_edges().to_lower()
+		return {"ok": true, "value": null if normalized_ascii.length() == 0 else normalized_ascii}
+	var request_id = _sha256_text(raw_value)
+	var response = _read_pack_normalization_response(request_id)
+	if response.ok:
+		return {"ok": true, "value": response.value}
+	var request_path = _pack_normalization_root() + "/requests/" + request_id + ".json"
+	var directory = Directory.new()
+	if not directory.file_exists(request_path):
+		_normalization_request_pending = {
+			"path": request_path,
+			"payload": {
+				"schema_version": CATALOG_SCHEMA_VERSION,
+				"request_id": request_id,
+				"value": raw_value,
+			},
+		}
+		_state = "normalizing_pack_id"
+	return {"ok": false}
+
+
+func _advance_pack_normalization_state():
+	if _normalization_request_pending != null:
+		var pending = _normalization_request_pending
+		var result = _write_bytes_immutable(pending.path, to_json(pending.payload).to_utf8())
+		if result != "created" and result != "existing":
+			_state = "failed"
+			return
+		_normalization_request_pending = null
+	_state = "previewing"
+
+
+func _read_pack_normalization_response(request_id):
+	var path = _pack_normalization_root() + "/responses/" + request_id + ".json"
+	var file = File.new()
+	if not file.file_exists(path) or file.open(path, File.READ) != OK:
+		return {"ok": false}
+	if file.get_len() > MAX_NORMALIZATION_BYTES:
+		file.close()
+		return {"ok": false}
+	var text = file.get_as_text()
+	file.close()
+	var parsed = JSON.parse(text)
+	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+		return {"ok": false}
+	var response = parsed.result
+	if response.get("schema_version", "") != CATALOG_SCHEMA_VERSION or response.get("request_id", "") != request_id:
+		return {"ok": false}
+	var normalized = response.get("normalized_pack_id", null)
+	if typeof(normalized) != TYPE_STRING or normalized.strip_edges().length() == 0:
+		return {"ok": false}
+	return {"ok": true, "value": normalized}
 
 
 func _pack_id_for_hash(pack_id):
@@ -502,7 +659,50 @@ func _bounded_nonblank_text(value, maximum_characters):
 
 
 func _catalog_error(code, message, category):
-	return {"code": code, "message": message, "category": category}
+	return {
+		"code": _bounded_utf8_text(code, MAX_ERROR_CODE_BYTES, "catalog_error"),
+		"message": _bounded_utf8_text(message, MAX_ERROR_MESSAGE_BYTES, "Catalog error."),
+		"category": category if CATEGORIES.has(category) else null,
+	}
+
+
+func _record_error(code, message, category):
+	if _errors.size() < MAX_ERROR_RECORDS - 1:
+		_errors.append(_catalog_error(code, message, category))
+	else:
+		_suppressed_error_count += 1
+
+
+func _published_errors():
+	var published = _errors.duplicate(true)
+	if _suppressed_error_count > 0:
+		published.append(_catalog_error(
+			"errors_truncated",
+			str(_suppressed_error_count) + " additional bounded catalog errors were suppressed.",
+			null))
+	return published
+
+
+func _bounded_utf8_text(value, maximum_bytes, fallback):
+	var text = str(value).strip_edges().substr(0, maximum_bytes)
+	while text.length() > 0 and text.to_utf8().size() > maximum_bytes:
+		text = text.substr(0, text.length() - 1)
+	return fallback if text.length() == 0 else text
+
+
+func _select_current_slot():
+	var revisions = [-1, -1]
+	for index in range(CURRENT_SLOT_FILE_NAMES.size()):
+		var path = catalog_root + "/" + CURRENT_SLOT_FILE_NAMES[index]
+		var file = File.new()
+		if not file.file_exists(path) or file.open(path, File.READ) != OK:
+			return index
+		if file.get_len() <= MAX_NORMALIZATION_BYTES:
+			var parsed = JSON.parse(file.get_as_text())
+			if parsed.error == OK and typeof(parsed.result) == TYPE_DICTIONARY:
+				revisions[index] = int(parsed.result.get("catalog_revision", -1))
+		file.close()
+	return 0 if revisions[0] <= revisions[1] else 1
 
 
 func _sha256_text(text):
@@ -521,6 +721,7 @@ func _write_bytes_immutable(path, bytes):
 	directory.make_dir_recursive(path.get_base_dir())
 	if directory.file_exists(path):
 		return "existing"
+	_last_update_file_publications += 1
 	var temporary_path = path + "." + str(OS.get_ticks_msec()) + ".tmp"
 	directory.remove(temporary_path)
 	var file = File.new()
@@ -535,13 +736,12 @@ func _write_bytes_immutable(path, bytes):
 	return "write_failed"
 
 
-func _replace_bytes_atomically(path, bytes):
+func _replace_bytes_recoverably(path, bytes):
 	var directory = Directory.new()
 	directory.make_dir_recursive(path.get_base_dir())
 	var temporary_path = path + "." + str(OS.get_ticks_msec()) + ".next"
-	var backup_path = path + ".previous"
 	directory.remove(temporary_path)
-	directory.remove(backup_path)
+	_last_update_file_publications += 1
 	var file = File.new()
 	if file.open(temporary_path, File.WRITE) != OK:
 		return "write_failed"
@@ -550,13 +750,6 @@ func _replace_bytes_atomically(path, bytes):
 	file.close()
 	if directory.rename(temporary_path, path) == OK:
 		return "replaced"
-	if not directory.file_exists(path) or directory.rename(path, backup_path) != OK:
-		directory.remove(temporary_path)
-		return "write_failed"
-	if directory.rename(temporary_path, path) == OK:
-		directory.remove(backup_path)
-		return "replaced"
-	directory.rename(backup_path, path)
 	directory.remove(temporary_path)
 	return "write_failed"
 
@@ -574,6 +767,10 @@ func _snapshots_root():
 
 func _previews_root():
 	return catalog_root + "/previews"
+
+
+func _pack_normalization_root():
+	return catalog_root.get_base_dir() + "/private/pack-normalization"
 
 
 func _is_safe_segment(value):
