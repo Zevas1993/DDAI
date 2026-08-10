@@ -3,6 +3,6 @@
   "unique_id": "org.ddai.status_bridge",
   "version": "0.2.1",
   "author": "DDAI contributors",
-  "description": "Local filesystem mailbox bridge for status and one native rectangular wall mutation. No network listener.",
+  "description": "Local filesystem mailbox bridge with a bounded live asset catalog and one native rectangular wall mutation. No network listener.",
   "dd_version": "1.2.0.1"
 }

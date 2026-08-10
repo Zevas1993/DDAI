@@ -855,7 +855,7 @@ func _active_mods_payload():
 
 
 func _write_runtime_receipt():
-	_write_json_atomically(MAILBOX_ROOT + "/runtime-receipts/" + _session_id + ".json", {
+	var receipt = {
 		"schema_version": MAILBOX_SCHEMA_VERSION,
 		"event": "started",
 		"mod_version": MOD_VERSION,
@@ -863,7 +863,9 @@ func _write_runtime_receipt():
 		"timestamp": _iso_timestamp(),
 		"session_id": _session_id,
 		"supported_commands": SUPPORTED_COMMANDS,
-	})
+	}
+	_write_json_atomically(MAILBOX_ROOT + "/runtime-receipts/" + _session_id + ".json", receipt)
+	_replace_json_atomically("user://ddai/runtime-receipt.json", receipt)
 
 
 func _write_heartbeat():
@@ -894,6 +896,35 @@ func _write_failed_record(claim, error):
 
 func _write_json_atomically(destination_path, payload):
 	return _write_text_atomically(destination_path, to_json(payload))
+
+
+func _replace_json_atomically(destination_path, payload):
+	var directory = Directory.new()
+	directory.make_dir_recursive(destination_path.get_base_dir())
+	var temporary_path = destination_path + "." + str(OS.get_ticks_msec()) + ".next"
+	var backup_path = destination_path + ".previous"
+	directory.remove(temporary_path)
+	directory.remove(backup_path)
+	var file = File.new()
+	if file.open(temporary_path, File.WRITE) != OK:
+		return "write_failed"
+	file.store_string(to_json(payload))
+	file.flush()
+	file.close()
+	if directory.rename(temporary_path, destination_path) == OK:
+		return "replaced"
+	if not directory.file_exists(destination_path):
+		directory.remove(temporary_path)
+		return "write_failed"
+	if directory.rename(destination_path, backup_path) != OK:
+		directory.remove(temporary_path)
+		return "write_failed"
+	if directory.rename(temporary_path, destination_path) == OK:
+		directory.remove(backup_path)
+		return "replaced"
+	directory.rename(backup_path, destination_path)
+	directory.remove(temporary_path)
+	return "write_failed"
 
 
 func _write_text_atomically(destination_path, text):

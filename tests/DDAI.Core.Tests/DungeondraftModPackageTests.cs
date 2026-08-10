@@ -5,6 +5,20 @@ namespace DDAI.Core.Tests;
 public sealed class DungeondraftModPackageTests
 {
     [Fact]
+    public void Package_IncludesLiveAssetCatalogToolAndCanonicalRuntimeReceiptHandoff()
+    {
+        var modRoot = Path.Combine(FindRepositoryRoot(), "mods", "DDAI");
+        using var manifest = JsonDocument.Parse(File.ReadAllText(Path.Combine(modRoot, "ddai_bridge.ddmod")));
+        var bridge = File.ReadAllText(Path.Combine(modRoot, "scripts", "ddai_bridge.gd"));
+        var catalogPath = Path.Combine(modRoot, "scripts", "ddai_asset_catalog.gd");
+
+        Assert.True(File.Exists(catalogPath), "The redistributable package must include the live asset catalog tool.");
+        Assert.Contains("asset catalog", manifest.RootElement.GetProperty("description").GetString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("user://ddai/runtime-receipt.json", bridge, StringComparison.Ordinal);
+        Assert.Contains("func _replace_json_atomically(", bridge, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Package_DeclaresRectangularRoomMutationBridgeVersionAndCommands()
     {
         var modRoot = Path.Combine(FindRepositoryRoot(), "mods", "DDAI");

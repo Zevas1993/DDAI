@@ -1,0 +1,598 @@
+var script_class = "tool"
+
+const CATALOG_SCHEMA_VERSION = "1.0"
+const RUNTIME_RECEIPT_PATH = "user://ddai/runtime-receipt.json"
+const CATALOG_ROOT = "user://ddai/catalog"
+const SNAPSHOTS_ROOT = "user://ddai/catalog/snapshots"
+const PREVIEWS_ROOT = "user://ddai/catalog/previews"
+const CURRENT_POINTER_PATH = "user://ddai/catalog/current.json"
+const MANIFEST_FILE_NAME = "manifest.json"
+const CURRENT_POINTER_FILE_NAME = "current.json"
+const MAX_ASSETS_PER_TICK = 8
+const MAX_PREVIEW_EDGE = 256
+const MAX_PREVIEW_BYTES = 262144
+const MAX_CHUNK_BYTES = 900000
+const MAX_RECEIPT_BYTES = 65536
+
+const CATEGORIES = [
+	"Terrain",
+	"Patterns",
+	"Patterns Colorable",
+	"Caves",
+	"Roofs",
+	"Objects",
+	"Walls",
+	"Materials",
+	"Portals",
+	"Paths",
+	"Lights",
+	"Simple Tiles",
+	"Smart Tiles",
+	"Smart Tiles Double",
+]
+
+var catalog_root = CATALOG_ROOT
+var _runtime_adapter = null
+var _state = "waiting_for_receipt"
+var _session_id = ""
+var _catalog_revision = 0
+var _snapshot_at = ""
+var _snapshot_namespace = ""
+var _snapshot_root = ""
+var _category_index = 0
+var _enumeration_loaded = false
+var _enumeration_raw = []
+var _enumeration_raw_index = 0
+var _enumeration_sorted = []
+var _enumeration_seen = {}
+var _category_resources = []
+var _category_counts = {}
+var _asset_category_index = 0
+var _asset_index = 0
+var _entries = []
+var _resource_lookup = {}
+var _preview_results = {}
+var _errors = []
+var _chunk_build_index = 0
+var _chunk_entry_json = []
+var _chunk_payload_bytes = 2
+var _pending_chunks = []
+var _chunk_write_index = 0
+var _chunk_receipts = []
+var _chunk_phase = "building"
+var _publishing_step = 0
+var _manifest_text = ""
+
+
+class LiveRuntimeAdapter:
+	func read_runtime_receipt():
+		var file = File.new()
+		if not file.file_exists(RUNTIME_RECEIPT_PATH):
+			return {"ok": false}
+		if file.open(RUNTIME_RECEIPT_PATH, File.READ) != OK:
+			return {"ok": false}
+		if file.get_len() > MAX_RECEIPT_BYTES:
+			file.close()
+			return {"ok": false}
+		var text = file.get_as_text()
+		file.close()
+		var parsed = JSON.parse(text)
+		if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+			return {"ok": false}
+		return {"ok": true, "receipt": parsed.result}
+
+	func get_asset_list(category):
+		return Script.GetAssetList(category)
+
+	func get_pack_metadata(resource_identity):
+		var owner = null
+		var owner_path_length = -1
+		for pack in Global.Header.AssetManifest:
+			var pack_path = str(pack.Path).replace("\\", "/")
+			var normalized_identity = resource_identity.replace("\\", "/")
+			if pack_path.length() > owner_path_length and normalized_identity.begins_with(pack_path):
+				owner = pack
+				owner_path_length = pack_path.length()
+		if owner == null:
+			return {
+				"pack_id": null,
+				"pack_name": null,
+				"keywords": [],
+				"allow_third_party_use": true,
+			}
+		return {
+			"pack_id": owner.ID,
+			"pack_name": owner.Name,
+			"keywords": owner.Keywords,
+			"allow_third_party_use": owner.AllowThirdPartyUse,
+		}
+
+	func load_texture(resource_identity):
+		return load(resource_identity)
+
+
+# Called by Dungeondraft after the map and its drawing assets have loaded.
+func start():
+	if _runtime_adapter == null:
+		_runtime_adapter = LiveRuntimeAdapter.new()
+	_ensure_catalog_directories()
+
+
+# Every update performs at most eight lightweight entry operations or one logical file publication.
+func update(_delta):
+	if _state == "waiting_for_receipt":
+		_advance_waiting_for_receipt_state()
+	elif _state == "enumerating":
+		_advance_enumerating_state()
+	elif _state == "previewing":
+		_advance_previewing_state()
+	elif _state == "writing_chunks":
+		_advance_writing_chunks_state()
+	elif _state == "publishing":
+		_advance_publishing_state()
+
+
+func resolve_asset_ref(asset_ref):
+	return _resource_lookup.get(asset_ref, null)
+
+
+func get_preview_result(asset_ref):
+	return _preview_results.get(asset_ref, {
+		"ok": false,
+		"error": {
+			"code": "asset_not_found",
+			"message": "The opaque asset reference is not present in the live catalog.",
+			"category": null,
+		},
+	})
+
+
+func _advance_waiting_for_receipt_state():
+	var result = _runtime_adapter.read_runtime_receipt()
+	if typeof(result) != TYPE_DICTIONARY or not result.get("ok", false):
+		return
+	var receipt = result.get("receipt", null)
+	if typeof(receipt) != TYPE_DICTIONARY:
+		return
+	var candidate_session = str(receipt.get("session_id", ""))
+	if not _is_safe_segment(candidate_session):
+		return
+	_session_id = candidate_session
+	_catalog_revision = int(OS.get_unix_time()) * 1000 + int(OS.get_ticks_msec() % 1000)
+	_snapshot_at = _utc_wire_timestamp()
+	_snapshot_namespace = _session_id + "-" + str(_catalog_revision)
+	_snapshot_root = _snapshots_root() + "/" + _snapshot_namespace
+	var directory = Directory.new()
+	while directory.dir_exists(_snapshot_root):
+		_catalog_revision += 1
+		_snapshot_namespace = _session_id + "-" + str(_catalog_revision)
+		_snapshot_root = _snapshots_root() + "/" + _snapshot_namespace
+	if directory.make_dir_recursive(_snapshot_root) != OK:
+		_state = "failed"
+		return
+	for category in CATEGORIES:
+		_category_counts[category] = 0
+	_state = "enumerating"
+
+
+func _advance_enumerating_state():
+	if _category_index >= CATEGORIES.size():
+		_asset_category_index = 0
+		_asset_index = 0
+		_state = "previewing"
+		return
+	var category = CATEGORIES[_category_index]
+	if not _enumeration_loaded:
+		var listed = _runtime_adapter.get_asset_list(category)
+		if typeof(listed) != TYPE_ARRAY:
+			_errors.append(_catalog_error("asset_enumeration_failed", "Dungeondraft did not return an asset list for this category.", category))
+			listed = []
+		_enumeration_raw = listed
+		_enumeration_raw_index = 0
+		_enumeration_sorted = []
+		_enumeration_seen = {}
+		_enumeration_loaded = true
+		return
+	var processed = 0
+	while processed < MAX_ASSETS_PER_TICK and _enumeration_raw_index < _enumeration_raw.size():
+		var resource_identity = str(_enumeration_raw[_enumeration_raw_index])
+		_enumeration_raw_index += 1
+		processed += 1
+		if resource_identity.length() == 0 or _enumeration_seen.has(resource_identity):
+			continue
+		_enumeration_seen[resource_identity] = true
+		var insertion_index = _enumeration_sorted.bsearch(resource_identity)
+		_enumeration_sorted.insert(insertion_index, resource_identity)
+	if _enumeration_raw_index < _enumeration_raw.size():
+		return
+	_category_resources.append({"category": category, "identities": _enumeration_sorted})
+	_category_counts[category] = _enumeration_sorted.size()
+	_category_index += 1
+	_enumeration_loaded = false
+	_enumeration_raw = []
+	_enumeration_sorted = []
+	_enumeration_seen = {}
+
+
+func _advance_previewing_state():
+	if _asset_category_index >= _category_resources.size():
+		_state = "writing_chunks"
+		return
+	var category_group = _category_resources[_asset_category_index]
+	var identities = category_group.identities
+	if _asset_index >= identities.size():
+		_asset_category_index += 1
+		_asset_index = 0
+		return
+	# Preview encoding and publication are intentionally limited to one asset per update.
+	var category = category_group.category
+	var resource_identity = identities[_asset_index]
+	_asset_index += 1
+	var pack_metadata = _safe_pack_metadata(resource_identity)
+	var pack_id = _canonical_pack_id(pack_metadata.pack_id)
+	var resource_fingerprint = _sha256_text(resource_identity)
+	var asset_ref = "sha256:" + _sha256_text(_pack_id_for_hash(pack_id) + "\n" + category + "\n" + resource_identity)
+	var preview_hash = null
+	var preview = _create_preview(resource_identity)
+	if preview.ok:
+		preview_hash = preview.hash
+		_preview_results[asset_ref] = {"ok": true, "preview_hash": preview_hash}
+	else:
+		var error = _catalog_error("preview_not_available", "Preview unavailable for opaque asset " + asset_ref + ": " + preview.message, category)
+		_errors.append(error)
+		_preview_results[asset_ref] = {"ok": false, "error": error}
+	var entry = _build_catalog_entry(asset_ref, category, resource_identity, resource_fingerprint, pack_metadata, pack_id, preview_hash)
+	_entries.append(entry)
+	_resource_lookup[asset_ref] = resource_identity
+
+
+func _build_catalog_entry(asset_ref, category, resource_identity, resource_fingerprint, pack_metadata, pack_id, preview_hash):
+	var display_name = _display_name(resource_identity, category)
+	var tags = _normalized_tags(pack_metadata.keywords)
+	var search_terms = [display_name]
+	if pack_metadata.pack_name != null:
+		var bounded_pack_name = _bounded_nonblank_text(pack_metadata.pack_name, 256)
+		if bounded_pack_name != null:
+			search_terms.append(bounded_pack_name)
+	for tag in tags:
+		if not search_terms.has(tag):
+			search_terms.append(tag)
+	return {
+		"asset_ref": asset_ref,
+		"category": category,
+		"display_name": display_name,
+		"resource_fingerprint": resource_fingerprint,
+		"pack_id": pack_id,
+		"pack_name": _bounded_nonblank_text(pack_metadata.pack_name, 256),
+		"search_terms": search_terms,
+		"tags": tags,
+		"preview_hash": preview_hash,
+		"allow_third_party_use": bool(pack_metadata.allow_third_party_use),
+		"generated": false,
+	}
+
+
+func _advance_writing_chunks_state():
+	if _chunk_phase == "building":
+		var processed = 0
+		while processed < MAX_ASSETS_PER_TICK and _chunk_build_index < _entries.size():
+			var entry_text = to_json(_entries[_chunk_build_index])
+			var entry_bytes = entry_text.to_utf8().size()
+			var separator_bytes = 0 if _chunk_entry_json.size() == 0 else 1
+			if _chunk_entry_json.size() > 0 and _chunk_payload_bytes + separator_bytes + entry_bytes > MAX_CHUNK_BYTES:
+				_queue_current_chunk()
+				separator_bytes = 0
+			_chunk_entry_json.append(entry_text)
+			_chunk_payload_bytes += separator_bytes + entry_bytes
+			_chunk_build_index += 1
+			processed += 1
+		if _chunk_build_index < _entries.size():
+			return
+		if _chunk_entry_json.size() > 0:
+			_queue_current_chunk()
+		_chunk_phase = "writing"
+		return
+	if _chunk_write_index < _pending_chunks.size():
+		var pending = _pending_chunks[_chunk_write_index]
+		var file_name = "chunk-%04d.json" % _chunk_write_index
+		var payload = pending.text.to_utf8()
+		if _write_bytes_immutable(_snapshot_root + "/" + file_name, payload) != "created":
+			_state = "failed"
+			return
+		_chunk_receipts.append({
+			"file_name": file_name,
+			"sha256": _sha256_bytes(payload),
+			"entry_count": pending.entry_count,
+			"byte_count": payload.size(),
+		})
+		_chunk_write_index += 1
+		return
+	_publishing_step = 0
+	_state = "publishing"
+
+
+func _queue_current_chunk():
+	var chunk_text = "[" + PoolStringArray(_chunk_entry_json).join(",") + "]"
+	_pending_chunks.append({"text": chunk_text, "entry_count": _chunk_entry_json.size()})
+	_chunk_entry_json = []
+	_chunk_payload_bytes = 2
+
+
+func _advance_publishing_state():
+	if _publishing_step == 0:
+		_manifest_text = _build_manifest_text()
+		if _write_bytes_immutable(_snapshot_root + "/" + MANIFEST_FILE_NAME, _manifest_text.to_utf8()) != "created":
+			_state = "failed"
+			return
+		_publishing_step = 1
+		return
+	if _publishing_step == 1:
+		var pointer = {
+			"session_id": _session_id,
+			"manifest": _snapshot_namespace + "/" + MANIFEST_FILE_NAME,
+		}
+		if _replace_bytes_atomically(catalog_root + "/" + CURRENT_POINTER_FILE_NAME, to_json(pointer).to_utf8()) != "replaced":
+			_state = "failed"
+			return
+		_publishing_step = 2
+		_state = "published"
+
+
+func _build_manifest_text():
+	var manifest = {
+		"schema_version": CATALOG_SCHEMA_VERSION,
+		"session_id": _session_id,
+		"catalog_revision": _catalog_revision,
+		"catalog_fingerprint": "",
+		"snapshot_at": _snapshot_at,
+		"complete": true,
+		"category_counts": _category_counts,
+		"chunks": _chunk_receipts,
+		"errors": _errors,
+	}
+	manifest.catalog_fingerprint = _catalog_fingerprint(manifest)
+	return to_json(manifest)
+
+
+func _catalog_fingerprint(manifest):
+	var framed = ""
+	framed += _framed_string("schema_version", manifest.schema_version)
+	framed += _framed_string("session_id", manifest.session_id)
+	framed += _framed_integer("catalog_revision", manifest.catalog_revision)
+	framed += _framed_string("snapshot_at", manifest.snapshot_at)
+	framed += _framed_boolean("complete", manifest.complete)
+	for category in CATEGORIES:
+		framed += _framed_integer("category[" + category + "]", manifest.category_counts.get(category, -1))
+	framed += _framed_integer("chunks_count", manifest.chunks.size())
+	for index in range(manifest.chunks.size()):
+		var chunk = manifest.chunks[index]
+		framed += _framed_string("chunk[" + str(index) + "].file_name", chunk.file_name)
+		framed += _framed_string("chunk[" + str(index) + "].sha256", chunk.sha256)
+		framed += _framed_integer("chunk[" + str(index) + "].entry_count", chunk.entry_count)
+		framed += _framed_integer("chunk[" + str(index) + "].byte_count", chunk.byte_count)
+	framed += _framed_integer("errors_count", manifest.errors.size())
+	for index in range(manifest.errors.size()):
+		var error = manifest.errors[index]
+		framed += _framed_string("error[" + str(index) + "].code", error.code)
+		framed += _framed_string("error[" + str(index) + "].message", error.message)
+		framed += _framed_string("error[" + str(index) + "].category", error.category)
+	return _sha256_text(framed)
+
+
+func _framed_string(name, value):
+	if value == null:
+		return name + "=null\n"
+	var text = str(value)
+	return name + "=" + str(text.to_utf8().size()) + ":" + text + "\n"
+
+
+func _framed_integer(name, value):
+	return name + "=" + str(int(value)) + "\n"
+
+
+func _framed_boolean(name, value):
+	return name + "=" + ("true" if value else "false") + "\n"
+
+
+func _create_preview(resource_identity):
+	var texture = _runtime_adapter.load_texture(resource_identity)
+	if texture == null or not texture.has_method("get_data"):
+		return {"ok": false, "message": "The loaded asset is not a readable texture."}
+	var image = texture.get_data().duplicate()
+	if image == null or image.get_width() <= 0 or image.get_height() <= 0:
+		return {"ok": false, "message": "The loaded texture did not expose image data."}
+	if image.get_width() > MAX_PREVIEW_EDGE or image.get_height() > MAX_PREVIEW_EDGE:
+		var scale = min(float(MAX_PREVIEW_EDGE) / float(image.get_width()), float(MAX_PREVIEW_EDGE) / float(image.get_height()))
+		var width = max(1, int(round(float(image.get_width()) * scale)))
+		var height = max(1, int(round(float(image.get_height()) * scale)))
+		image.resize(width, height, Image.INTERPOLATE_LANCZOS)
+	var png = image.save_png_to_buffer()
+	if png.size() <= 0:
+		return {"ok": false, "message": "PNG encoding failed."}
+	if png.size() > MAX_PREVIEW_BYTES:
+		return {"ok": false, "message": "The encoded preview exceeds the 262144-byte limit."}
+	var preview_hash = _sha256_bytes(png)
+	var preview_path = _previews_root() + "/" + preview_hash + ".png"
+	var validation = _validate_existing_preview(preview_path, preview_hash)
+	if validation == "valid":
+		return {"ok": true, "hash": preview_hash}
+	if validation == "invalid":
+		return {"ok": false, "message": "A conflicting content-addressed preview already exists."}
+	if _write_bytes_immutable(preview_path, png) != "created":
+		return {"ok": false, "message": "The bounded preview could not be published."}
+	return {"ok": true, "hash": preview_hash}
+
+
+func _validate_existing_preview(path, expected_hash):
+	var file = File.new()
+	if not file.file_exists(path):
+		return "missing"
+	if file.open(path, File.READ) != OK:
+		return "invalid"
+	if file.get_len() > MAX_PREVIEW_BYTES:
+		file.close()
+		return "invalid"
+	var bytes = file.get_buffer(file.get_len())
+	file.close()
+	return "valid" if _sha256_bytes(bytes) == expected_hash else "invalid"
+
+
+func _safe_pack_metadata(resource_identity):
+	var metadata = _runtime_adapter.get_pack_metadata(resource_identity)
+	if typeof(metadata) != TYPE_DICTIONARY:
+		return {"pack_id": null, "pack_name": null, "keywords": [], "allow_third_party_use": true}
+	return {
+		"pack_id": metadata.get("pack_id", null),
+		"pack_name": metadata.get("pack_name", null),
+		"keywords": metadata.get("keywords", []),
+		"allow_third_party_use": metadata.get("allow_third_party_use", true),
+	}
+
+
+func _canonical_pack_id(value):
+	if value == null:
+		return null
+	var normalized = str(value).strip_edges().to_lower()
+	if normalized.length() == 0:
+		return null
+	# ASCII IDs are already Unicode Form KC; non-ASCII IDs become null because Godot 3 has no NFKC API.
+	for index in range(normalized.length()):
+		if normalized.ord_at(index) > 127:
+			return null
+	return normalized
+
+
+func _pack_id_for_hash(pack_id):
+	return "" if pack_id == null else pack_id
+
+
+func _normalized_tags(raw_keywords):
+	var candidates = []
+	if typeof(raw_keywords) == TYPE_ARRAY or typeof(raw_keywords) == TYPE_STRING_ARRAY:
+		candidates = raw_keywords
+	elif raw_keywords != null:
+		candidates = str(raw_keywords).replace(";", ",").split(",")
+	var tags = []
+	var seen = {}
+	for candidate in candidates:
+		if tags.size() >= 64:
+			break
+		var tag = str(candidate).strip_edges().substr(0, 128)
+		if tag.length() == 0 or seen.has(tag):
+			continue
+		seen[tag] = true
+		tags.append(tag)
+	return tags
+
+
+func _display_name(resource_identity, category):
+	var value = resource_identity.get_file().get_basename().replace("_", " ").replace("-", " ").strip_edges()
+	if value.length() == 0:
+		value = category + " asset"
+	return value.substr(0, 256)
+
+
+func _bounded_nonblank_text(value, maximum_characters):
+	if value == null:
+		return null
+	var text = str(value).strip_edges()
+	if text.length() == 0:
+		return null
+	return text.substr(0, maximum_characters)
+
+
+func _catalog_error(code, message, category):
+	return {"code": code, "message": message, "category": category}
+
+
+func _sha256_text(text):
+	return _sha256_bytes(str(text).to_utf8())
+
+
+func _sha256_bytes(bytes):
+	var context = HashingContext.new()
+	context.start(HashingContext.HASH_SHA256)
+	context.update(bytes)
+	return context.finish().hex_encode()
+
+
+func _write_bytes_immutable(path, bytes):
+	var directory = Directory.new()
+	directory.make_dir_recursive(path.get_base_dir())
+	if directory.file_exists(path):
+		return "existing"
+	var temporary_path = path + "." + str(OS.get_ticks_msec()) + ".tmp"
+	directory.remove(temporary_path)
+	var file = File.new()
+	if file.open(temporary_path, File.WRITE) != OK:
+		return "write_failed"
+	file.store_buffer(bytes)
+	file.flush()
+	file.close()
+	if directory.rename(temporary_path, path) == OK:
+		return "created"
+	directory.remove(temporary_path)
+	return "write_failed"
+
+
+func _replace_bytes_atomically(path, bytes):
+	var directory = Directory.new()
+	directory.make_dir_recursive(path.get_base_dir())
+	var temporary_path = path + "." + str(OS.get_ticks_msec()) + ".next"
+	var backup_path = path + ".previous"
+	directory.remove(temporary_path)
+	directory.remove(backup_path)
+	var file = File.new()
+	if file.open(temporary_path, File.WRITE) != OK:
+		return "write_failed"
+	file.store_buffer(bytes)
+	file.flush()
+	file.close()
+	if directory.rename(temporary_path, path) == OK:
+		return "replaced"
+	if not directory.file_exists(path) or directory.rename(path, backup_path) != OK:
+		directory.remove(temporary_path)
+		return "write_failed"
+	if directory.rename(temporary_path, path) == OK:
+		directory.remove(backup_path)
+		return "replaced"
+	directory.rename(backup_path, path)
+	directory.remove(temporary_path)
+	return "write_failed"
+
+
+func _ensure_catalog_directories():
+	var directory = Directory.new()
+	directory.make_dir_recursive(catalog_root)
+	directory.make_dir_recursive(_snapshots_root())
+	directory.make_dir_recursive(_previews_root())
+
+
+func _snapshots_root():
+	return catalog_root + "/snapshots"
+
+
+func _previews_root():
+	return catalog_root + "/previews"
+
+
+func _is_safe_segment(value):
+	if value.length() == 0 or value.length() > 128 or value == "." or value == "..":
+		return false
+	for index in range(value.length()):
+		var code = value.ord_at(index)
+		if not (code >= 48 and code <= 57) and not (code >= 65 and code <= 90) and not (code >= 97 and code <= 122) and code != 45 and code != 46 and code != 95:
+			return false
+	return true
+
+
+func _utc_wire_timestamp():
+	var current = OS.get_datetime_from_unix_time(OS.get_unix_time())
+	return "%04d-%02d-%02dT%02d:%02d:%02d.0000000+00:00" % [
+		current.year,
+		current.month,
+		current.day,
+		current.hour,
+		current.minute,
+		current.second,
+	]
