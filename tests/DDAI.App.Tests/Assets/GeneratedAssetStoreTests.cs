@@ -1,9 +1,11 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using DDAI.App.Assets;
+using Microsoft.Win32.SafeHandles;
 using SkiaSharp;
 
 namespace DDAI.App.Tests.Assets;
@@ -54,6 +56,52 @@ public sealed class GeneratedAssetStoreTests
         var content = File.ReadAllBytes(sandbox.ContentPath(result.ContentHash));
         Assert.DoesNotContain("tEXt", ReadChunkTypes(content));
         Assert.DoesNotContain("private prompt", Encoding.Latin1.GetString(content), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ImportAsync_NormalizesARealStaticWebpToPng()
+    {
+        using var sandbox = new GeneratedAssetSandbox();
+        var input = CreateWebp(SKColors.Red);
+        Assert.Equal("RIFF", Encoding.ASCII.GetString(input, 0, 4));
+        Assert.Equal("WEBP", Encoding.ASCII.GetString(input, 8, 4));
+
+        var result = await sandbox.Store.ImportAsync(Request("static-webp", input));
+
+        var content = File.ReadAllBytes(sandbox.ContentPath(result.ContentHash));
+        AssertPngDimensions(content, 1, 1);
+        Assert.Equal("\u0089PNG\r\n\u001a\n", Encoding.Latin1.GetString(content, 0, 8));
+        using var output = SKBitmap.Decode(content);
+        AssertColorNear(SKColors.Red, output.GetPixel(0, 0));
+    }
+
+    [Fact]
+    public async Task ImportAsync_StripsExifIccAndXmpWhileApplyingOrientation()
+    {
+        using var sandbox = new GeneratedAssetSandbox();
+        var input = CreateJpegWithExifIccAndXmp(6);
+        var inputText = Encoding.Latin1.GetString(input);
+        Assert.Contains("Exif\0\0", inputText, StringComparison.Ordinal);
+        Assert.Contains("ICC_PROFILE\0", inputText, StringComparison.Ordinal);
+        Assert.Contains("http://ns.adobe.com/xap/1.0/\0", inputText, StringComparison.Ordinal);
+
+        var result = await sandbox.Store.ImportAsync(Request("structured-metadata", input));
+
+        var content = File.ReadAllBytes(sandbox.ContentPath(result.ContentHash));
+        Assert.Equal(32, result.Width);
+        Assert.Equal(64, result.Height);
+        Assert.DoesNotContain("eXIf", ReadChunkTypes(content));
+        Assert.DoesNotContain("iCCP", ReadChunkTypes(content));
+        Assert.DoesNotContain("iTXt", ReadChunkTypes(content));
+        var outputText = Encoding.Latin1.GetString(content);
+        Assert.DoesNotContain("Exif\0\0", outputText, StringComparison.Ordinal);
+        Assert.DoesNotContain("ICC_PROFILE\0", outputText, StringComparison.Ordinal);
+        Assert.DoesNotContain("http://ns.adobe.com/xap/1.0/\0", outputText, StringComparison.Ordinal);
+        using var output = SKBitmap.Decode(content);
+        AssertColorNear(SKColors.Blue, output.GetPixel(2, 2));
+        AssertColorNear(SKColors.Red, output.GetPixel(output.Width - 3, 2));
+        AssertColorNear(SKColors.Yellow, output.GetPixel(2, output.Height - 3));
+        AssertColorNear(SKColors.Lime, output.GetPixel(output.Width - 3, output.Height - 3));
     }
 
     [Fact]
@@ -144,6 +192,21 @@ public sealed class GeneratedAssetStoreTests
     }
 
     [Theory]
+    [InlineData("tab\tname")]
+    [InlineData("carriage\rreturn")]
+    [InlineData("line\nfeed")]
+    [InlineData("unicode\u2028line")]
+    [InlineData("unicode\u2029paragraph")]
+    [InlineData("zero\u200bwidth")]
+    public async Task ImportAsync_RejectsControlledOriginalNamesBeforeWhitespaceNormalization(string name)
+    {
+        using var sandbox = new GeneratedAssetSandbox();
+        var exception = await Assert.ThrowsAsync<GeneratedAssetImportException>(
+            () => sandbox.Store.ImportAsync(Request("controlled-name", CreatePng(1, 1)) with { Name = name }));
+        Assert.Equal("invalid_name", exception.Code);
+    }
+
+    [Theory]
     [InlineData("../escape")]
     [InlineData("folder\\escape")]
     [InlineData("bad\u0001tag")]
@@ -152,6 +215,21 @@ public sealed class GeneratedAssetStoreTests
         using var sandbox = new GeneratedAssetSandbox();
         var exception = await Assert.ThrowsAsync<GeneratedAssetImportException>(
             () => sandbox.Store.ImportAsync(Request("bad-tag", CreatePng(1, 1)) with { Tags = [tag] }));
+        Assert.Equal("invalid_tags", exception.Code);
+    }
+
+    [Theory]
+    [InlineData("tab\ttag")]
+    [InlineData("carriage\rreturn")]
+    [InlineData("line\nfeed")]
+    [InlineData("unicode\u2028line")]
+    [InlineData("unicode\u2029paragraph")]
+    [InlineData("zero\u200bwidth")]
+    public async Task ImportAsync_RejectsControlledOriginalTagsBeforeWhitespaceNormalization(string tag)
+    {
+        using var sandbox = new GeneratedAssetSandbox();
+        var exception = await Assert.ThrowsAsync<GeneratedAssetImportException>(
+            () => sandbox.Store.ImportAsync(Request("controlled-tag", CreatePng(1, 1)) with { Tags = [tag] }));
         Assert.Equal("invalid_tags", exception.Code);
     }
 
@@ -383,6 +461,114 @@ public sealed class GeneratedAssetStoreTests
     }
 
     [Fact]
+    public async Task ImportAsync_RealChildProcessesSerializeExactRetriesAndClassifyKeyConflicts()
+    {
+        using var sandbox = new GeneratedAssetSandbox();
+        var gatePath = Path.Combine(sandbox.Root, "child-start.gate");
+        var children = Enumerable.Range(0, 8)
+            .Select(index => StartChildImport(sandbox.Root, "cross-process-key", 1, gatePath, index.ToString()))
+            .ToArray();
+        try
+        {
+            Assert.True(SpinWait.SpinUntil(
+                () => children.All(child => File.Exists(child.ReadyPath)),
+                TimeSpan.FromSeconds(30)), "The generated-asset child processes did not reach the shared start gate.");
+            File.WriteAllBytes(gatePath, []);
+            var outcomes = await Task.WhenAll(children.Select(CompleteChildImportAsync));
+
+            Assert.All(outcomes, outcome => Assert.True(outcome.Success, outcome.Code));
+            Assert.Single(outcomes, outcome => !outcome.Duplicate);
+            Assert.Equal(7, outcomes.Count(outcome => outcome.Duplicate));
+            Assert.Single(outcomes.Select(outcome => outcome.GeneratedAssetId).Distinct(StringComparer.Ordinal));
+
+            var exactRetry = await CompleteChildImportAsync(StartChildImport(
+                sandbox.Root, "cross-process-key", 1, gatePath, "retry"));
+            Assert.True(exactRetry.Success, exactRetry.Code);
+            Assert.True(exactRetry.Duplicate);
+
+            var conflict = await CompleteChildImportAsync(StartChildImport(
+                sandbox.Root, "cross-process-key", 2, gatePath, "conflict"));
+            Assert.False(conflict.Success);
+            Assert.Equal("request_conflict", conflict.Code);
+        }
+        finally
+        {
+            foreach (var child in children) child.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task ImportAsync_RealChildProcessCrashLeavesAnAbandonedTransactionRecoverable()
+    {
+        using var sandbox = new GeneratedAssetSandbox();
+        var gatePath = Path.Combine(sandbox.Root, "crash-start.gate");
+        File.WriteAllBytes(gatePath, []);
+        using var crashed = StartChildImport(
+            sandbox.Root,
+            "cross-process-crash",
+            1,
+            gatePath,
+            "crash",
+            GeneratedAssetDurableMove.Manifest.ToString());
+
+        var crashResult = await CompleteChildProcessAsync(crashed);
+        Assert.NotEqual(0, crashResult.ExitCode);
+        Assert.Contains("Injected generated-asset child crash after Manifest.", crashResult.StandardError, StringComparison.Ordinal);
+        Assert.False(File.Exists(crashed.ResultPath));
+        Assert.Single(Directory.EnumerateFiles(
+            Path.Combine(sandbox.Root, "generated-assets", "manifest"),
+            "*.json"));
+
+        var recovered = await CompleteChildImportAsync(StartChildImport(
+            sandbox.Root, "cross-process-crash", 1, gatePath, "recover"));
+        var replay = await CompleteChildImportAsync(StartChildImport(
+            sandbox.Root, "cross-process-crash", 1, gatePath, "replay"));
+        Assert.True(recovered.Success, recovered.Code);
+        Assert.True(replay.Success, replay.Code);
+        Assert.Equal(recovered.GeneratedAssetId, replay.GeneratedAssetId);
+        Assert.True(replay.Duplicate);
+        Assert.Empty(Directory.EnumerateFiles(sandbox.Root, "*.next", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public async Task ChildProcessImportEntryPoint()
+    {
+        var root = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_ROOT");
+        if (string.IsNullOrEmpty(root)) return;
+
+        var readyPath = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_READY")
+            ?? throw new InvalidOperationException("The generated-asset child ready path is missing.");
+        var gatePath = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_GATE")
+            ?? throw new InvalidOperationException("The generated-asset child gate path is missing.");
+        var resultPath = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_RESULT")
+            ?? throw new InvalidOperationException("The generated-asset child result path is missing.");
+        var key = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_KEY")
+            ?? throw new InvalidOperationException("The generated-asset child idempotency key is missing.");
+        var gridWidth = int.Parse(
+            Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_GRID") ?? "1",
+            System.Globalization.CultureInfo.InvariantCulture);
+        var crashMove = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_CRASH_MOVE");
+        File.WriteAllBytes(readyPath, []);
+        Assert.True(SpinWait.SpinUntil(() => File.Exists(gatePath), TimeSpan.FromSeconds(30)));
+
+        IGeneratedAssetDurability durability = crashMove is null
+            ? GeneratedAssetDurability.Instance
+            : new FailFastAfterMove(Enum.Parse<GeneratedAssetDurableMove>(crashMove));
+        try
+        {
+            var result = await new GeneratedAssetStore(root, durability).ImportAsync(
+                Request(key, CreatePng(64, 32)) with { GridWidth = gridWidth });
+            File.WriteAllText(resultPath, JsonSerializer.Serialize(new ChildImportOutcome(
+                true, result.Duplicate, result.GeneratedAssetId, null)));
+        }
+        catch (GeneratedAssetImportException exception)
+        {
+            File.WriteAllText(resultPath, JsonSerializer.Serialize(new ChildImportOutcome(
+                false, false, null, exception.Code)));
+        }
+    }
+
+    [Fact]
     public async Task ImportAsync_RejectsAReparsePointAtAnImmutableContentDestination()
     {
         using var sandbox = new GeneratedAssetSandbox();
@@ -483,6 +669,93 @@ public sealed class GeneratedAssetStoreTests
         Assert.Equal("stored_data_conflict", exception.Code);
     }
 
+    [Fact]
+    public async Task ImportAsync_ClassifiesAnExactReceiptCollisionAsAReplay()
+    {
+        var request = Request("exact-receipt-collision", CreatePng(2, 2));
+        byte[] receipt;
+        using (var seed = new GeneratedAssetSandbox())
+        {
+            await seed.Store.ImportAsync(request);
+            receipt = File.ReadAllBytes(seed.ReceiptPath(request.IdempotencyKey));
+        }
+        using var sandbox = new GeneratedAssetSandbox(
+            root => new InsertReceiptAfterManifest(root, request.IdempotencyKey, receipt));
+
+        var result = await sandbox.Store.ImportAsync(request);
+
+        Assert.True(result.Duplicate);
+    }
+
+    [Fact]
+    public async Task ImportAsync_ClassifiesAConflictingReceiptCollisionAsARequestConflict()
+    {
+        var request = Request("conflicting-receipt-collision", CreatePng(2, 2));
+        var conflictingReceipt = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            request_fingerprint = new string('a', 64),
+            result = (object?)null,
+        });
+        using var sandbox = new GeneratedAssetSandbox(
+            root => new InsertReceiptAfterManifest(root, request.IdempotencyKey, conflictingReceipt));
+
+        var exception = await Assert.ThrowsAsync<GeneratedAssetImportException>(() => sandbox.Store.ImportAsync(request));
+
+        Assert.Equal("request_conflict", exception.Code);
+    }
+
+    [Fact]
+    public void GeneratedAssetMutexName_UsesTheGlobalPerUserNamespaceAcrossWindowsSessions()
+    {
+        using var sandbox = new GeneratedAssetSandbox();
+        var mutexMethod = typeof(GeneratedAssetStore).GetMethod(
+            "MutexName",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+
+        var mutexName = Assert.IsType<string>(mutexMethod!.Invoke(null, [Path.Combine(sandbox.Root, "generated-assets")]));
+
+        Assert.StartsWith("Global\\DDAI.GeneratedAssets.", mutexName, StringComparison.Ordinal);
+        Assert.DoesNotContain("Local\\", mutexName, StringComparison.Ordinal);
+        using var first = new Mutex(false, mutexName, out _);
+        using var reopened = Mutex.OpenExisting(mutexName);
+        Assert.True(first.WaitOne(TimeSpan.FromSeconds(1)));
+        first.ReleaseMutex();
+    }
+
+    [Fact]
+    public async Task ImportAsync_FailsClosedWhenAForeignPrincipalOwnsTheGlobalMutexObject()
+    {
+        using var sandbox = new GeneratedAssetSandbox();
+        var mutexMethod = typeof(GeneratedAssetStore).GetMethod(
+            "MutexName",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        var mutexName = Assert.IsType<string>(mutexMethod!.Invoke(null, [Path.Combine(sandbox.Root, "generated-assets")]));
+        using var foreignMutex = CreateMutexWithSddl(
+            mutexName,
+            "D:P(A;;GA;;;S-1-5-21-0-0-0-9999)");
+
+        var exception = await Assert.ThrowsAsync<GeneratedAssetImportException>(
+            () => sandbox.Store.ImportAsync(Request("foreign-mutex", CreatePng(1, 1))));
+
+        Assert.Equal("storage_unavailable", exception.Code);
+    }
+
+    [Fact]
+    public async Task ImportAsync_FailsClosedWhenAPrecreatedGlobalMutexHasAPermissiveDacl()
+    {
+        using var sandbox = new GeneratedAssetSandbox();
+        var mutexMethod = typeof(GeneratedAssetStore).GetMethod(
+            "MutexName",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        var mutexName = Assert.IsType<string>(mutexMethod!.Invoke(null, [Path.Combine(sandbox.Root, "generated-assets")]));
+        using var permissiveMutex = CreateMutexWithSddl(mutexName, "D:P(A;;GA;;;WD)");
+
+        var exception = await Assert.ThrowsAsync<GeneratedAssetImportException>(
+            () => sandbox.Store.ImportAsync(Request("permissive-mutex", CreatePng(1, 1))));
+
+        Assert.Equal("storage_unavailable", exception.Code);
+    }
+
     private static GeneratedAssetImportRequest Request(string key, byte[] content) => new(
         key,
         "Objects",
@@ -566,6 +839,47 @@ public sealed class GeneratedAssetStoreTests
         return [.. jpeg.AsSpan(0, 2), .. exif, .. jpeg.AsSpan(2)];
     }
 
+    private static byte[] CreateJpegWithExifIccAndXmp(int orientation)
+    {
+        var jpeg = CreateJpegWithOrientation(orientation);
+        var iccProfile = CreateSrgbIccProfile();
+        var iccPayload = new byte[14 + iccProfile.Length];
+        Encoding.ASCII.GetBytes("ICC_PROFILE\0").CopyTo(iccPayload, 0);
+        iccPayload[12] = 1;
+        iccPayload[13] = 1;
+        iccProfile.CopyTo(iccPayload, 14);
+        jpeg = AddJpegAppSegment(jpeg, 0xe2, iccPayload);
+
+        var xmpHeader = Encoding.ASCII.GetBytes("http://ns.adobe.com/xap/1.0/\0");
+        var xmpBody = Encoding.UTF8.GetBytes("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"/></x:xmpmeta>");
+        return AddJpegAppSegment(jpeg, 0xe1, [.. xmpHeader, .. xmpBody]);
+    }
+
+    private static byte[] AddJpegAppSegment(byte[] jpeg, byte marker, byte[] payload)
+    {
+        var segment = new byte[payload.Length + 4];
+        segment[0] = 0xff;
+        segment[1] = marker;
+        BinaryPrimitives.WriteUInt16BigEndian(segment.AsSpan(2, 2), checked((ushort)(payload.Length + 2)));
+        payload.CopyTo(segment, 4);
+        return [.. jpeg.AsSpan(0, 2), .. segment, .. jpeg.AsSpan(2)];
+    }
+
+    private static byte[] CreateSrgbIccProfile()
+    {
+        var profilePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.System),
+            "spool",
+            "drivers",
+            "color",
+            "sRGB Color Space Profile.icm");
+        Assert.True(File.Exists(profilePath), "The Windows sRGB ICC fixture is unavailable.");
+        var bytes = File.ReadAllBytes(profilePath);
+        using var verified = SKColorSpaceIccProfile.Create(bytes);
+        Assert.NotNull(verified);
+        return bytes;
+    }
+
     private static byte[] CreateAnimatedWebp()
     {
         var first = ExtractWebpImageChunk(CreateWebp(SKColors.Red));
@@ -621,6 +935,63 @@ public sealed class GeneratedAssetStoreTests
         Assert.InRange(Math.Abs(expected.Blue - actual.Blue), 0, 20);
     }
 
+    private static RunningChildImport StartChildImport(
+        string root,
+        string key,
+        int gridWidth,
+        string gatePath,
+        string suffix,
+        string? crashMove = null)
+    {
+        var testAssembly = typeof(GeneratedAssetStoreTests).Assembly.Location;
+        var resultPath = Path.Combine(root, "child-" + suffix + ".json");
+        var readyPath = Path.Combine(root, "child-" + suffix + ".ready");
+        var startInfo = new ProcessStartInfo("dotnet")
+        {
+            WorkingDirectory = Path.GetDirectoryName(testAssembly)!,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        startInfo.ArgumentList.Add("vstest");
+        startInfo.ArgumentList.Add(testAssembly);
+        startInfo.ArgumentList.Add("--Tests:" + typeof(GeneratedAssetStoreTests).FullName + "." + nameof(ChildProcessImportEntryPoint));
+        startInfo.Environment["DDAI_GENERATED_CHILD_ROOT"] = root;
+        startInfo.Environment["DDAI_GENERATED_CHILD_RESULT"] = resultPath;
+        startInfo.Environment["DDAI_GENERATED_CHILD_READY"] = readyPath;
+        startInfo.Environment["DDAI_GENERATED_CHILD_GATE"] = gatePath;
+        startInfo.Environment["DDAI_GENERATED_CHILD_KEY"] = key;
+        startInfo.Environment["DDAI_GENERATED_CHILD_GRID"] = gridWidth.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (crashMove is not null) startInfo.Environment["DDAI_GENERATED_CHILD_CRASH_MOVE"] = crashMove;
+        var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Could not start the generated-asset child process.");
+        return new RunningChildImport(
+            process,
+            process.StandardOutput.ReadToEndAsync(),
+            process.StandardError.ReadToEndAsync(),
+            resultPath,
+            readyPath);
+    }
+
+    private static async Task<ChildImportOutcome> CompleteChildImportAsync(RunningChildImport child)
+    {
+        using (child)
+        {
+            var result = await CompleteChildProcessAsync(child);
+            Assert.True(result.ExitCode == 0, $"Generated-asset child failed.\nstdout:\n{result.StandardOutput}\nstderr:\n{result.StandardError}");
+            Assert.True(File.Exists(child.ResultPath), "The generated-asset child did not write its result.");
+            return JsonSerializer.Deserialize<ChildImportOutcome>(File.ReadAllText(child.ResultPath))
+                ?? throw new InvalidDataException("The generated-asset child result is invalid.");
+        }
+    }
+
+    private static async Task<ChildProcessResult> CompleteChildProcessAsync(RunningChildImport child)
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        await child.Process.WaitForExitAsync(deadline.Token);
+        return new ChildProcessResult(child.Process.ExitCode, await child.StandardOutput, await child.StandardError);
+    }
+
     private static void CreateDirectoryJunction(string linkPath, string targetPath)
     {
         using var process = Process.Start(new ProcessStartInfo
@@ -633,6 +1004,57 @@ public sealed class GeneratedAssetStoreTests
         process.WaitForExit();
         Assert.True(process.ExitCode == 0 && Directory.Exists(linkPath), "The Windows junction fixture could not be created.");
     }
+
+    private static SafeWaitHandle CreateMutexWithSddl(string name, string sddl)
+    {
+        Assert.True(ConvertStringSecurityDescriptorToSecurityDescriptor(
+            sddl,
+            1,
+            out var descriptor,
+            out _));
+        try
+        {
+            var attributes = new TestSecurityAttributes
+            {
+                Length = Marshal.SizeOf<TestSecurityAttributes>(),
+                SecurityDescriptor = descriptor,
+                InheritHandle = false,
+            };
+            var handle = CreateMutexEx(ref attributes, name, 0, 0x001F0001);
+            Assert.False(handle.IsInvalid);
+            return handle;
+        }
+        finally
+        {
+            _ = LocalFree(descriptor);
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TestSecurityAttributes
+    {
+        public int Length;
+        public IntPtr SecurityDescriptor;
+        [MarshalAs(UnmanagedType.Bool)] public bool InheritHandle;
+    }
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(
+        string stringSecurityDescriptor,
+        uint stringSecurityDescriptorRevision,
+        out IntPtr securityDescriptor,
+        out uint securityDescriptorSize);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeWaitHandle CreateMutexEx(
+        ref TestSecurityAttributes mutexAttributes,
+        string name,
+        uint flags,
+        uint desiredAccess);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
 
     private static IReadOnlyList<string> ReadChunkTypes(byte[] png)
     {
@@ -681,11 +1103,23 @@ public sealed class GeneratedAssetStoreTests
             Store = durability is null ? new GeneratedAssetStore(Root) : new GeneratedAssetStore(Root, durability);
         }
 
+        public GeneratedAssetSandbox(Func<string, IGeneratedAssetDurability> durabilityFactory)
+        {
+            Root = Path.Combine(Path.GetTempPath(), "ddai-generated-asset-tests", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(Root);
+            Store = new GeneratedAssetStore(Root, durabilityFactory(Root));
+        }
+
         public string Root { get; }
         public GeneratedAssetStore Store { get; }
         public string ContentPath(string hash) => Path.Combine(Root, "generated-assets", "content", hash + ".png");
         public string PreviewPath(string hash) => Path.Combine(Root, "generated-assets", "preview", hash + ".png");
         public string ManifestPath(string id) => Path.Combine(Root, "generated-assets", "manifest", id + ".json");
+        public string ReceiptPath(string key) => Path.Combine(
+            Root,
+            "generated-assets",
+            "idempotency",
+            Hash(Encoding.UTF8.GetBytes(key)) + ".json");
 
         public void Dispose()
         {
@@ -706,6 +1140,26 @@ public sealed class GeneratedAssetStoreTests
         }
     }
 
+    private sealed class FailFastAfterMove(GeneratedAssetDurableMove target) : IGeneratedAssetDurability
+    {
+        public void AfterDurableMove(GeneratedAssetDurableMove move)
+        {
+            if (move == target) Environment.FailFast("Injected generated-asset child crash after " + move + ".");
+        }
+    }
+
+    private sealed class InsertReceiptAfterManifest(string root, string key, byte[] bytes) : IGeneratedAssetDurability
+    {
+        private int inserted;
+
+        public void AfterDurableMove(GeneratedAssetDurableMove move)
+        {
+            if (move != GeneratedAssetDurableMove.Manifest || Interlocked.Exchange(ref inserted, 1) != 0) return;
+            var path = Path.Combine(root, "generated-assets", "idempotency", Hash(Encoding.UTF8.GetBytes(key)) + ".json");
+            File.WriteAllBytes(path, bytes);
+        }
+    }
+
     private sealed class SubstituteAfterMove(string root, GeneratedAssetDurableMove target) : IGeneratedAssetDurability
     {
         public void AfterDurableMove(GeneratedAssetDurableMove move)
@@ -718,4 +1172,17 @@ public sealed class GeneratedAssetStoreTests
     }
 
     private sealed class InjectedDurabilityException : IOException;
+
+    private sealed record ChildImportOutcome(bool Success, bool Duplicate, string? GeneratedAssetId, string? Code);
+    private sealed record ChildProcessResult(int ExitCode, string StandardOutput, string StandardError);
+
+    private sealed record RunningChildImport(
+        Process Process,
+        Task<string> StandardOutput,
+        Task<string> StandardError,
+        string ResultPath,
+        string ReadyPath) : IDisposable
+    {
+        public void Dispose() => Process.Dispose();
+    }
 }

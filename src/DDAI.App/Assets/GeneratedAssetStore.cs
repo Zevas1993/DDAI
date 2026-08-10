@@ -1,9 +1,14 @@
 using System.Collections.Concurrent;
+using System.ComponentModel;
 using System.Globalization;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using DDAI.Core.Assets;
+using Microsoft.Win32.SafeHandles;
 using SkiaSharp;
 
 namespace DDAI.App.Assets;
@@ -49,6 +54,7 @@ public sealed class GeneratedAssetStore
 
     private readonly SafeLocalFileSystem fileSystem;
     private readonly SemaphoreSlim gate;
+    private readonly string generatedRoot;
     private readonly string contentRoot;
     private readonly string previewRoot;
     private readonly string manifestRoot;
@@ -71,7 +77,7 @@ public sealed class GeneratedAssetStore
         var normalizedRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dataRoot));
         Directory.CreateDirectory(normalizedRoot);
         fileSystem = new SafeLocalFileSystem(normalizedRoot);
-        fileSystem.EnsureDirectory("generated-assets");
+        generatedRoot = fileSystem.EnsureDirectory("generated-assets");
         contentRoot = fileSystem.EnsureDirectory("generated-assets", "content");
         previewRoot = fileSystem.EnsureDirectory("generated-assets", "preview");
         manifestRoot = fileSystem.EnsureDirectory("generated-assets", "manifest");
@@ -171,32 +177,144 @@ public sealed class GeneratedAssetStore
             canonical.GridHeight,
             "staged");
         var manifestBytes = JsonSerializer.SerializeToUtf8Bytes(manifest, JsonOptions);
-        if (fileSystem.EntryExists(receiptPath))
+        GeneratedAssetMutex mutex;
+        try
         {
-            var receipt = JsonSerializer.Deserialize<IdempotencyReceipt>(
-                fileSystem.ReadBounded(receiptPath, MaximumManifestBytes),
-                JsonOptions) ?? throw Failure("stored_data_invalid", "The idempotency receipt is invalid.");
-            if (!string.Equals(receipt.RequestFingerprint, requestFingerprint, StringComparison.Ordinal))
-            {
-                throw Failure("request_conflict", "The idempotency key belongs to a different normalized import.");
-            }
-            if (receipt.Result != result)
-            {
-                throw Failure("stored_data_conflict", "The idempotency receipt result does not match the normalized import.");
-            }
-            PublishPriorArtifacts(contentHash, content, previewHash, preview, manifestPath, manifestBytes);
-            return result with { Duplicate = true };
+            mutex = CreateGeneratedAssetMutex(generatedRoot);
+        }
+        catch (Exception exception) when (exception is Win32Exception or UnauthorizedAccessException)
+        {
+            // Never fall back to the process-local gate. A foreign or inaccessible global
+            // object would otherwise reopen the cross-process publication race.
+            throw Failure("storage_unavailable", "The generated asset transaction lock is unavailable.", exception);
         }
 
-        var duplicate = fileSystem.EntryExists(manifestPath);
-        PublishPriorArtifacts(contentHash, content, previewHash, preview, manifestPath, manifestBytes);
-        PublishImmutable(
-            receiptPath,
-            JsonSerializer.SerializeToUtf8Bytes(new IdempotencyReceipt(requestFingerprint, result), JsonOptions),
-            MaximumManifestBytes,
-            GeneratedAssetDurableMove.IdempotencyReceipt);
+        using var heldMutex = mutex;
+        var entered = false;
+        try
+        {
+            try { entered = mutex.WaitOne(TimeSpan.FromSeconds(10)); }
+            catch (AbandonedMutexException) { entered = true; }
+            if (!entered)
+            {
+                throw Failure("storage_busy", "The generated asset transaction lock timed out.");
+            }
 
-        return result with { Duplicate = duplicate };
+            if (TryReplayReceipt(
+                    receiptPath,
+                    requestFingerprint,
+                    result,
+                    contentHash,
+                    content,
+                    previewHash,
+                    preview,
+                    manifestPath,
+                    manifestBytes,
+                    out var replay))
+            {
+                return replay;
+            }
+
+            var duplicate = fileSystem.EntryExists(manifestPath);
+            PublishPriorArtifacts(contentHash, content, previewHash, preview, manifestPath, manifestBytes);
+            var receiptBytes = JsonSerializer.SerializeToUtf8Bytes(new IdempotencyReceipt(requestFingerprint, result), JsonOptions);
+            try
+            {
+                var receiptCreated = PublishImmutable(
+                    receiptPath,
+                    receiptBytes,
+                    MaximumManifestBytes,
+                    GeneratedAssetDurableMove.IdempotencyReceipt);
+                if (!receiptCreated && TryReplayReceipt(
+                        receiptPath,
+                        requestFingerprint,
+                        result,
+                        contentHash,
+                        content,
+                        previewHash,
+                        preview,
+                        manifestPath,
+                        manifestBytes,
+                        out replay))
+                {
+                    return replay;
+                }
+            }
+            catch (GeneratedAssetImportException exception) when (exception.Code == "stored_data_conflict")
+            {
+                // A receipt pathname collision must be classified by its canonical request,
+                // not reported as a generic immutable-data conflict.
+                if (TryReplayReceipt(
+                        receiptPath,
+                        requestFingerprint,
+                        result,
+                        contentHash,
+                        content,
+                        previewHash,
+                        preview,
+                        manifestPath,
+                        manifestBytes,
+                        out replay))
+                {
+                    return replay;
+                }
+                throw;
+            }
+
+            return result with { Duplicate = duplicate };
+        }
+        finally
+        {
+            if (entered) mutex.Release();
+        }
+    }
+
+    private bool TryReplayReceipt(
+        string receiptPath,
+        string requestFingerprint,
+        GeneratedAssetImportResult result,
+        string contentHash,
+        byte[] content,
+        string previewHash,
+        byte[] preview,
+        string manifestPath,
+        byte[] manifestBytes,
+        out GeneratedAssetImportResult replay)
+    {
+        replay = default!;
+        if (!fileSystem.EntryExists(receiptPath)) return false;
+
+        IdempotencyReceipt receipt;
+        try
+        {
+            receipt = JsonSerializer.Deserialize<IdempotencyReceipt>(
+                fileSystem.ReadBounded(receiptPath, MaximumManifestBytes),
+                JsonOptions) ?? throw Failure("stored_data_invalid", "The idempotency receipt is invalid.");
+        }
+        catch (JsonException exception)
+        {
+            throw Failure("stored_data_invalid", "The idempotency receipt is invalid.", exception);
+        }
+        if (!IsHash(receipt.RequestFingerprint))
+        {
+            throw Failure("stored_data_invalid", "The idempotency receipt fingerprint is invalid.");
+        }
+        if (!string.Equals(receipt.RequestFingerprint, requestFingerprint, StringComparison.Ordinal))
+        {
+            throw Failure("request_conflict", "The idempotency key belongs to a different normalized import.");
+        }
+        if (receipt.Result is null)
+        {
+            throw Failure("stored_data_invalid", "The idempotency receipt result is missing.");
+        }
+        if (receipt.Result != result)
+        {
+            throw Failure("stored_data_conflict", "The idempotency receipt result does not match the normalized import.");
+        }
+
+        PublishPriorArtifacts(contentHash, content, previewHash, preview, manifestPath, manifestBytes);
+        replay = result with { Duplicate = true };
+        return true;
     }
 
     private void PublishPriorArtifacts(
@@ -234,9 +352,9 @@ public sealed class GeneratedAssetStore
         {
             throw Failure("unsupported_category", "The generated asset category is unsupported.");
         }
-        if (!IsWellFormedUtf16(request.Name))
+        if (!IsWellFormedUtf16(request.Name) || ContainsControlledScalar(request.Name!))
         {
-            throw Failure("invalid_name", "The generated asset name contains invalid Unicode.");
+            throw Failure("invalid_name", "The generated asset name contains invalid or controlled Unicode.");
         }
         var name = NormalizeWhitespace(request.Name);
         if (string.IsNullOrWhiteSpace(name) || CountScalars(name) > 120 || IsPathLikeOrControlledName(name))
@@ -247,9 +365,9 @@ public sealed class GeneratedAssetStore
         {
             throw Failure("invalid_tags", "Generated asset tags are invalid or exceed 32 entries.");
         }
-        if (request.Tags.Any(tag => !IsWellFormedUtf16(tag)))
+        if (request.Tags.Any(tag => !IsWellFormedUtf16(tag) || ContainsControlledScalar(tag!)))
         {
-            throw Failure("invalid_tags", "A generated asset tag contains invalid Unicode.");
+            throw Failure("invalid_tags", "A generated asset tag contains invalid or controlled Unicode.");
         }
         var tags = request.Tags.Select(NormalizeTag).ToArray();
         if (tags.Any(tag => tag.Length == 0 || CountScalars(tag) > 64 || IsPathLikeOrControlled(tag)))
@@ -528,7 +646,7 @@ public sealed class GeneratedAssetStore
         return true;
     }
 
-    private void PublishImmutable(
+    private bool PublishImmutable(
         string destinationPath,
         byte[] bytes,
         int maximumExistingBytes,
@@ -540,7 +658,7 @@ public sealed class GeneratedAssetStore
         if (fileSystem.EntryExists(destinationPath))
         {
             RequireImmutableMatch(destinationPath, bytes, maximumExistingBytes);
-            return;
+            return false;
         }
 
         var stagingPath = Path.Combine(parent, "." + Path.GetFileName(destinationPath) + "." + Guid.NewGuid().ToString("N") + ".next");
@@ -554,13 +672,14 @@ public sealed class GeneratedAssetStore
             catch (IOException) when (fileSystem.EntryExists(destinationPath))
             {
                 RequireImmutableMatch(destinationPath, bytes, maximumExistingBytes);
-                return;
+                return false;
             }
             durability.AfterDurableMove(move);
             // Reopen through SafeLocalFileSystem's validated handle before success. This binds
             // the published pathname to the exact flushed bytes even if the staging pathname
             // was substituted after its original handle closed or the destination was raced.
             RequireImmutableMatch(destinationPath, bytes, maximumExistingBytes);
+            return true;
         }
         finally
         {
@@ -576,8 +695,220 @@ public sealed class GeneratedAssetStore
         }
     }
 
+    private static string MutexName(string generatedRoot)
+    {
+        var userHash = Hash(Encoding.UTF8.GetBytes(CurrentUserSid()));
+        var rootHash = Hash(Encoding.UTF8.GetBytes(Path.GetFullPath(generatedRoot).ToLowerInvariant()));
+        return "Global\\DDAI.GeneratedAssets." + userHash + "." + rootHash;
+    }
+
+    private static GeneratedAssetMutex CreateGeneratedAssetMutex(string generatedRoot)
+    {
+        var sid = CurrentUserSid();
+        var securityDescriptor = IntPtr.Zero;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptor(
+                "D:P(A;;GA;;;SY)(A;;GA;;;" + sid + ")",
+                SecurityDescriptorRevision,
+                out securityDescriptor,
+                out _))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+
+        try
+        {
+            var attributes = new SecurityAttributes
+            {
+                Length = Marshal.SizeOf<SecurityAttributes>(),
+                SecurityDescriptor = securityDescriptor,
+                InheritHandle = false,
+            };
+            var handle = CreateMutexEx(
+                ref attributes,
+                MutexName(generatedRoot),
+                0,
+                ReadControl | Synchronize | MutexModifyState);
+            if (!handle.IsInvalid)
+            {
+                try
+                {
+                    ValidateGeneratedAssetMutexSecurity(handle);
+                    return new GeneratedAssetMutex(handle);
+                }
+                catch
+                {
+                    handle.Dispose();
+                    throw;
+                }
+            }
+
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            var nativeFailure = new Win32Exception(error);
+            if (error == ErrorAccessDenied)
+            {
+                throw new UnauthorizedAccessException(
+                    "The global generated-asset mutex is owned by another principal.",
+                    nativeFailure);
+            }
+            throw nativeFailure;
+        }
+        finally
+        {
+            _ = LocalFree(securityDescriptor);
+        }
+    }
+
+    private static string CurrentUserSid() => WindowsIdentity.GetCurrent().User?.Value
+        ?? throw new UnauthorizedAccessException("The current Windows user has no security identifier.");
+
+    private static void ValidateGeneratedAssetMutexSecurity(SafeWaitHandle handle)
+    {
+        var error = GetSecurityInfo(
+            handle,
+            SeKernelObject,
+            OwnerSecurityInformation | DaclSecurityInformation,
+            out _,
+            out _,
+            out _,
+            out _,
+            out var securityDescriptor);
+        if (error != 0) throw new Win32Exception(checked((int)error));
+
+        try
+        {
+            var length = GetSecurityDescriptorLength(securityDescriptor);
+            if (length == 0) throw new UnauthorizedAccessException("The global generated-asset mutex has no security descriptor.");
+            var bytes = new byte[checked((int)length)];
+            Marshal.Copy(securityDescriptor, bytes, 0, bytes.Length);
+            var descriptor = new RawSecurityDescriptor(bytes, 0);
+            using var identity = WindowsIdentity.GetCurrent();
+            var currentUser = identity.User
+                ?? throw new UnauthorizedAccessException("The current Windows user has no security identifier.");
+            var expectedOwner = identity.Owner ?? currentUser;
+            var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            if (descriptor.Owner is null ||
+                (!descriptor.Owner.Equals(expectedOwner) &&
+                 !descriptor.Owner.Equals(currentUser) &&
+                 !descriptor.Owner.Equals(system)))
+            {
+                throw new UnauthorizedAccessException("The global generated-asset mutex has an unexpected owner.");
+            }
+            if ((descriptor.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0 ||
+                descriptor.DiscretionaryAcl is null)
+            {
+                throw new UnauthorizedAccessException("The global generated-asset mutex DACL is not protected.");
+            }
+
+            var requiredPrincipals = new HashSet<string>(StringComparer.Ordinal)
+            {
+                currentUser.Value,
+                system.Value,
+            };
+            var observedPrincipals = new HashSet<string>(StringComparer.Ordinal);
+            foreach (GenericAce ace in descriptor.DiscretionaryAcl)
+            {
+                if (ace is not CommonAce common ||
+                    common.AceQualifier != AceQualifier.AccessAllowed ||
+                    common.AceFlags != AceFlags.None ||
+                    common.SecurityIdentifier is null ||
+                    !requiredPrincipals.Contains(common.SecurityIdentifier.Value) ||
+                    !GrantsMutexAllAccess(common.AccessMask))
+                {
+                    throw new UnauthorizedAccessException("The global generated-asset mutex DACL is not restricted to the current user and SYSTEM.");
+                }
+                observedPrincipals.Add(common.SecurityIdentifier.Value);
+            }
+            if (!observedPrincipals.SetEquals(requiredPrincipals))
+            {
+                throw new UnauthorizedAccessException("The global generated-asset mutex DACL is missing a required principal.");
+            }
+        }
+        finally
+        {
+            _ = LocalFree(securityDescriptor);
+        }
+    }
+
+    private static bool GrantsMutexAllAccess(int accessMask) =>
+        (accessMask & GenericAll) != 0 || (accessMask & MutexAllAccess) == MutexAllAccess;
+
+    private const uint SecurityDescriptorRevision = 1;
+    private const uint MutexModifyState = 0x0001;
+    private const uint ReadControl = 0x00020000;
+    private const uint Synchronize = 0x00100000;
+    private const int MutexAllAccess = 0x001F0001;
+    private const int GenericAll = 0x10000000;
+    private const int ErrorAccessDenied = 5;
+    private const int SeKernelObject = 6;
+    private const uint OwnerSecurityInformation = 0x00000001;
+    private const uint DaclSecurityInformation = 0x00000004;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SecurityAttributes
+    {
+        public int Length;
+        public IntPtr SecurityDescriptor;
+        [MarshalAs(UnmanagedType.Bool)] public bool InheritHandle;
+    }
+
+    private sealed class GeneratedAssetMutex : WaitHandle
+    {
+        private readonly SafeWaitHandle ownedHandle;
+
+        public GeneratedAssetMutex(SafeWaitHandle handle)
+        {
+            SafeWaitHandle = handle;
+            ownedHandle = handle;
+        }
+
+        public void Release()
+        {
+            if (!ReleaseMutexNative(ownedHandle)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(
+        string stringSecurityDescriptor,
+        uint stringSecurityDescriptorRevision,
+        out IntPtr securityDescriptor,
+        out uint securityDescriptorSize);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeWaitHandle CreateMutexEx(
+        ref SecurityAttributes mutexAttributes,
+        string name,
+        uint flags,
+        uint desiredAccess);
+
+    [DllImport("kernel32.dll", EntryPoint = "ReleaseMutex", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ReleaseMutexNative(SafeWaitHandle mutex);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern uint GetSecurityInfo(
+        SafeWaitHandle handle,
+        int objectType,
+        uint securityInfo,
+        out IntPtr owner,
+        out IntPtr group,
+        out IntPtr dacl,
+        out IntPtr sacl,
+        out IntPtr securityDescriptor);
+
+    [DllImport("advapi32.dll")]
+    private static extern uint GetSecurityDescriptorLength(IntPtr securityDescriptor);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
+
     private static string Hash(ReadOnlySpan<byte> bytes) =>
         Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+
+    private static bool IsHash(string? value) => value is not null && value.Length == 64 &&
+        value.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f');
 
     private static GeneratedAssetImportException Failure(string code, string message, Exception? innerException = null) =>
         new(code, message, innerException);
