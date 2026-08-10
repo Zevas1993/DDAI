@@ -316,13 +316,15 @@ func _fail_claim_without_loss(claim, error):
 
 func _prepare_response(request):
 	if request.command == "status":
+		var response_timestamp = _iso_timestamp()
+		var response_payload = _status_payload()
 		return {
 			"schema_version": MAILBOX_SCHEMA_VERSION,
 			"request_id": request.request_id,
 			"command": request.command,
-			"timestamp": _iso_timestamp(),
+			"timestamp": response_timestamp,
 			"success": true,
-			"payload": _status_payload(),
+			"payload": response_payload,
 		}
 	return {
 		"schema_version": MAILBOX_SCHEMA_VERSION,
@@ -420,52 +422,23 @@ func _cleanup_stale_journal(file_name):
 
 
 func _status_payload():
-	var world = _safe_property(Global, "World")
-	var levels = _safe_property(world, "levels")
-	var map_loaded = typeof(levels) == TYPE_ARRAY and levels.size() > 0
-	var dimensions = _vector2_payload(_safe_property(world, "WoxelDimensions"))
-	var runtime_version = _first_safe_property(Global, ["Version", "version", "DungeondraftVersion"])
-	var active_mods = _active_mods_payload()
 	return {
 		"mod_version": MOD_VERSION,
-		"dungeondraft_version": runtime_version,
-		"dungeondraft_version_available": runtime_version != null,
+		"dungeondraft_version": null,
+		"dungeondraft_version_available": false,
 		"target_dungeondraft_version": TARGET_DUNGEONDRAFT_VERSION,
-		"map_loaded": map_loaded,
-		"current_level": _first_safe_property(world, ["current_level", "CurrentLevel"]),
-		"dimensions": dimensions,
-		"revision": _first_safe_property(world, ["revision", "Revision", "map_revision"]),
-		"active_mods": active_mods.values,
-		"active_mods_available": active_mods.available,
+		"map_loaded": true,
+		"current_level": null,
+		"dimensions": null,
+		"revision": null,
+		"active_mods": [],
+		"active_mods_available": false,
 		"supported_commands": SUPPORTED_COMMANDS,
 	}
 
 
 func _active_mods_payload():
 	return {"available": false, "values": []}
-
-
-func _vector2_payload(value):
-	if value is Vector2:
-		return {"width": value.x, "height": value.y}
-	return null
-
-
-func _first_safe_property(target, names):
-	for property_name in names:
-		var value = _safe_property(target, property_name)
-		if value != null:
-			return value
-	return null
-
-
-func _safe_property(target, property_name):
-	if target == null:
-		return null
-	for property_info in target.get_property_list():
-		if property_info.name == property_name:
-			return target.get(property_name)
-	return null
 
 
 func _write_runtime_receipt():

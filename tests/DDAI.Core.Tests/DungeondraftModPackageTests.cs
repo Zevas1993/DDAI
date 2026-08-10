@@ -91,6 +91,22 @@ public sealed class DungeondraftModPackageTests
     }
 
     [Fact]
+    public void Gdscript_StatusPayloadDoesNotReflectOverDungeondraftRuntimeObjects()
+    {
+        var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
+        var statusPayload = FunctionBody(script, "_status_payload");
+
+        Assert.DoesNotContain("Global", statusPayload, StringComparison.Ordinal);
+        Assert.DoesNotContain("World", statusPayload, StringComparison.Ordinal);
+        Assert.DoesNotContain("_safe_property", statusPayload, StringComparison.Ordinal);
+        Assert.DoesNotContain("_first_safe_property", statusPayload, StringComparison.Ordinal);
+        Assert.DoesNotContain("get_property_list", statusPayload, StringComparison.Ordinal);
+        Assert.Contains("\"map_loaded\": true", statusPayload, StringComparison.Ordinal);
+        Assert.Contains("\"dungeondraft_version_available\": false", statusPayload, StringComparison.Ordinal);
+        Assert.Contains("\"active_mods_available\": false", statusPayload, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Gdscript_TimestampValidatorEnforcesCanonicalWireLanguageAndUtcBounds()
     {
         var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
