@@ -18,6 +18,12 @@ public sealed class DungeondraftModPackageTests
         Assert.Contains("runtime-receipt-slot-0.json", bridge, StringComparison.Ordinal);
         Assert.Contains("runtime-receipt-slot-1.json", bridge, StringComparison.Ordinal);
         Assert.Contains("func _replace_json_recoverably(", bridge, StringComparison.Ordinal);
+        var receiptWriter = FunctionBody(bridge, "_write_runtime_receipt");
+        Assert.Contains("slot_result", receiptWriter, StringComparison.Ordinal);
+        Assert.Contains("if slot_result != \"replaced\"", receiptWriter, StringComparison.Ordinal);
+        Assert.True(
+            receiptWriter.IndexOf("if slot_result != \"replaced\"", StringComparison.Ordinal) <
+            receiptWriter.IndexOf("runtime-receipt.json", StringComparison.Ordinal));
     }
 
     [Fact]

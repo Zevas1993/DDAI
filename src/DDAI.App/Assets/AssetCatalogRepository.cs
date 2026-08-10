@@ -125,40 +125,52 @@ public sealed class AssetCatalogRepository
 
     private AcceptedAssetCatalog ReadSnapshot()
     {
+        var validPointers = InspectPointers()
+            .Where(pointer => pointer.Catalog is not null)
+            .Select(pointer => pointer.Catalog!)
+            .ToArray();
+        EnsureNoRevisionConflict(validPointers);
+        return validPointers
+            .OrderByDescending(candidate => candidate.Manifest.CatalogRevision)
+            .FirstOrDefault()
+            ?? throw new InvalidDataException("No complete recoverable catalog pointer is available.");
+    }
+
+    internal IReadOnlyList<CatalogPointerInspection> InspectPointers()
+    {
         RequireExistingOrdinaryDirectory(catalogRoot, "Catalog root");
         RequireExistingOrdinaryDirectory(snapshotsRoot, "Snapshots directory");
 
-        AcceptedAssetCatalog? newest = null;
-        foreach (var pointerPath in new[]
+        var inspections = new List<CatalogPointerInspection>();
+        foreach (var pointer in new[]
                  {
-                     Path.Combine(catalogRoot, "current.json"),
-                     Path.Combine(catalogRoot, "current-slot-0.json"),
-                     Path.Combine(catalogRoot, "current-slot-1.json"),
+                     new CatalogPointerLocation(-1, Path.Combine(catalogRoot, "current.json")),
+                     new CatalogPointerLocation(0, Path.Combine(catalogRoot, "current-slot-0.json")),
+                     new CatalogPointerLocation(1, Path.Combine(catalogRoot, "current-slot-1.json")),
                  })
         {
-            AcceptedAssetCatalog candidate;
             try
             {
-                candidate = ReadSnapshot(pointerPath);
+                inspections.Add(new CatalogPointerInspection(pointer.SlotIndex, ReadSnapshot(pointer.Path)));
             }
             catch (Exception exception) when (IsRecoverableCatalogFailure(exception))
             {
-                // Another pointer or slot can remain reader-visible while Godot replaces this one.
-                continue;
+                inspections.Add(new CatalogPointerInspection(pointer.SlotIndex, null));
             }
+        }
 
-            if (newest is null || candidate.Manifest.CatalogRevision > newest.Manifest.CatalogRevision)
-            {
-                newest = candidate;
-            }
-            else if (candidate.Manifest.CatalogRevision == newest.Manifest.CatalogRevision &&
-                     !string.Equals(candidate.Manifest.CatalogFingerprint, newest.Manifest.CatalogFingerprint, StringComparison.Ordinal))
+        return inspections;
+    }
+
+    internal static void EnsureNoRevisionConflict(IEnumerable<AcceptedAssetCatalog> candidates)
+    {
+        foreach (var revision in candidates.GroupBy(candidate => candidate.Manifest.CatalogRevision))
+        {
+            if (revision.Select(candidate => candidate.Manifest.CatalogFingerprint).Distinct(StringComparer.Ordinal).Skip(1).Any())
             {
                 throw new InvalidDataException("Catalog pointers conflict at the same revision.");
             }
         }
-
-        return newest ?? throw new InvalidDataException("No complete recoverable catalog pointer is available.");
     }
 
     private AcceptedAssetCatalog ReadSnapshot(string pointerPath)
@@ -807,6 +819,8 @@ public sealed class AssetCatalogRepository
 
     private readonly record struct PngPass(int Width, int Height);
 
+    private readonly record struct CatalogPointerLocation(int SlotIndex, string Path);
+
     private enum FileInfoByHandleClass
     {
         FileAttributeTagInfo = 9,
@@ -844,3 +858,5 @@ public sealed class AssetCatalogRepository
         uint pathLength,
         uint flags);
 }
+
+internal sealed record CatalogPointerInspection(int SlotIndex, AcceptedAssetCatalog? Catalog);

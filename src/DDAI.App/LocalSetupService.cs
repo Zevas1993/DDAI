@@ -17,6 +17,11 @@ public sealed record LocalSetupPaths(
 {
     public string InstalledExecutable => Path.Combine(Path.GetFullPath(InstallRoot), "ddai.exe");
     public string MetadataPath => Path.Combine(Path.GetFullPath(InstallRoot), "install-metadata.json");
+    public string AssetHelperReceiptPath => Path.Combine(
+        Path.GetFullPath(DungeondraftUserDataDirectory),
+        "ddai",
+        "private",
+        "asset-helper.json");
     public string InstalledModDirectory => Path.Combine(Path.GetFullPath(ModsDirectory), "DDAI");
     public string DungeondraftConfigPath =>
         Path.Combine(Path.GetFullPath(DungeondraftUserDataDirectory), "config.ini");
@@ -134,6 +139,7 @@ public sealed class LocalSetupService
         }
 
         var connectorState = InstallConnector(paths);
+        WriteAssetHelperReceipt(paths);
         var modState = InstallMod(paths);
         var configs = ClientConfigMerger.Setup(paths.ConfigTargets, paths.InstalledExecutable, timeProvider);
         if (configPlan is not null)
@@ -332,6 +338,8 @@ public sealed class LocalSetupService
         {
             Directory.Delete(paths.InstalledModDirectory, recursive: true);
         }
+
+        DeleteOwnedAssetHelperReceipt(paths);
 
         var isRunningInstalledExecutable = !string.IsNullOrWhiteSpace(currentExecutablePath) &&
             Path.GetFullPath(currentExecutablePath).Equals(
@@ -668,6 +676,67 @@ public sealed class LocalSetupService
         }
     }
 
+    private static void WriteAssetHelperReceipt(LocalSetupPaths paths)
+    {
+        var receiptPath = paths.AssetHelperReceiptPath;
+        Directory.CreateDirectory(Path.GetDirectoryName(receiptPath)!);
+        if (File.Exists(receiptPath))
+        {
+            AssetHelperReceipt? existing;
+            try
+            {
+                existing = JsonSerializer.Deserialize<AssetHelperReceipt>(File.ReadAllBytes(receiptPath), JsonOptions);
+            }
+            catch (Exception exception) when (exception is JsonException or IOException or UnauthorizedAccessException)
+            {
+                throw new LocalSetupException("Refusing to replace invalid asset-helper ownership metadata.", exception);
+            }
+
+            if (existing is null || existing.Owner != Owner ||
+                !Path.GetFullPath(existing.ExecutablePath).Equals(Path.GetFullPath(paths.InstalledExecutable), StringComparison.OrdinalIgnoreCase))
+            {
+                throw new LocalSetupException("Refusing to replace foreign asset-helper ownership metadata.");
+            }
+        }
+
+        WriteJsonAtomically(
+            receiptPath,
+            new AssetHelperReceipt(
+                "1.0",
+                Owner,
+                Path.GetFullPath(paths.InstalledExecutable),
+                HashFile(paths.InstalledExecutable)));
+    }
+
+    private static void DeleteOwnedAssetHelperReceipt(LocalSetupPaths paths)
+    {
+        if (!File.Exists(paths.AssetHelperReceiptPath))
+        {
+            return;
+        }
+
+        try
+        {
+            var receipt = JsonSerializer.Deserialize<AssetHelperReceipt>(
+                File.ReadAllBytes(paths.AssetHelperReceiptPath),
+                JsonOptions);
+            if (receipt is not null && receipt.Owner == Owner &&
+                Path.GetFullPath(receipt.ExecutablePath).Equals(Path.GetFullPath(paths.InstalledExecutable), StringComparison.OrdinalIgnoreCase))
+            {
+                File.Delete(paths.AssetHelperReceiptPath);
+            }
+        }
+        catch (Exception exception) when (exception is JsonException or IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+        }
+    }
+
+    private static string HashFile(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+    }
+
     private void WriteInstallMetadata(
         LocalSetupPaths paths,
         DungeondraftConfigOwnership? ownership,
@@ -737,4 +806,10 @@ public sealed class LocalSetupService
         DateTimeOffset InstalledAt,
         DungeondraftConfigOwnership? DungeondraftConfig = null,
         IReadOnlyList<DungeondraftModConsolidationReceipt>? ConsolidatedMods = null);
+
+    private sealed record AssetHelperReceipt(
+        string SchemaVersion,
+        string Owner,
+        string ExecutablePath,
+        string Sha256);
 }

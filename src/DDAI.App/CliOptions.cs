@@ -7,6 +7,7 @@ public enum DdaiCommand
     Setup,
     Diagnose,
     Uninstall,
+    AssetHelper,
 }
 
 public sealed record CliOptions(
@@ -41,7 +42,7 @@ public static class CliParser
     {
         if (args.Count == 0)
         {
-            throw new CliUsageException("A command is required: serve, status, setup, diagnose, or uninstall.");
+            throw new CliUsageException("A command is required: serve, status, setup, diagnose, uninstall, or asset-helper.");
         }
 
         var command = args[0] switch
@@ -51,6 +52,7 @@ public static class CliParser
             "setup" => DdaiCommand.Setup,
             "diagnose" => DdaiCommand.Diagnose,
             "uninstall" => DdaiCommand.Uninstall,
+            "asset-helper" => DdaiCommand.AssetHelper,
             _ => throw new CliUsageException($"Unknown command: {args[0]}"),
         };
 
@@ -74,6 +76,11 @@ public static class CliParser
 
         for (var index = 1; index < args.Count; index++)
         {
+            if (command == DdaiCommand.AssetHelper && args[index] != "--mailbox-root")
+            {
+                throw new CliUsageException("asset-helper accepts only --mailbox-root.");
+            }
+
             switch (args[index])
             {
                 case "--stdio":

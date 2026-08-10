@@ -1,5 +1,6 @@
 using System.Text.Json;
 using DDAI.Core.Mailbox;
+using DDAI.App.Assets;
 
 namespace DDAI.App;
 
@@ -34,6 +35,12 @@ public sealed class CliApplication(
                     timeProvider).GetStatusAsync(options.Timeout, cancellationToken);
                 await WriteJsonAsync(status);
                 return status.Success ? 0 : 2;
+            }
+
+            if (options.Command == DdaiCommand.AssetHelper)
+            {
+                new AssetHelperService(options.MailboxRoot, timeProvider).RunOnce();
+                return 0;
             }
 
             var setupService = processProbe is null

@@ -20,6 +20,11 @@ const MAX_ERROR_RECORDS = 128
 const MAX_ERROR_CODE_BYTES = 64
 const MAX_ERROR_MESSAGE_BYTES = 512
 const MAX_NORMALIZATION_BYTES = 4096
+const HELPER_RECEIPT_PATH = "user://ddai/private/asset-helper.json"
+const HELPER_HASH_BYTES_PER_TICK = 65536
+const HELPER_LAUNCH_INTERVAL_MSEC = 2000
+const HELPER_MAX_LAUNCH_ATTEMPTS = 3
+const HELPER_RESPONSE_DEADLINE_MSEC = 10000
 
 const CATEGORIES = [
 	"Terrain",
@@ -63,6 +68,17 @@ var _errors = []
 var _suppressed_error_count = 0
 var _preview_work = null
 var _normalization_request_pending = null
+var _normalization_active_request_id = ""
+var _pack_normalization_values = {}
+var _pack_normalization_failures = {}
+var _publication_request_pending = null
+var _publication_request_id = ""
+var _publication_slot_index = -1
+var _helper_verification_started = false
+var _helper_ready = false
+var _helper_launch_attempts = 0
+var _helper_launch_started_at = 0
+var _helper_last_launch_at = 0
 var _chunk_build_index = 0
 var _chunk_entry_json = []
 var _chunk_payload_bytes = 2
@@ -77,6 +93,11 @@ var _last_update_file_publications = 0
 
 
 class LiveRuntimeAdapter:
+	var _helper_executable_path = ""
+	var _helper_file = null
+	var _helper_hash = null
+	var _helper_expected_hash = ""
+
 	func read_runtime_receipt():
 		var newest = null
 		for path in [RUNTIME_RECEIPT_PATH] + RUNTIME_RECEIPT_SLOT_PATHS:
@@ -122,6 +143,77 @@ class LiveRuntimeAdapter:
 			return null
 		return parsed.result
 
+	func begin_helper_verification():
+		var receipt_file = File.new()
+		if not receipt_file.file_exists(HELPER_RECEIPT_PATH) or receipt_file.open(HELPER_RECEIPT_PATH, File.READ) != OK:
+			return false
+		if receipt_file.get_len() > MAX_NORMALIZATION_BYTES:
+			receipt_file.close()
+			return false
+		var parsed = JSON.parse(receipt_file.get_as_text())
+		receipt_file.close()
+		if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+			return false
+		var receipt = parsed.result
+		var fixed_path = (OS.get_environment("LOCALAPPDATA") + "/DDAI/ddai.exe").replace("\\", "/")
+		var receipt_path = str(receipt.get("executable_path", "")).replace("\\", "/")
+		var expected_hash = str(receipt.get("sha256", ""))
+		if receipt.get("schema_version", "") != CATALOG_SCHEMA_VERSION or receipt.get("owner", "") != "org.ddai.connector":
+			return false
+		if receipt_path.to_lower() != fixed_path.to_lower() or not _is_sha256_value(expected_hash):
+			return false
+		_helper_file = File.new()
+		if _helper_file.open(receipt_path, File.READ) != OK:
+			_helper_file = null
+			return false
+		_helper_hash = HashingContext.new()
+		if _helper_hash.start(HashingContext.HASH_SHA256) != OK:
+			_helper_file.close()
+			_helper_file = null
+			return false
+		_helper_executable_path = receipt_path
+		_helper_expected_hash = expected_hash
+		return true
+
+	func advance_helper_verification():
+		if _helper_file == null or _helper_hash == null:
+			return {"status": "failed"}
+		var remaining = _helper_file.get_len() - _helper_file.get_position()
+		if remaining > 0:
+			var bytes = _helper_file.get_buffer(min(HELPER_HASH_BYTES_PER_TICK, remaining))
+			if bytes.size() <= 0 or _helper_hash.update(bytes) != OK:
+				_helper_file.close()
+				_helper_file = null
+				return {"status": "failed"}
+			return {"status": "pending"}
+		_helper_file.close()
+		_helper_file = null
+		var actual_hash = _helper_hash.finish().hex_encode()
+		_helper_hash = null
+		return {"status": "ready" if actual_hash == _helper_expected_hash else "failed"}
+
+	func launch_asset_helper(mailbox_path):
+		if _helper_executable_path.length() == 0:
+			return false
+		var mailbox_root = ProjectSettings.globalize_path(mailbox_path)
+		var pid = OS.execute(
+			_helper_executable_path,
+			["asset-helper", "--mailbox-root", mailbox_root],
+			false,
+			[],
+			false,
+			false)
+		return pid >= 0
+
+	func _is_sha256_value(value):
+		if value.length() != 64:
+			return false
+		for index in range(value.length()):
+			var code = value.ord_at(index)
+			if not (code >= 48 and code <= 57) and not (code >= 97 and code <= 102):
+				return false
+		return true
+
 	func get_asset_list(category):
 		return Script.GetAssetList(category)
 
@@ -165,6 +257,12 @@ func update(_delta):
 	_last_update_file_publications = 0
 	if _state == "waiting_for_receipt":
 		_advance_waiting_for_receipt_state()
+	elif _state == "helper_verification":
+		_advance_helper_verification_state()
+	elif _state == "requesting_publication_advice":
+		_advance_publication_advice_request_state()
+	elif _state == "waiting_publication_advice":
+		_advance_waiting_publication_advice_state()
 	elif _state == "enumerating":
 		_advance_enumerating_state()
 	elif _state == "previewing":
@@ -209,21 +307,114 @@ func _advance_waiting_for_receipt_state():
 	if not _is_safe_segment(candidate_session):
 		return
 	_session_id = candidate_session
-	_catalog_revision = int(OS.get_unix_time()) * 1000 + int(OS.get_ticks_msec() % 1000)
-	_snapshot_at = _utc_wire_timestamp()
-	_snapshot_namespace = _session_id + "-" + str(_catalog_revision)
-	_snapshot_root = _snapshots_root() + "/" + _snapshot_namespace
-	var directory = Directory.new()
-	while directory.dir_exists(_snapshot_root):
-		_catalog_revision += 1
-		_snapshot_namespace = _session_id + "-" + str(_catalog_revision)
-		_snapshot_root = _snapshots_root() + "/" + _snapshot_namespace
-	if directory.make_dir_recursive(_snapshot_root) != OK:
+	_state = "helper_verification"
+
+
+func _advance_helper_verification_state():
+	if not _helper_verification_started:
+		_helper_verification_started = true
+		if not _runtime_adapter.begin_helper_verification():
+			_record_error("asset_helper_unavailable", "The owned local asset helper receipt or executable could not be verified.", null)
+			_state = "failed"
+		return
+	var result = _runtime_adapter.advance_helper_verification()
+	if typeof(result) != TYPE_DICTIONARY or result.get("status", "failed") == "failed":
+		_record_error("asset_helper_unavailable", "The owned local asset helper hash did not verify.", null)
 		_state = "failed"
 		return
-	for category in CATEGORIES:
-		_category_counts[category] = 0
-	_state = "enumerating"
+	if result.get("status", "") != "ready":
+		return
+	_helper_ready = true
+	_publication_request_id = _sha256_text("catalog-publication\n" + _session_id)
+	_publication_request_pending = {
+		"path": _catalog_publication_root() + "/requests/" + _publication_request_id + ".json",
+		"payload": {
+			"schema_version": CATALOG_SCHEMA_VERSION,
+			"request_id": _publication_request_id,
+			"wall_clock_revision": int(OS.get_unix_time()) * 1000,
+		},
+	}
+	_state = "requesting_publication_advice"
+
+
+func _advance_publication_advice_request_state():
+	var result = _write_bytes_immutable(
+		_publication_request_pending.path,
+		to_json(_publication_request_pending.payload).to_utf8())
+	if result != "created" and result != "existing":
+		_record_error("catalog_advice_unavailable", "The private catalog publication request could not be written.", null)
+		_state = "failed"
+		return
+	_publication_request_pending = null
+	_reset_helper_launch_window()
+	_state = "waiting_publication_advice"
+
+
+func _advance_waiting_publication_advice_state():
+	var response = {"ok": false}
+	if not _private_request_is_pending(_catalog_publication_root(), _publication_request_id):
+		response = _read_publication_advice_response()
+	if response.ok:
+		if not response.success:
+			_record_error(response.error_code, "Existing catalog pointers conflict or cannot advance safely.", null)
+			_state = "failed"
+			return
+		_catalog_revision = response.catalog_revision
+		_publication_slot_index = response.slot_index
+		_snapshot_at = _utc_wire_timestamp()
+		_snapshot_namespace = _session_id + "-" + str(_catalog_revision)
+		_snapshot_root = _snapshots_root() + "/" + _snapshot_namespace
+		var directory = Directory.new()
+		if directory.dir_exists(_snapshot_root) or directory.make_dir_recursive(_snapshot_root) != OK:
+			_record_error("catalog_snapshot_conflict", "The advised immutable snapshot namespace is unavailable.", null)
+			_state = "failed"
+			return
+		for category in CATEGORIES:
+			_category_counts[category] = 0
+		_state = "enumerating"
+		return
+	if _advance_helper_launch_window():
+		return
+	_record_error("catalog_advice_unavailable", "The owned local helper did not return bounded publication advice.", null)
+	_state = "failed"
+
+
+func _read_publication_advice_response():
+	var path = _catalog_publication_root() + "/responses/" + _publication_request_id + ".json"
+	var parsed = _read_bounded_dictionary(path, MAX_NORMALIZATION_BYTES)
+	if parsed == null or parsed.get("schema_version", "") != CATALOG_SCHEMA_VERSION or parsed.get("request_id", "") != _publication_request_id:
+		return {"ok": false}
+	if typeof(parsed.get("success", null)) != TYPE_BOOL:
+		return {"ok": false}
+	if not parsed.success:
+		var error_code = str(parsed.get("error_code", "catalog_pointer_conflict"))
+		return {"ok": true, "success": false, "error_code": error_code}
+	if not _is_json_nonnegative_integer(parsed.get("catalog_revision", null)):
+		return {"ok": false}
+	if not _is_json_nonnegative_integer(parsed.get("slot_index", null)) or not [0, 1].has(int(parsed.slot_index)):
+		return {"ok": false}
+	return {
+		"ok": true,
+		"success": true,
+		"catalog_revision": int(parsed.catalog_revision),
+		"slot_index": int(parsed.slot_index),
+	}
+
+
+func _reset_helper_launch_window():
+	_helper_launch_attempts = 0
+	_helper_launch_started_at = OS.get_ticks_msec()
+	_helper_last_launch_at = _helper_launch_started_at - HELPER_LAUNCH_INTERVAL_MSEC
+
+
+func _advance_helper_launch_window():
+	var now = OS.get_ticks_msec()
+	if _helper_launch_attempts < HELPER_MAX_LAUNCH_ATTEMPTS and now - _helper_last_launch_at >= HELPER_LAUNCH_INTERVAL_MSEC:
+		_helper_last_launch_at = now
+		_helper_launch_attempts += 1
+		_runtime_adapter.launch_asset_helper(catalog_root.get_base_dir())
+		return true
+	return _helper_launch_attempts < HELPER_MAX_LAUNCH_ATTEMPTS or now - _helper_launch_started_at < HELPER_RESPONSE_DEADLINE_MSEC
 
 
 func _advance_enumerating_state():
@@ -283,6 +474,11 @@ func _advance_previewing_state():
 	var pack_id_result = _resolve_pack_id(pack_metadata.pack_id)
 	if not pack_id_result.ok:
 		return
+	if pack_id_result.has("error_code"):
+		_record_error(
+			pack_id_result.error_code,
+			"A pack identifier could not be normalized by the verified local helper; the asset remains available without pack metadata.",
+			category)
 	var pack_id = pack_id_result.value
 	var resource_fingerprint = _sha256_text(resource_identity)
 	var asset_ref = "sha256:" + _sha256_text(_pack_id_for_hash(pack_id) + "\n" + category + "\n" + resource_identity)
@@ -425,7 +621,7 @@ func _advance_publishing_state():
 			"manifest": _snapshot_namespace + "/" + MANIFEST_FILE_NAME,
 			"catalog_revision": _catalog_revision,
 		}
-		var slot_name = CURRENT_SLOT_FILE_NAMES[_select_current_slot()]
+		var slot_name = CURRENT_SLOT_FILE_NAMES[_publication_slot_index]
 		if _replace_bytes_recoverably(catalog_root + "/" + slot_name, to_json(slot_pointer).to_utf8()) != "replaced":
 			_state = "failed"
 			return
@@ -568,9 +764,15 @@ func _resolve_pack_id(value):
 		var normalized_ascii = raw_value.strip_edges().to_lower()
 		return {"ok": true, "value": null if normalized_ascii.length() == 0 else normalized_ascii}
 	var request_id = _sha256_text(raw_value)
-	var response = _read_pack_normalization_response(request_id)
-	if response.ok:
-		return {"ok": true, "value": response.value}
+	if _pack_normalization_values.has(request_id):
+		return {"ok": true, "value": _pack_normalization_values[request_id]}
+	if _pack_normalization_failures.has(request_id):
+		return {
+			"ok": true,
+			"value": null,
+			"error_code": "pack_normalization_unavailable",
+		}
+	_normalization_active_request_id = request_id
 	var request_path = _pack_normalization_root() + "/requests/" + request_id + ".json"
 	var directory = Directory.new()
 	if not directory.file_exists(request_path):
@@ -582,7 +784,7 @@ func _resolve_pack_id(value):
 				"value": raw_value,
 			},
 		}
-		_state = "normalizing_pack_id"
+	_state = "normalizing_pack_id"
 	return {"ok": false}
 
 
@@ -591,29 +793,41 @@ func _advance_pack_normalization_state():
 		var pending = _normalization_request_pending
 		var result = _write_bytes_immutable(pending.path, to_json(pending.payload).to_utf8())
 		if result != "created" and result != "existing":
-			_state = "failed"
+			_pack_normalization_failures[_normalization_active_request_id] = true
+			_normalization_request_pending = null
+			_normalization_active_request_id = ""
+			_state = "previewing"
 			return
 		_normalization_request_pending = null
+		_reset_helper_launch_window()
+		return
+	var response = {"ok": false}
+	if not _private_request_is_pending(_pack_normalization_root(), _normalization_active_request_id):
+		response = _read_pack_normalization_response(_normalization_active_request_id)
+	if response.ok:
+		_pack_normalization_values[_normalization_active_request_id] = response.value
+		_normalization_active_request_id = ""
+		_state = "previewing"
+		return
+	if _advance_helper_launch_window():
+		return
+	_pack_normalization_failures[_normalization_active_request_id] = true
+	_normalization_active_request_id = ""
 	_state = "previewing"
 
 
 func _read_pack_normalization_response(request_id):
 	var path = _pack_normalization_root() + "/responses/" + request_id + ".json"
-	var file = File.new()
-	if not file.file_exists(path) or file.open(path, File.READ) != OK:
+	var response = _read_bounded_dictionary(path, MAX_NORMALIZATION_BYTES)
+	if response == null:
 		return {"ok": false}
-	if file.get_len() > MAX_NORMALIZATION_BYTES:
-		file.close()
-		return {"ok": false}
-	var text = file.get_as_text()
-	file.close()
-	var parsed = JSON.parse(text)
-	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
-		return {"ok": false}
-	var response = parsed.result
 	if response.get("schema_version", "") != CATALOG_SCHEMA_VERSION or response.get("request_id", "") != request_id:
 		return {"ok": false}
-	var normalized = response.get("normalized_pack_id", null)
+	if not response.has("normalized_pack_id"):
+		return {"ok": false}
+	var normalized = response.normalized_pack_id
+	if normalized == null:
+		return {"ok": true, "value": null}
 	if typeof(normalized) != TYPE_STRING or normalized.strip_edges().length() == 0:
 		return {"ok": false}
 	return {"ok": true, "value": normalized}
@@ -690,21 +904,6 @@ func _bounded_utf8_text(value, maximum_bytes, fallback):
 	return fallback if text.length() == 0 else text
 
 
-func _select_current_slot():
-	var revisions = [-1, -1]
-	for index in range(CURRENT_SLOT_FILE_NAMES.size()):
-		var path = catalog_root + "/" + CURRENT_SLOT_FILE_NAMES[index]
-		var file = File.new()
-		if not file.file_exists(path) or file.open(path, File.READ) != OK:
-			return index
-		if file.get_len() <= MAX_NORMALIZATION_BYTES:
-			var parsed = JSON.parse(file.get_as_text())
-			if parsed.error == OK and typeof(parsed.result) == TYPE_DICTIONARY:
-				revisions[index] = int(parsed.result.get("catalog_revision", -1))
-		file.close()
-	return 0 if revisions[0] <= revisions[1] else 1
-
-
 func _sha256_text(text):
 	return _sha256_bytes(str(text).to_utf8())
 
@@ -771,6 +970,32 @@ func _previews_root():
 
 func _pack_normalization_root():
 	return catalog_root.get_base_dir() + "/private/pack-normalization"
+
+
+func _catalog_publication_root():
+	return catalog_root.get_base_dir() + "/private/catalog-publication"
+
+
+func _read_bounded_dictionary(path, maximum_bytes):
+	var file = File.new()
+	if not file.file_exists(path) or file.open(path, File.READ) != OK:
+		return null
+	if file.get_len() > maximum_bytes:
+		file.close()
+		return null
+	var parsed = JSON.parse(file.get_as_text())
+	file.close()
+	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+		return null
+	return parsed.result
+
+
+func _private_request_is_pending(private_root, request_id):
+	return Directory.new().file_exists(private_root + "/requests/" + request_id + ".json")
+
+
+func _is_json_nonnegative_integer(value):
+	return typeof(value) == TYPE_REAL and not is_nan(value) and not is_inf(value) and value >= 0.0 and value <= 9007199254740991.0 and value == floor(value)
 
 
 func _is_safe_segment(value):

@@ -9,6 +9,7 @@ namespace DDAI.App.Assets;
 public sealed class AssetPackNormalizationService
 {
     public const int MaximumRequestsPerPass = 8;
+    private const int MaximumDirectoryCandidates = 256;
     private const int MaximumRequestBytes = 4096;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -17,120 +18,133 @@ public sealed class AssetPackNormalizationService
         WriteIndented = false,
     };
 
+    private readonly SafeLocalFileSystem fileSystem;
     private readonly string requestsRoot;
     private readonly string responsesRoot;
+    private readonly string quarantineRoot;
 
     public AssetPackNormalizationService(string mailboxRoot)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(mailboxRoot);
-        var privateRoot = Path.Combine(Path.GetFullPath(mailboxRoot), "private", "pack-normalization");
-        requestsRoot = Path.Combine(privateRoot, "requests");
-        responsesRoot = Path.Combine(privateRoot, "responses");
-        Directory.CreateDirectory(requestsRoot);
-        Directory.CreateDirectory(responsesRoot);
+        fileSystem = new SafeLocalFileSystem(Path.GetFullPath(mailboxRoot));
+        fileSystem.EnsureDirectory("private", "pack-normalization");
+        requestsRoot = fileSystem.EnsureDirectory("private", "pack-normalization", "requests");
+        responsesRoot = fileSystem.EnsureDirectory("private", "pack-normalization", "responses");
+        quarantineRoot = fileSystem.EnsureDirectory("private", "pack-normalization", "quarantine");
     }
 
     public int ProcessPending()
     {
         var processed = 0;
-        foreach (var requestPath in Directory.EnumerateFiles(requestsRoot, "*.json", SearchOption.TopDirectoryOnly)
-                     .Order(StringComparer.Ordinal)
+        foreach (var requestPath in fileSystem
+                     .EnumerateFiles(requestsRoot, "*.json", MaximumDirectoryCandidates)
                      .Take(MaximumRequestsPerPass))
         {
-            try
+            if (ProcessOne(requestPath))
             {
-                var request = JsonSerializer.Deserialize<NormalizationRequest>(ReadBounded(requestPath), JsonOptions)
-                    ?? throw new JsonException("Pack normalization request cannot be null.");
-                var expectedId = Hash(request.Value);
-                if (!string.Equals(request.SchemaVersion, "1.0", StringComparison.Ordinal) ||
-                    !string.Equals(request.RequestId, expectedId, StringComparison.Ordinal) ||
-                    !string.Equals(Path.GetFileNameWithoutExtension(requestPath), expectedId, StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                var normalized = AssetReference.NormalizePackId(request.Value);
-                if (string.IsNullOrWhiteSpace(normalized))
-                {
-                    continue;
-                }
-
-                var responsePath = Path.Combine(responsesRoot, expectedId + ".json");
-                var response = new NormalizationResponse("1.0", expectedId, normalized);
-                if (!File.Exists(responsePath))
-                {
-                    WriteImmutable(responsePath, response);
-                }
-                else
-                {
-                    var existing = JsonSerializer.Deserialize<NormalizationResponse>(ReadBounded(responsePath), JsonOptions);
-                    if (existing != response)
-                    {
-                        continue;
-                    }
-                }
-
-                File.Delete(requestPath);
                 processed++;
-            }
-            catch (Exception exception) when (exception is IOException
-                or UnauthorizedAccessException
-                or JsonException
-                or InvalidDataException
-                or ArgumentException
-                or NotSupportedException
-                or PathTooLongException)
-            {
-                // A malformed private request cannot terminate the MCP host or block other bounded work.
             }
         }
 
         return processed;
     }
 
-    private static byte[] ReadBounded(string path)
+    private bool ProcessOne(string requestPath)
     {
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        if (stream.Length > MaximumRequestBytes)
-        {
-            throw new InvalidDataException("Pack normalization data exceeds its byte limit.");
-        }
-
-        var bytes = new byte[checked((int)stream.Length)];
-        stream.ReadExactly(bytes);
-        return bytes;
-    }
-
-    private static void WriteImmutable<T>(string destinationPath, T value)
-    {
-        var temporaryPath = Path.Combine(
-            Path.GetDirectoryName(destinationPath)!,
-            "." + Path.GetFileName(destinationPath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        NormalizationRequest request;
         try
         {
-            using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            request = JsonSerializer.Deserialize<NormalizationRequest>(
+                    fileSystem.ReadBounded(requestPath, MaximumRequestBytes),
+                    JsonOptions)
+                ?? throw new JsonException("Pack normalization request cannot be null.");
+            var expectedId = Hash(request.Value);
+            if (!string.Equals(request.SchemaVersion, "1.0", StringComparison.Ordinal) ||
+                !string.Equals(request.RequestId, expectedId, StringComparison.Ordinal) ||
+                !string.Equals(Path.GetFileNameWithoutExtension(requestPath), expectedId, StringComparison.Ordinal))
             {
-                JsonSerializer.Serialize(stream, value, JsonOptions);
-                stream.Flush(flushToDisk: true);
+                throw new InvalidDataException("Pack normalization request identity is invalid.");
+            }
+        }
+        catch (Exception exception) when (IsPrivateDataFailure(exception))
+        {
+            return QuarantineRequest(requestPath);
+        }
+
+        var normalized = AssetReference.NormalizePackId(request.Value);
+        var responsePath = Path.Combine(responsesRoot, request.RequestId + ".json");
+        var response = new NormalizationResponse(
+            "1.0",
+            request.RequestId,
+            normalized.Length == 0 ? null : normalized);
+        if (File.Exists(responsePath))
+        {
+            try
+            {
+                var existing = JsonSerializer.Deserialize<NormalizationResponse>(
+                    fileSystem.ReadBounded(responsePath, MaximumRequestBytes),
+                    JsonOptions);
+                if (existing == response)
+                {
+                    fileSystem.DeleteOrdinaryOrLink(requestPath);
+                    return true;
+                }
+            }
+            catch (Exception exception) when (IsPrivateDataFailure(exception))
+            {
             }
 
-            File.Move(temporaryPath, destinationPath, overwrite: false);
-        }
-        finally
-        {
-            if (File.Exists(temporaryPath))
+            try
             {
-                File.Delete(temporaryPath);
+                fileSystem.QuarantineOrdinaryOrDeleteLink(responsePath, quarantineRoot);
+            }
+            catch (Exception exception) when (IsPrivateDataFailure(exception))
+            {
+                return false;
             }
         }
+
+        try
+        {
+            fileSystem.WriteImmutable(responsePath, response, JsonOptions);
+            fileSystem.DeleteOrdinaryOrLink(requestPath);
+            return true;
+        }
+        catch (Exception exception) when (IsPrivateDataFailure(exception))
+        {
+            return false;
+        }
     }
+
+    private bool QuarantineRequest(string requestPath)
+    {
+        try
+        {
+            fileSystem.QuarantineOrdinaryOrDeleteLink(requestPath, quarantineRoot);
+            return true;
+        }
+        catch (Exception exception) when (IsPrivateDataFailure(exception))
+        {
+            return false;
+        }
+    }
+
+    internal static bool IsPrivateDataFailure(Exception exception) => exception is IOException
+        or UnauthorizedAccessException
+        or JsonException
+        or InvalidDataException
+        or ArgumentException
+        or NotSupportedException
+        or PathTooLongException
+        or CryptographicException
+        or System.ComponentModel.Win32Exception;
 
     private static string Hash(string value) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
 
     private sealed record NormalizationRequest(string SchemaVersion, string RequestId, string Value);
 
-    private sealed record NormalizationResponse(string SchemaVersion, string RequestId, string NormalizedPackId);
+    private sealed record NormalizationResponse(string SchemaVersion, string RequestId, string? NormalizedPackId);
 }
 
 public sealed class AssetPackNormalizationWorker(AssetPackNormalizationService service) : BackgroundService

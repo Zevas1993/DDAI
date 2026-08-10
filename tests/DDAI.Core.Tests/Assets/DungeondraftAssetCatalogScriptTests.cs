@@ -108,6 +108,20 @@ public sealed class DungeondraftAssetCatalogScriptTests
         Assert.Contains("+ \"/requests/\"", script, StringComparison.Ordinal);
         Assert.Contains("+ \"/responses/\"", script, StringComparison.Ordinal);
         Assert.DoesNotContain("non-ASCII IDs become null", script, StringComparison.Ordinal);
+        Assert.Contains("helper_verification", script, StringComparison.Ordinal);
+        Assert.Contains("waiting_publication_advice", script, StringComparison.Ordinal);
+        Assert.Contains("asset-helper", script, StringComparison.Ordinal);
+        Assert.Contains("OS.execute", script, StringComparison.Ordinal);
+        Assert.Contains("HELPER_LAUNCH_INTERVAL_MSEC", script, StringComparison.Ordinal);
+        Assert.Contains("HELPER_MAX_LAUNCH_ATTEMPTS", script, StringComparison.Ordinal);
+        Assert.Contains("pack_normalization_unavailable", script, StringComparison.Ordinal);
+        Assert.Contains("response.has(\"normalized_pack_id\")", script, StringComparison.Ordinal);
+        Assert.Contains("_pack_normalization_values", script, StringComparison.Ordinal);
+        Assert.Contains("_private_request_is_pending", script, StringComparison.Ordinal);
+        Assert.Contains("if not _private_request_is_pending(_catalog_publication_root(), _publication_request_id)", script, StringComparison.Ordinal);
+        Assert.Contains("if not _private_request_is_pending(_pack_normalization_root(), _normalization_active_request_id)", script, StringComparison.Ordinal);
+        Assert.Contains("_publication_slot_index", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("func _select_current_slot", script, StringComparison.Ordinal);
     }
 
     private static string ReadCatalogScript() => File.ReadAllText(

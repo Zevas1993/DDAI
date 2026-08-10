@@ -1,12 +1,41 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Security.Cryptography;
 using DDAI.App;
 
 namespace DDAI.App.Tests;
 
 public sealed class SetupLifecycleTests
 {
+    [Fact]
+    public void SetupRepairAndUninstall_ManageOwnedAssetHelperReceipt()
+    {
+        using var sandbox = new LifecycleSandbox();
+        File.WriteAllText(sandbox.ClaudePath, "{}");
+        File.WriteAllText(sandbox.GeminiPath, "{}");
+        var service = new LocalSetupService(new FixedTimeProvider(), new StubProcessProbe(false));
+        var receiptPath = Path.Combine(sandbox.UserDataDirectory, "ddai", "private", "asset-helper.json");
+
+        _ = service.Setup(sandbox.Paths);
+
+        using (var receipt = JsonDocument.Parse(File.ReadAllText(receiptPath)))
+        {
+            Assert.Equal("1.0", receipt.RootElement.GetProperty("schema_version").GetString());
+            Assert.Equal(Path.GetFullPath(sandbox.Paths.InstalledExecutable), receipt.RootElement.GetProperty("executable_path").GetString());
+            Assert.Equal(
+                Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(sandbox.Paths.InstalledExecutable))).ToLowerInvariant(),
+                receipt.RootElement.GetProperty("sha256").GetString());
+        }
+
+        File.Delete(receiptPath);
+        _ = service.Setup(sandbox.Paths);
+        Assert.True(File.Exists(receiptPath));
+
+        _ = service.Uninstall(sandbox.Paths, sandbox.SourceExecutable);
+        Assert.False(File.Exists(receiptPath));
+    }
+
     [Fact]
     public void Parse_AcceptsAllIsolatedSetupPathOverridesAndDefaultsToCustomPerUserModsRoot()
     {

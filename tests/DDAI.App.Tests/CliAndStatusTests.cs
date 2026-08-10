@@ -1,4 +1,6 @@
 using System.Text.Json;
+using System.Security.Cryptography;
+using System.Text;
 using DDAI.App;
 using DDAI.Core.Mailbox;
 
@@ -22,6 +24,45 @@ public sealed class CliAndStatusTests
         Assert.Equal(DdaiCommand.Setup, CliParser.Parse(["setup"]).Command);
         Assert.Equal(DdaiCommand.Diagnose, CliParser.Parse(["diagnose"]).Command);
         Assert.Equal(DdaiCommand.Uninstall, CliParser.Parse(["uninstall"]).Command);
+        Assert.Equal(DdaiCommand.AssetHelper, CliParser.Parse(["asset-helper", "--mailbox-root", root]).Command);
+    }
+
+    [Fact]
+    public async Task AssetHelper_ProcessesNormalizationWithoutMcpHost()
+    {
+        using var sandbox = new TestDirectory();
+        const string value = " Pack Café ";
+        var requestId = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+        var requests = Path.Combine(sandbox.Path, "private", "pack-normalization", "requests");
+        Directory.CreateDirectory(requests);
+        File.WriteAllText(
+            Path.Combine(requests, requestId + ".json"),
+            JsonSerializer.Serialize(new { schema_version = "1.0", request_id = requestId, value }));
+        using var stdout = new StringWriter();
+        using var stderr = new StringWriter();
+
+        var exitCode = await new CliApplication(stdout, stderr, TimeProvider.System)
+            .RunAsync(["asset-helper", "--mailbox-root", sandbox.Path]);
+
+        Assert.Equal(0, exitCode);
+        using var response = JsonDocument.Parse(File.ReadAllText(
+            Path.Combine(sandbox.Path, "private", "pack-normalization", "responses", requestId + ".json")));
+        Assert.Equal("pack café", response.RootElement.GetProperty("normalized_pack_id").GetString());
+        Assert.Equal(string.Empty, stderr.ToString());
+    }
+
+    [Theory]
+    [InlineData("--stdio")]
+    [InlineData("--json")]
+    [InlineData("--timeout-ms")]
+    public void AssetHelper_RejectsNonFixedOptions(string option)
+    {
+        using var sandbox = new TestDirectory();
+        var arguments = option == "--timeout-ms"
+            ? new[] { "asset-helper", "--mailbox-root", sandbox.Path, option, "1" }
+            : new[] { "asset-helper", "--mailbox-root", sandbox.Path, option };
+
+        Assert.Throws<CliUsageException>(() => CliParser.Parse(arguments));
     }
 
     [Theory]

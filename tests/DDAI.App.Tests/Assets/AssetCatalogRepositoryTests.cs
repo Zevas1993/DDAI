@@ -11,6 +11,114 @@ namespace DDAI.App.Tests.Assets;
 public sealed class AssetCatalogRepositoryTests
 {
     [Fact]
+    public void PublicationAdvice_OverwritesInvalidHighRevisionSlotInsteadOfSoleValidSlot()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete();
+        File.Copy(sandbox.CurrentPath, Path.Combine(sandbox.Root, "current-slot-0.json"));
+        File.WriteAllText(
+            Path.Combine(sandbox.Root, "current-slot-1.json"),
+            JsonSerializer.Serialize(new
+            {
+                session_id = "attacker",
+                manifest = "../escape/manifest.json",
+                catalog_revision = long.MaxValue,
+            }));
+
+        var advice = new AssetCatalogPublicationAdvisor(sandbox.Root, sandbox.TimeProvider)
+            .InspectForPublication(0);
+
+        Assert.True(advice.Success);
+        Assert.Equal(1, advice.SlotIndex);
+        Assert.Equal(2, advice.CatalogRevision);
+    }
+
+    [Fact]
+    public void PublicationAdvice_IsMonotonicWhenWallClockMovesBackward()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete();
+        File.Copy(sandbox.CurrentPath, Path.Combine(sandbox.Root, "current-slot-0.json"));
+
+        var advice = new AssetCatalogPublicationAdvisor(sandbox.Root, sandbox.TimeProvider)
+            .InspectForPublication(0);
+
+        Assert.True(advice.Success);
+        Assert.Equal(2, advice.CatalogRevision);
+        Assert.Equal(1, advice.SlotIndex);
+    }
+
+    [Fact]
+    public void PublicationAdvice_UsesDeterministicSlotForIdenticalValidTies()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete();
+        File.Copy(sandbox.CurrentPath, Path.Combine(sandbox.Root, "current-slot-0.json"));
+        File.Copy(sandbox.CurrentPath, Path.Combine(sandbox.Root, "current-slot-1.json"));
+
+        var advice = new AssetCatalogPublicationAdvisor(sandbox.Root, sandbox.TimeProvider)
+            .InspectForPublication(1);
+
+        Assert.True(advice.Success);
+        Assert.Equal(0, advice.SlotIndex);
+        Assert.Equal(2, advice.CatalogRevision);
+    }
+
+    [Fact]
+    public void PublicationAdvice_RejectsValidFingerprintConflictAtSameRevision()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete();
+        File.Copy(sandbox.CurrentPath, Path.Combine(sandbox.Root, "current-slot-0.json"));
+        sandbox.PublishConflictingSlotAtSameRevision();
+
+        var advice = new AssetCatalogPublicationAdvisor(sandbox.Root, sandbox.TimeProvider)
+            .InspectForPublication(2);
+
+        Assert.False(advice.Success);
+        Assert.Equal("catalog_pointer_conflict", advice.ErrorCode);
+    }
+
+    [Fact]
+    public void PublicationAdvice_RejectsRevisionExhaustionInsteadOfWrapping()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete();
+        sandbox.PublishCompleteRevision(revision: 9_007_199_254_740_991L);
+        File.Copy(sandbox.CurrentPath, Path.Combine(sandbox.Root, "current-slot-0.json"));
+
+        var advice = new AssetCatalogPublicationAdvisor(sandbox.Root, sandbox.TimeProvider)
+            .InspectForPublication(0);
+
+        Assert.False(advice.Success);
+        Assert.Equal("catalog_revision_exhausted", advice.ErrorCode);
+    }
+
+    [Fact]
+    public void PublicationAdviceService_WritesBoundedPrivateResponseAndDeletesDurableRequest()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete();
+        File.Copy(sandbox.CurrentPath, Path.Combine(sandbox.Root, "current-slot-0.json"));
+        const string requestId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        var requests = Path.Combine(sandbox.MailboxRoot, "private", "catalog-publication", "requests");
+        Directory.CreateDirectory(requests);
+        var requestPath = Path.Combine(requests, requestId + ".json");
+        File.WriteAllText(
+            requestPath,
+            JsonSerializer.Serialize(new { schema_version = "1.0", request_id = requestId, wall_clock_revision = 0 }));
+
+        var processed = new AssetCatalogPublicationAdviceService(sandbox.MailboxRoot, sandbox.TimeProvider)
+            .ProcessPending();
+
+        Assert.Equal(1, processed);
+        Assert.False(File.Exists(requestPath));
+        using var response = JsonDocument.Parse(File.ReadAllText(Path.Combine(
+            sandbox.MailboxRoot,
+            "private",
+            "catalog-publication",
+            "responses",
+            requestId + ".json")));
+        Assert.True(response.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal(2, response.RootElement.GetProperty("catalog_revision").GetInt64());
+        Assert.Equal(1, response.RootElement.GetProperty("slot_index").GetInt32());
+    }
+
+    [Fact]
     public void TryRefresh_PromotesOnlyACompleteHashVerifiedSnapshot()
     {
         using var sandbox = CatalogSandbox.CreateComplete();
@@ -359,7 +467,8 @@ public sealed class AssetCatalogRepositoryTests
 
         private CatalogSandbox(DateTimeOffset snapshotAt)
         {
-            Root = Path.Combine(Path.GetTempPath(), "ddai-asset-catalog-tests", Guid.NewGuid().ToString("N"));
+            MailboxRoot = Path.Combine(Path.GetTempPath(), "ddai-asset-catalog-tests", Guid.NewGuid().ToString("N"));
+            Root = Path.Combine(MailboxRoot, "catalog");
             SnapshotsPath = Path.Combine(Root, "snapshots");
             PreviewsPath = Path.Combine(Root, "previews");
             Directory.CreateDirectory(SnapshotsPath);
@@ -369,6 +478,7 @@ public sealed class AssetCatalogRepositoryTests
         }
 
         public string Root { get; }
+        public string MailboxRoot { get; }
         public string SnapshotsPath { get; }
         public string PreviewsPath { get; }
         public FixedTimeProvider TimeProvider { get; }
@@ -501,9 +611,9 @@ public sealed class AssetCatalogRepositoryTests
 
         public void Dispose()
         {
-            if (Directory.Exists(Root))
+            if (Directory.Exists(MailboxRoot))
             {
-                Directory.Delete(Root, recursive: true);
+                Directory.Delete(MailboxRoot, recursive: true);
             }
         }
 

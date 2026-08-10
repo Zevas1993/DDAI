@@ -867,7 +867,9 @@ func _write_runtime_receipt():
 	}
 	_write_json_atomically(MAILBOX_ROOT + "/runtime-receipts/" + _session_id + ".json", receipt)
 	var slot_path = RUNTIME_RECEIPT_SLOT_PATHS[_select_runtime_receipt_slot()]
-	_replace_json_recoverably(slot_path, receipt)
+	var slot_result = _replace_json_recoverably(slot_path, receipt)
+	if slot_result != "replaced":
+		return slot_result
 	_replace_json_recoverably("user://ddai/runtime-receipt.json", receipt)
 
 
@@ -919,7 +921,7 @@ func _replace_json_recoverably(destination_path, payload):
 
 
 func _select_runtime_receipt_slot():
-	var timestamps = ["", ""]
+	var receipts = [null, null]
 	for index in range(RUNTIME_RECEIPT_SLOT_PATHS.size()):
 		var path = RUNTIME_RECEIPT_SLOT_PATHS[index]
 		var directory = Directory.new()
@@ -931,8 +933,31 @@ func _select_runtime_receipt_slot():
 		var parsed = JSON.parse(read_result.text)
 		if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
 			return index
-		timestamps[index] = str(parsed.result.get("timestamp", ""))
-	return 0 if timestamps[0] <= timestamps[1] else 1
+		if typeof(parsed.result.get("session_id", null)) != TYPE_STRING or typeof(parsed.result.get("timestamp", null)) != TYPE_STRING:
+			return index
+		receipts[index] = parsed.result
+	return 1 if _runtime_receipt_is_newer(receipts[0], receipts[1]) else 0
+
+
+func _runtime_receipt_is_newer(candidate, current):
+	var candidate_timestamp = str(candidate.get("timestamp", ""))
+	var current_timestamp = str(current.get("timestamp", ""))
+	if candidate_timestamp != current_timestamp:
+		return candidate_timestamp > current_timestamp
+	var candidate_parts = _runtime_session_sequence(str(candidate.get("session_id", "")))
+	var current_parts = _runtime_session_sequence(str(current.get("session_id", "")))
+	if candidate_parts[0] != current_parts[0]:
+		return candidate_parts[0] > current_parts[0]
+	if candidate_parts[1] != current_parts[1]:
+		return candidate_parts[1] > current_parts[1]
+	return str(candidate.get("session_id", "")) > str(current.get("session_id", ""))
+
+
+func _runtime_session_sequence(value):
+	var parts = value.split("-", false)
+	if parts.size() != 2 or not str(parts[0]).is_valid_integer() or not str(parts[1]).is_valid_integer():
+		return [-1, -1]
+	return [int(parts[0]), int(parts[1])]
 
 
 func _write_text_atomically(destination_path, text):
