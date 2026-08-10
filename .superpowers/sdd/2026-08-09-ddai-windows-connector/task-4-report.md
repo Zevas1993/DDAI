@@ -3,7 +3,8 @@
 ## Scope and commit
 
 - Base commit: `487ff5b`.
-- Delivery commit: this Task 4 commit; use `git log -1 --oneline` for the final immutable hash reported in the handoff.
+- Initial delivery commit: `680125156a034da444ad5361d7c389298c32275d`.
+- Independent-review fixes: this follow-up commit; use the immutable hash reported in the handoff.
 - Preserved unrelated working-tree changes: `.gitignore`, `task-3-report.md`, `.claude/`, `AGENTS.md`, and `CLAUDE.md`.
 - Added a `net9.0-windows` console application published as a self-contained Windows x64 single-file executable.
 - Pinned the official stable `ModelContextProtocol` package to `1.4.1`; no prerelease MCP package is referenced.
@@ -15,6 +16,24 @@
 3. MCP protocol RED: the official SDK client launched the published executable, but initialization failed with exit code `64` and `serve is not implemented yet.` GREEN: the same test published one `ddai.exe`, initialized over stdio, listed `ddai_status`, called it through a live fake mod using the real mailbox, and parsed the returned `ready` payload.
 4. Setup lifecycle RED: setup initially copied `ddai.exe` before discovering a foreign same-named mod target. GREEN: preflight now rejects that target before any install/config mutation; the foreign manifest remains byte-identical.
 5. Setup lifecycle GREEN: six tests cover explicit path overrides, the `%LOCALAPPDATA%\DDAI\DungeondraftMods` default, owned executable/metadata and mod installation, unrelated-file/mod preservation, idempotence, invalid-config preflight, DDAI-only uninstall, missing-heartbeat diagnosis, and honest running-self retention.
+
+## Independent-review fixes
+
+### P1: client-config ownership
+
+- Verified the finding before editing: setup assigned `mcpServers.ddai` unconditionally and uninstall removed it by name alone.
+- Unit RED: three focused cases failed because a foreign Claude or Gemini entry was accepted and foreign replacements were removed.
+- Published-EXE RED: two lifecycle regressions reproduced the unsafe behavior through a newly published executable: setup returned `0` and installed files despite foreign entries, while uninstall deleted foreign replacement entries.
+- GREEN: setup now accepts only an absent entry or the exact DDAI-owned shape for that client and absolute installed executable. A foreign or modified entry fails before connector/mod installation and before either config changes. Uninstall removes only that exact owned shape and preserves a user or foreign replacement while still removing proven DDAI-owned local files.
+- Focused GREEN evidence: `ClientConfigMergerTests` passed `7/7`; published config-ownership tests passed `2/2`.
+
+### P2: stdio failure cleanliness
+
+- Verified the finding before editing: the generic operation-error catch serialized CLI JSON to stdout even after `serve --stdio` had been selected.
+- Published-EXE RED: a real mailbox initialization fault (the mailbox root was an existing regular file) exited `1` but stdout began with `{"state":"error",...}`.
+- GREEN: after successful command parsing, every caught serve-host `IOException`, `UnauthorizedAccessException`, setup exception, or config exception writes only to stderr and exits `1`; non-serve commands retain their structured JSON error output.
+- Published-EXE GREEN: the same filesystem fault exited `1`, wrote exactly `0` stdout bytes, and wrote `189` diagnostic bytes to stderr. The official SDK happy path and all published ownership/protocol tests passed together `4/4`.
+- No test-only production fault hook was added.
 
 ## Implementation summary
 
@@ -29,13 +48,14 @@
 
 ## Verification
 
-- Fresh Release suite: `241/241` passed (`224` core and `17` app), `0` failed, `0` skipped.
+- Fresh Release suite after review fixes: `247/247` passed (`224` core and `23` app), `0` failed, `0` skipped.
 - Fresh Release build: succeeded with `0` warnings and `0` errors.
 - Published artifact: `artifacts/task4/win-x64/ddai.exe`, one-file output, `73,762,197` bytes.
-- Artifact SHA-256: `9D290307952D974C92EDE549AFF57BF0160F5447AA0E10E97BE40BEBF9AF81F6`.
+- Review-fixed artifact SHA-256: `D8B5CA196006C0805CF5B3B1AF718A39E2B7A01BB5C5C85D9250123A30E9BF29`.
 - Installed executable SHA-256: `9D290307952D974C92EDE549AFF57BF0160F5447AA0E10E97BE40BEBF9AF81F6`.
 - Direct published run: `status --json` emitted one JSON document and exited `2` with `status_timeout`, matching the current unobserved bridge state.
 - Protocol proof: the `ModelContextProtocol` `1.4.1` client test launched a newly published self-contained EXE and proved initialize, list-tools, and call-tool `ddai_status`.
+- The review-fixed artifact was not installed on the current machine during this fix pass; the real Claude/Gemini configs and existing installation were deliberately left untouched.
 
 ## Current-machine setup evidence
 

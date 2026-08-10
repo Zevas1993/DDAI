@@ -88,18 +88,64 @@ public sealed class ClientConfigMergerTests
         Assert.Empty(Directory.GetFiles(sandbox.Root, ".*.ddai-stage-*", SearchOption.AllDirectories));
     }
 
-    [Fact]
-    public void Uninstall_RemovesOnlyDdaiEntriesAndIsIdempotent()
+    [Theory]
+    [InlineData(ClientKind.Claude)]
+    [InlineData(ClientKind.Gemini)]
+    public void Setup_ForeignDdaiEntryInEitherClientBlocksBothTargetsWithoutWriting(ClientKind foreignClient)
     {
         using var sandbox = new ConfigSandbox();
-        var existing = """
-            { "mcpServers": { "ddai": { "command": "old.exe", "args": ["serve"] }, "other": { "command": "keep.exe" } }, "keep": 42 }
+        const string empty = "{\"mcpServers\":{\"other\":{\"command\":\"keep.exe\"}}}";
+        const string foreign = "{\"mcpServers\":{\"ddai\":{\"command\":\"C:\\\\foreign.exe\",\"args\":[\"foreign\"]},\"other\":{\"command\":\"keep.exe\"}}}";
+        File.WriteAllText(sandbox.ClaudePath, foreignClient == ClientKind.Claude ? foreign : empty);
+        File.WriteAllText(sandbox.GeminiPath, foreignClient == ClientKind.Gemini ? foreign : empty);
+        var claudeBefore = File.ReadAllBytes(sandbox.ClaudePath);
+        var geminiBefore = File.ReadAllBytes(sandbox.GeminiPath);
+
+        Assert.Throws<ClientConfigException>(() =>
+            ClientConfigMerger.Setup(sandbox.Targets, Path.Combine(sandbox.Root, "ddai.exe"), new FixedTimeProvider()));
+
+        Assert.Equal(claudeBefore, File.ReadAllBytes(sandbox.ClaudePath));
+        Assert.Equal(geminiBefore, File.ReadAllBytes(sandbox.GeminiPath));
+        Assert.Empty(Directory.GetFiles(sandbox.Root, "*.ddai-backup-*", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public void Uninstall_PreservesForeignDdaiReplacementInBothClients()
+    {
+        using var sandbox = new ConfigSandbox();
+        var foreign = """
+            { "mcpServers": { "ddai": { "command": "C:\\foreign.exe", "args": ["foreign"] }, "other": { "command": "keep.exe" } }, "keep": 42 }
             """;
+        File.WriteAllText(sandbox.ClaudePath, foreign);
+        File.WriteAllText(sandbox.GeminiPath, foreign);
+
+        var executable = Path.Combine(sandbox.Root, "ddai.exe");
+        var first = ClientConfigMerger.Uninstall(sandbox.Targets, executable, new FixedTimeProvider());
+        var second = ClientConfigMerger.Uninstall(sandbox.Targets, executable, new FixedTimeProvider());
+
+        Assert.All(first, result => Assert.False(result.Changed));
+        Assert.All(second, result => Assert.False(result.Changed));
+        foreach (var path in new[] { sandbox.ClaudePath, sandbox.GeminiPath })
+        {
+            var root = JsonNode.Parse(File.ReadAllText(path))!;
+            Assert.Equal("C:\\foreign.exe", root["mcpServers"]!["ddai"]!["command"]!.GetValue<string>());
+            Assert.Equal("keep.exe", root["mcpServers"]!["other"]!["command"]!.GetValue<string>());
+            Assert.Equal(42, root["keep"]!.GetValue<int>());
+        }
+    }
+
+    [Fact]
+    public void Uninstall_RemovesOnlyExactOwnedEntriesAndIsIdempotent()
+    {
+        using var sandbox = new ConfigSandbox();
+        const string existing = "{\"mcpServers\":{\"other\":{\"command\":\"keep.exe\"}},\"keep\":42}";
         File.WriteAllText(sandbox.ClaudePath, existing);
         File.WriteAllText(sandbox.GeminiPath, existing);
+        var executable = Path.Combine(sandbox.Root, "ddai.exe");
+        ClientConfigMerger.Setup(sandbox.Targets, executable, new FixedTimeProvider());
 
-        var first = ClientConfigMerger.Uninstall(sandbox.Targets, new FixedTimeProvider());
-        var second = ClientConfigMerger.Uninstall(sandbox.Targets, new FixedTimeProvider());
+        var first = ClientConfigMerger.Uninstall(sandbox.Targets, executable, new FixedTimeProvider());
+        var second = ClientConfigMerger.Uninstall(sandbox.Targets, executable, new FixedTimeProvider());
 
         Assert.All(first, result => Assert.True(result.Changed));
         Assert.All(second, result => Assert.False(result.Changed));

@@ -7,6 +7,7 @@ using ModelContextProtocol.Protocol;
 
 namespace DDAI.App.Tests;
 
+[Collection("Published executable")]
 public sealed class McpPublishedIntegrationTests
 {
     [Fact(Timeout = 120_000)]

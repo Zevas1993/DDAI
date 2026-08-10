@@ -121,7 +121,7 @@ public sealed class LocalSetupService(TimeProvider timeProvider)
     {
         ArgumentNullException.ThrowIfNull(paths);
         ValidateOwnedTargetsForUninstall(paths);
-        var configs = ClientConfigMerger.Uninstall(paths.ConfigTargets, timeProvider);
+        var configs = ClientConfigMerger.Uninstall(paths.ConfigTargets, paths.InstalledExecutable, timeProvider);
 
         if (Directory.Exists(paths.InstalledModDirectory))
         {
@@ -172,6 +172,8 @@ public sealed class LocalSetupService(TimeProvider timeProvider)
         {
             ValidateModManifest(paths.InstalledModDirectory);
         }
+
+        ClientConfigMerger.ValidateSetupOwnership(paths.ConfigTargets, paths.InstalledExecutable);
 
         foreach (var target in paths.ConfigTargets)
         {

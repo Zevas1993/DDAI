@@ -13,9 +13,10 @@ public sealed class CliApplication(TextWriter stdout, TextWriter stderr, TimePro
 
     public async Task<int> RunAsync(IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
+        CliOptions? options = null;
         try
         {
-            var options = CliParser.Parse(args);
+            options = CliParser.Parse(args);
             if (options.Command == DdaiCommand.Serve)
             {
                 await McpStdioServer.RunAsync(options, timeProvider, cancellationToken);
@@ -56,7 +57,11 @@ public sealed class CliApplication(TextWriter stdout, TextWriter stderr, TimePro
         }
         catch (Exception exception) when (exception is ClientConfigException or LocalSetupException or IOException or UnauthorizedAccessException)
         {
-            await WriteJsonAsync(new { state = "error", code = "operation_failed", message = exception.Message });
+            if (options?.Command != DdaiCommand.Serve)
+            {
+                await WriteJsonAsync(new { state = "error", code = "operation_failed", message = exception.Message });
+            }
+
             await stderr.WriteLineAsync(exception.Message);
             return 1;
         }

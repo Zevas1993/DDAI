@@ -33,14 +33,10 @@ public static class ClientConfigMerger
         return Apply(targets, timeProvider, (target, root) =>
         {
             var servers = GetServers(root, target.Path, create: true)!;
-            var entry = new JsonObject
+            var entry = CreateOwnedEntry(target.Kind, absoluteExecutable);
+            if (servers.TryGetPropertyValue("ddai", out var existing) && !JsonNode.DeepEquals(existing, entry))
             {
-                ["command"] = absoluteExecutable,
-                ["args"] = new JsonArray("serve", "--stdio"),
-            };
-            if (target.Kind == ClientKind.Gemini)
-            {
-                entry["trust"] = false;
+                throw new ClientConfigException($"Refusing to overwrite a foreign or modified mcpServers.ddai entry: {target.Path}");
             }
 
             servers["ddai"] = entry;
@@ -49,11 +45,41 @@ public static class ClientConfigMerger
 
     public static IReadOnlyList<ClientConfigUpdate> Uninstall(
         IReadOnlyList<ClientConfigTarget> targets,
+        string executablePath,
         TimeProvider timeProvider) =>
         Apply(targets, timeProvider, (target, root) =>
         {
-            GetServers(root, target.Path, create: false)?.Remove("ddai");
+            var servers = GetServers(root, target.Path, create: false);
+            var ownedEntry = CreateOwnedEntry(target.Kind, Path.GetFullPath(executablePath));
+            if (servers is not null &&
+                servers.TryGetPropertyValue("ddai", out var existing) &&
+                JsonNode.DeepEquals(existing, ownedEntry))
+            {
+                servers.Remove("ddai");
+            }
         });
+
+    public static void ValidateSetupOwnership(
+        IReadOnlyList<ClientConfigTarget> targets,
+        string executablePath)
+    {
+        ArgumentNullException.ThrowIfNull(targets);
+        ArgumentException.ThrowIfNullOrWhiteSpace(executablePath);
+        var absoluteExecutable = Path.GetFullPath(executablePath);
+        foreach (var target in targets)
+        {
+            var path = Path.GetFullPath(target.Path);
+            var root = ParseRoot(path, File.Exists(path) ? File.ReadAllBytes(path) : null);
+            var servers = GetServers(root, path, create: false);
+            var ownedEntry = CreateOwnedEntry(target.Kind, absoluteExecutable);
+            if (servers is not null &&
+                servers.TryGetPropertyValue("ddai", out var existing) &&
+                !JsonNode.DeepEquals(existing, ownedEntry))
+            {
+                throw new ClientConfigException($"Refusing to overwrite a foreign or modified mcpServers.ddai entry: {path}");
+            }
+        }
+    }
 
     private static IReadOnlyList<ClientConfigUpdate> Apply(
         IReadOnlyList<ClientConfigTarget> targets,
@@ -170,6 +196,21 @@ public static class ClientConfigMerger
 
         return root["mcpServers"] as JsonObject
             ?? throw new ClientConfigException($"mcpServers must be a JSON object and was not changed: {path}");
+    }
+
+    private static JsonObject CreateOwnedEntry(ClientKind kind, string absoluteExecutable)
+    {
+        var entry = new JsonObject
+        {
+            ["command"] = absoluteExecutable,
+            ["args"] = new JsonArray("serve", "--stdio"),
+        };
+        if (kind == ClientKind.Gemini)
+        {
+            entry["trust"] = false;
+        }
+
+        return entry;
     }
 
     private static void WriteNewFile(string path, byte[] bytes)
