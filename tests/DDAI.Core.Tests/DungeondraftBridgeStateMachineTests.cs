@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 
 using DDAI.Core.Mailbox;
+using DDAI.Core.MapPlans;
 
 namespace DDAI.Core.Tests;
 
@@ -12,6 +13,306 @@ public sealed class DungeondraftBridgeStateMachineTests
     private static readonly DateTimeOffset RequestTimestamp = DateTimeOffset.Parse("2026-08-09T12:00:00Z");
     private static readonly DateTimeOffset FirstResponseTimestamp = DateTimeOffset.Parse("2026-08-09T12:00:01Z");
     private static readonly DateTimeOffset RetryResponseTimestamp = DateTimeOffset.Parse("2026-08-09T12:05:00Z");
+
+    [Fact]
+    public void ApplyPlan_CreatesDurableIntentBeforeExecutingExactlyOnce()
+    {
+        using var sandbox = new MutationBridgeSandbox("mutation-order-001");
+        var executeCount = 0;
+        var bridge = sandbox.CreateBridge(request =>
+        {
+            executeCount++;
+            return MutationSuccessResponse(request, sandbox.Plan);
+        });
+
+        Assert.Equal(BridgeTransition.MutationIntentCreated, bridge.AdvanceClaim(sandbox.FileName));
+        Assert.Equal(0, executeCount);
+        Assert.True(File.Exists(sandbox.PreparedIntentPath));
+        Assert.False(File.Exists(sandbox.ConfirmedIntentPath));
+
+        Assert.Equal(BridgeTransition.MutationConfirmed, bridge.AdvanceClaim(sandbox.FileName));
+        Assert.Equal(1, executeCount);
+        Assert.True(File.Exists(sandbox.PreparedIntentPath));
+        Assert.True(File.Exists(sandbox.ConfirmedIntentPath));
+        Assert.False(File.Exists(sandbox.ResponsePath));
+    }
+
+    [Fact]
+    public void Recovery_PreparedOnlyBecomesAmbiguousWithoutReplayingMutation()
+    {
+        using var sandbox = new MutationBridgeSandbox("mutation-prepared-restart-001");
+        var first = sandbox.CreateBridge(request => MutationSuccessResponse(request, sandbox.Plan));
+        Assert.Equal(BridgeTransition.MutationIntentCreated, first.AdvanceClaim(sandbox.FileName));
+        var restartedExecuteCount = 0;
+        var restarted = sandbox.CreateBridge(_ =>
+        {
+            restartedExecuteCount++;
+            throw new InvalidOperationException("Recovery must never execute a prepared mutation.");
+        });
+
+        restarted.RecoverAll();
+
+        Assert.Equal(0, restartedExecuteCount);
+        Assert.False(File.Exists(sandbox.ProcessingPath));
+        Assert.True(File.Exists(sandbox.PreparedIntentPath));
+        Assert.True(File.Exists(sandbox.AmbiguousIntentPath));
+        Assert.False(File.Exists(sandbox.ConfirmedIntentPath));
+        Assert.False(File.Exists(sandbox.JournalPath));
+        var response = ReadResponse(sandbox.ResponsePath);
+        Assert.False(response.Success);
+        Assert.Equal("mutation_outcome_unknown", response.Error!.Code);
+        Assert.Equal(MapPlanJson.Fingerprint(sandbox.Plan), response.Payload.GetProperty("plan_fingerprint").GetString());
+        Assert.True(response.Payload.GetProperty("outcome_unknown").GetBoolean());
+        Assert.Single(Directory.EnumerateFiles(sandbox.FailedDirectory, "*.mutation-outcome-unknown.json"));
+    }
+
+    [Theory]
+    [InlineData(2)] // confirmed intent
+    [InlineData(3)] // response journal
+    [InlineData(4)] // response publication
+    [InlineData(5)] // processing claim deletion
+    [InlineData(6)] // response journal deletion
+    [InlineData(7)] // confirmed intent deletion
+    public void Recovery_ConfirmedMutationConvergesWithoutExecutingAgain(int completedTransitions)
+    {
+        using var sandbox = new MutationBridgeSandbox("mutation-confirmed-boundary-" + completedTransitions);
+        var firstExecuteCount = 0;
+        var first = sandbox.CreateBridge(request =>
+        {
+            firstExecuteCount++;
+            return MutationSuccessResponse(request, sandbox.Plan);
+        });
+        for (var index = 0; index < completedTransitions; index++)
+        {
+            Assert.NotEqual(BridgeTransition.Blocked, first.AdvanceClaim(sandbox.FileName));
+        }
+
+        var restartedExecuteCount = 0;
+        var restarted = sandbox.CreateBridge(_ =>
+        {
+            restartedExecuteCount++;
+            throw new InvalidOperationException("Confirmed recovery must not execute again.");
+        });
+        restarted.RecoverAll();
+
+        Assert.Equal(1, firstExecuteCount);
+        Assert.Equal(0, restartedExecuteCount);
+        Assert.False(File.Exists(sandbox.ProcessingPath));
+        Assert.False(File.Exists(sandbox.JournalPath));
+        Assert.False(File.Exists(sandbox.PreparedIntentPath));
+        Assert.False(File.Exists(sandbox.ConfirmedIntentPath));
+        Assert.False(File.Exists(sandbox.AmbiguousIntentPath));
+        var response = ReadResponse(sandbox.ResponsePath);
+        Assert.True(response.Success);
+        Assert.Equal(MapPlanJson.Fingerprint(sandbox.Plan), response.Payload.GetProperty("plan_fingerprint").GetString());
+    }
+
+    [Fact]
+    public void Mutation_PreparedWriteFailureRetainsClaimAndDoesNotExecute()
+    {
+        using var sandbox = new MutationBridgeSandbox("mutation-prepared-write-fault");
+        Directory.CreateDirectory(sandbox.PreparedIntentPath);
+        var executeCount = 0;
+        var bridge = sandbox.CreateBridge(request =>
+        {
+            executeCount++;
+            return MutationSuccessResponse(request, sandbox.Plan);
+        });
+
+        var transition = bridge.AdvanceClaim(sandbox.FileName);
+
+        Assert.Equal(BridgeTransition.Blocked, transition);
+        Assert.Equal(0, executeCount);
+        Assert.True(File.Exists(sandbox.ProcessingPath));
+        Assert.True(Directory.Exists(sandbox.PreparedIntentPath));
+        Assert.False(File.Exists(sandbox.ConfirmedIntentPath));
+    }
+
+    [Fact]
+    public void Mutation_InvalidExecutedResponseNeverExecutesTwiceAndBecomesAmbiguous()
+    {
+        using var sandbox = new MutationBridgeSandbox("mutation-response-validation-fault");
+        var executeCount = 0;
+        var bridge = sandbox.CreateBridge(request =>
+        {
+            executeCount++;
+            return MutationSuccessResponse(request, sandbox.Plan) with
+            {
+                Payload = JsonSerializer.SerializeToElement(new
+                {
+                    plan_fingerprint = new string('0', 64),
+                }),
+            };
+        });
+        Assert.Equal(BridgeTransition.MutationIntentCreated, bridge.AdvanceClaim(sandbox.FileName));
+
+        Assert.Equal(BridgeTransition.Blocked, bridge.AdvanceClaim(sandbox.FileName));
+        Assert.Equal(1, executeCount);
+        Assert.Equal(BridgeTransition.MutationAmbiguityRecorded, bridge.AdvanceClaim(sandbox.FileName));
+        Assert.Equal(1, executeCount);
+        Assert.True(File.Exists(sandbox.PreparedIntentPath));
+        Assert.True(File.Exists(sandbox.AmbiguousIntentPath));
+    }
+
+    [Theory]
+    [InlineData("confirmed")]
+    [InlineData("prepared")]
+    public void Mutation_LockedIntentCleanupReturnsBlockedAndRetainsSource(string lockedState)
+    {
+        using var sandbox = new MutationBridgeSandbox("mutation-cleanup-lock-" + lockedState);
+        var bridge = sandbox.CreateBridge(request => MutationSuccessResponse(request, sandbox.Plan));
+        for (var index = 0; index < 6; index++)
+        {
+            Assert.NotEqual(BridgeTransition.Blocked, bridge.AdvanceClaim(sandbox.FileName));
+        }
+        var lockedPath = lockedState == "confirmed"
+            ? sandbox.ConfirmedIntentPath
+            : sandbox.PreparedIntentPath;
+        using var locked = new FileStream(lockedPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+
+        var transition = bridge.AdvanceClaim(sandbox.FileName);
+
+        if (lockedState == "prepared")
+        {
+            Assert.Equal(BridgeTransition.MutationIntentDeleted, transition);
+            transition = bridge.AdvanceClaim(sandbox.FileName);
+        }
+        Assert.Equal(BridgeTransition.Blocked, transition);
+        Assert.True(File.Exists(lockedPath));
+        Assert.True(File.Exists(sandbox.ResponsePath));
+    }
+
+    [Fact]
+    public void Mutation_BlockedAmbiguityDiagnosticRetainsAmbiguousSourceState()
+    {
+        using var sandbox = new MutationBridgeSandbox("mutation-ambiguous-diagnostic-fault");
+        var first = sandbox.CreateBridge(request => MutationSuccessResponse(request, sandbox.Plan));
+        Assert.Equal(BridgeTransition.MutationIntentCreated, first.AdvanceClaim(sandbox.FileName));
+        var restarted = sandbox.CreateBridge(_ => throw new InvalidOperationException());
+        Assert.Equal(BridgeTransition.MutationAmbiguityRecorded, restarted.AdvanceClaim(sandbox.FileName));
+        Assert.Equal(BridgeTransition.JournalCreated, restarted.AdvanceClaim(sandbox.FileName));
+        Assert.Equal(BridgeTransition.ResponsePublished, restarted.AdvanceClaim(sandbox.FileName));
+        Assert.Equal(BridgeTransition.ClaimDeleted, restarted.AdvanceClaim(sandbox.FileName));
+        Assert.Equal(BridgeTransition.JournalDeleted, restarted.AdvanceClaim(sandbox.FileName));
+        Directory.Delete(sandbox.FailedDirectory);
+        File.WriteAllText(sandbox.FailedDirectory, "blocks diagnostic directory");
+
+        var transition = restarted.AdvanceClaim(sandbox.FileName);
+
+        Assert.Equal(BridgeTransition.Blocked, transition);
+        Assert.True(File.Exists(sandbox.PreparedIntentPath));
+        Assert.True(File.Exists(sandbox.AmbiguousIntentPath));
+        Assert.True(File.Exists(sandbox.ResponsePath));
+    }
+
+    [Fact]
+    public void Mutation_ForgedDiagnosticDirectoryBlocksAndRetainsAmbiguousState()
+    {
+        using var sandbox = new MutationBridgeSandbox("mutation-forged-diagnostic-directory");
+        var first = sandbox.CreateBridge(request => MutationSuccessResponse(request, sandbox.Plan));
+        Assert.Equal(BridgeTransition.MutationIntentCreated, first.AdvanceClaim(sandbox.FileName));
+        var restarted = sandbox.CreateBridge(_ => throw new InvalidOperationException());
+        Assert.Equal(BridgeTransition.MutationAmbiguityRecorded, restarted.AdvanceClaim(sandbox.FileName));
+        Assert.Equal(BridgeTransition.JournalCreated, restarted.AdvanceClaim(sandbox.FileName));
+        Assert.Equal(BridgeTransition.ResponsePublished, restarted.AdvanceClaim(sandbox.FileName));
+        Assert.Equal(BridgeTransition.ClaimDeleted, restarted.AdvanceClaim(sandbox.FileName));
+        Assert.Equal(BridgeTransition.JournalDeleted, restarted.AdvanceClaim(sandbox.FileName));
+        var diagnosticPath = Path.Combine(
+            sandbox.FailedDirectory,
+            sandbox.Key + ".mutation-outcome-unknown.json");
+        Directory.CreateDirectory(diagnosticPath);
+
+        var transition = restarted.AdvanceClaim(sandbox.FileName);
+
+        Assert.Equal(BridgeTransition.Blocked, transition);
+        Assert.True(Directory.Exists(diagnosticPath));
+        Assert.True(File.Exists(sandbox.PreparedIntentPath));
+        Assert.True(File.Exists(sandbox.AmbiguousIntentPath));
+    }
+
+    [Fact]
+    public void Mutation_CorruptResponseJournalBlocksIntentCleanup()
+    {
+        using var sandbox = new MutationBridgeSandbox("mutation-corrupt-response-journal");
+        var bridge = sandbox.CreateBridge(request => MutationSuccessResponse(request, sandbox.Plan));
+        for (var index = 0; index < 5; index++)
+        {
+            Assert.NotEqual(BridgeTransition.Blocked, bridge.AdvanceClaim(sandbox.FileName));
+        }
+        File.WriteAllText(sandbox.JournalPath, "{ malformed");
+
+        var transition = bridge.AdvanceClaim(sandbox.FileName);
+
+        Assert.Equal(BridgeTransition.Blocked, transition);
+        Assert.True(File.Exists(sandbox.JournalPath));
+        Assert.True(File.Exists(sandbox.PreparedIntentPath));
+        Assert.True(File.Exists(sandbox.ConfirmedIntentPath));
+        Assert.True(File.Exists(sandbox.ResponsePath));
+    }
+
+    [Fact]
+    public void Mutation_NoncanonicalRequestFingerprintBlocksClaimlessIntentCleanup()
+    {
+        using var sandbox = new MutationBridgeSandbox("mutation-bad-request-fingerprint");
+        var bridge = sandbox.CreateBridge(request => MutationSuccessResponse(request, sandbox.Plan));
+        for (var index = 0; index < 6; index++)
+        {
+            Assert.NotEqual(BridgeTransition.Blocked, bridge.AdvanceClaim(sandbox.FileName));
+        }
+        var intent = JsonNode.Parse(File.ReadAllText(sandbox.ConfirmedIntentPath))!.AsObject();
+        intent["request_fingerprint"] = "not-a-sha256";
+        File.WriteAllText(sandbox.ConfirmedIntentPath, intent.ToJsonString(BridgeWireJson.Options));
+
+        var transition = bridge.AdvanceClaim(sandbox.FileName);
+
+        Assert.Equal(BridgeTransition.Blocked, transition);
+        Assert.True(File.Exists(sandbox.ConfirmedIntentPath));
+        Assert.True(File.Exists(sandbox.PreparedIntentPath));
+    }
+
+    [Theory]
+    [InlineData("prepared")]
+    [InlineData("confirmed")]
+    [InlineData("ambiguous")]
+    public void Mutation_CorruptIntentBlocksWithoutDeletingSourceOrExecuting(string state)
+    {
+        using var sandbox = new MutationBridgeSandbox("mutation-corrupt-" + state);
+        var executeCount = 0;
+        var bridge = sandbox.CreateBridge(request =>
+        {
+            executeCount++;
+            return MutationSuccessResponse(request, sandbox.Plan);
+        });
+        Assert.Equal(BridgeTransition.MutationIntentCreated, bridge.AdvanceClaim(sandbox.FileName));
+        string path;
+        if (state == "confirmed")
+        {
+            Assert.Equal(BridgeTransition.MutationConfirmed, bridge.AdvanceClaim(sandbox.FileName));
+            path = sandbox.ConfirmedIntentPath;
+        }
+        else if (state == "ambiguous")
+        {
+            var restarted = sandbox.CreateBridge(_ => throw new InvalidOperationException());
+            Assert.Equal(BridgeTransition.MutationAmbiguityRecorded, restarted.AdvanceClaim(sandbox.FileName));
+            bridge = restarted;
+            path = sandbox.AmbiguousIntentPath;
+        }
+        else
+        {
+            path = sandbox.PreparedIntentPath;
+        }
+        var intent = JsonNode.Parse(File.ReadAllText(path))!.AsObject();
+        intent["state"] = "tampered";
+        File.WriteAllText(path, intent.ToJsonString(BridgeWireJson.Options));
+        var before = executeCount;
+
+        var transition = bridge.AdvanceClaim(sandbox.FileName);
+
+        Assert.Equal(BridgeTransition.Blocked, transition);
+        Assert.Equal(before, executeCount);
+        Assert.True(File.Exists(path));
+        Assert.True(File.Exists(sandbox.ProcessingPath));
+    }
 
     [Theory]
     [InlineData(0)] // crash before journal creation
@@ -253,6 +554,24 @@ public sealed class DungeondraftBridgeStateMachineTests
         Payload = JsonSerializer.SerializeToElement(new { state }),
     };
 
+    private static MailboxResponse MutationSuccessResponse(MailboxRequest request, MapPlan plan) => new()
+    {
+        SchemaVersion = MailboxRequest.CurrentSchemaVersion,
+        RequestId = request.RequestId,
+        Command = request.Command,
+        Timestamp = FirstResponseTimestamp,
+        Success = true,
+        Payload = JsonSerializer.SerializeToElement(new
+        {
+            applied = true,
+            created_walls = 1,
+            room_id = plan.Rooms[0].Id,
+            undo_available = true,
+            undo_instruction = "Use Dungeondraft Undo once",
+            plan_fingerprint = MapPlanJson.Fingerprint(plan),
+        }),
+    };
+
     private static MailboxResponse ReadResponse(string path) =>
         JsonSerializer.Deserialize<MailboxResponse>(File.ReadAllText(path), BridgeWireJson.Options)!;
 
@@ -261,7 +580,7 @@ public sealed class DungeondraftBridgeStateMachineTests
         public RawBridgeSandbox(string requestId, string? processingText)
         {
             Root = Path.Combine(Path.GetTempPath(), "ddai-bridge-state-tests", Guid.NewGuid().ToString("N"));
-            foreach (var directory in new[] { "requests", "processing", "responses", "failed", "journal" })
+            foreach (var directory in new[] { "requests", "processing", "responses", "failed", "journal", "mutation-intents" })
             {
                 Directory.CreateDirectory(Path.Combine(Root, directory));
             }
@@ -313,5 +632,51 @@ public sealed class DungeondraftBridgeStateMachineTests
 
         public DungeondraftBridgeStateMachine CreateBridge(Func<MailboxRequest, MailboxResponse> prepareResponse) =>
             new(Root, prepareResponse);
+    }
+
+    private sealed class MutationBridgeSandbox : RawBridgeSandbox
+    {
+        public MutationBridgeSandbox(string requestId)
+            : base(requestId, ApplyRequestJson(requestId))
+        {
+            Plan = ValidPlan(requestId);
+            Request = MailboxRequest.CreateApplyPlan(Plan, RequestTimestamp);
+            ResponsePath = Path.Combine(Root, "responses", FileName);
+            JournalPath = Path.Combine(Root, "journal", FileName);
+            FailedDirectory = Path.Combine(Root, "failed");
+            PreparedIntentPath = Path.Combine(Root, "mutation-intents", Key + ".prepared.json");
+            ConfirmedIntentPath = Path.Combine(Root, "mutation-intents", Key + ".confirmed.json");
+            AmbiguousIntentPath = Path.Combine(Root, "mutation-intents", Key + ".ambiguous.json");
+        }
+
+        public MapPlan Plan { get; }
+        public MailboxRequest Request { get; }
+        public string ResponsePath { get; }
+        public string JournalPath { get; }
+        public string FailedDirectory { get; }
+        public string PreparedIntentPath { get; }
+        public string ConfirmedIntentPath { get; }
+        public string AmbiguousIntentPath { get; }
+
+        public DungeondraftBridgeStateMachine CreateBridge(Func<MailboxRequest, MailboxResponse> executeMutation) =>
+            new(
+                Root,
+                request => SuccessResponse(request, FirstResponseTimestamp, "status-only"),
+                executeMutation);
+
+        private static string ApplyRequestJson(string requestId) =>
+            JsonSerializer.Serialize(
+                MailboxRequest.CreateApplyPlan(ValidPlan(requestId), RequestTimestamp),
+                BridgeWireJson.Options);
+
+        private static MapPlan ValidPlan(string requestId) => new()
+        {
+            SchemaVersion = MapPlan.CurrentSchemaVersion,
+            RequestId = requestId,
+            BaseRevision = 0,
+            Mode = MapOperationMode.Add,
+            Canvas = new MapCanvas(40, 30),
+            Rooms = [new MapRoom("room-entrance", 8, 7, 10, 8)],
+        };
     }
 }

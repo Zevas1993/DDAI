@@ -1,6 +1,8 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using DDAI.Core.MapPlans;
 
 namespace DDAI.Core.Mailbox;
 
@@ -13,6 +15,10 @@ public enum BridgeTransition
     JournalDeleted,
     InvalidClaimFailed,
     InvalidJournalFailed,
+    MutationIntentCreated,
+    MutationConfirmed,
+    MutationAmbiguityRecorded,
+    MutationIntentDeleted,
     Blocked,
 }
 
@@ -33,16 +39,20 @@ public sealed class DungeondraftBridgeStateMachine
     private const long MaximumMessageBytes = AtomicMailbox.MaximumMessageBytes;
     private readonly string _root;
     private readonly Func<MailboxRequest, MailboxResponse> _prepareResponse;
+    private readonly Func<MailboxRequest, MailboxResponse>? _executeMutation;
+    private readonly HashSet<string> _preparedMutationKeys = new(StringComparer.Ordinal);
 
     public DungeondraftBridgeStateMachine(
         string rootDirectory,
-        Func<MailboxRequest, MailboxResponse> prepareResponse)
+        Func<MailboxRequest, MailboxResponse> prepareResponse,
+        Func<MailboxRequest, MailboxResponse>? executeMutation = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(rootDirectory);
         ArgumentNullException.ThrowIfNull(prepareResponse);
         _root = Path.GetFullPath(rootDirectory);
         _prepareResponse = prepareResponse;
-        foreach (var name in new[] { "requests", "processing", "responses", "failed", "journal" })
+        _executeMutation = executeMutation;
+        foreach (var name in new[] { "requests", "processing", "responses", "failed", "journal", "mutation-intents" })
         {
             Directory.CreateDirectory(DirectoryPath(name));
         }
@@ -61,18 +71,7 @@ public sealed class DungeondraftBridgeStateMachine
         var responsePath = StatePath("responses", canonicalFileName);
         if (!File.Exists(processingPath))
         {
-            if (File.Exists(journalPath) &&
-                TryReadValidatedJournal(journalPath, expectedFingerprint: null, expectedRequestId: null, out var staleJournal) &&
-                StringComparer.Ordinal.Equals(Sha256(staleJournal.RequestId), key) &&
-                TryReadValidatedStandaloneResponse(staleJournal.ResponseText, staleJournal.RequestId, out _) &&
-                File.Exists(responsePath) &&
-                ResponsesEquivalent(staleJournal.ResponseText, ReadBoundedText(responsePath)))
-            {
-                File.Delete(journalPath);
-                return BridgeTransition.JournalDeleted;
-            }
-
-            return BridgeTransition.NoWork;
+            return AdvanceWithoutClaim(key, journalPath, responsePath);
         }
 
         if (!TryReadValidatedRequest(processingPath, canonicalFileName, out var request, out var canonicalRequestText))
@@ -83,26 +82,61 @@ public sealed class DungeondraftBridgeStateMachine
 
         ReconcileRequestDuplicate(canonicalFileName, canonicalRequestText);
         var fingerprint = Sha256(canonicalRequestText);
+        if (StringComparer.Ordinal.Equals(request.Command, "apply_plan"))
+        {
+            return AdvanceMutationClaim(
+                key,
+                canonicalFileName,
+                request,
+                fingerprint,
+                journalPath,
+                responsePath,
+                processingPath);
+        }
+
+        return AdvanceJournaledClaim(
+            key,
+            request,
+            fingerprint,
+            journalPath,
+            responsePath,
+            processingPath,
+            responseText: null);
+    }
+
+    private BridgeTransition AdvanceJournaledClaim(
+        string key,
+        MailboxRequest request,
+        string requestFingerprint,
+        string journalPath,
+        string responsePath,
+        string processingPath,
+        string? responseText)
+    {
         if (!File.Exists(journalPath))
         {
-            var response = _prepareResponse(request);
-            ValidateResponse(response, request);
-            var responseText = JsonSerializer.Serialize(response, BridgeWireJson.Options);
+            if (responseText is null)
+            {
+                var response = _prepareResponse(request);
+                ValidateResponse(response, request);
+                responseText = JsonSerializer.Serialize(response, BridgeWireJson.Options);
+            }
+
             if (Encoding.UTF8.GetByteCount(responseText) > MaximumMessageBytes)
             {
-                throw new ArgumentOutOfRangeException(nameof(response), "Serialized responses must not exceed 1 MiB.");
+                throw new ArgumentOutOfRangeException(nameof(responseText), "Serialized responses must not exceed 1 MiB.");
             }
 
             var journal = new ResponseJournal(
                 MailboxRequest.CurrentSchemaVersion,
                 request.RequestId,
-                fingerprint,
+                requestFingerprint,
                 responseText);
             WriteAtomically(journalPath, JsonSerializer.Serialize(journal, BridgeWireJson.Options));
             return BridgeTransition.JournalCreated;
         }
 
-        if (!TryReadValidatedJournal(journalPath, fingerprint, request.RequestId, out var prepared) ||
+        if (!TryReadValidatedJournal(journalPath, requestFingerprint, request.RequestId, out var prepared) ||
             !TryReadValidatedResponse(prepared.ResponseText, request, out _))
         {
             MoveToFailed(journalPath, key, "invalid-journal", ReadBoundedTextIfPossible(journalPath));
@@ -126,6 +160,265 @@ public sealed class DungeondraftBridgeStateMachine
         return BridgeTransition.ClaimDeleted;
     }
 
+    private BridgeTransition AdvanceMutationClaim(
+        string key,
+        string canonicalFileName,
+        MailboxRequest request,
+        string requestFingerprint,
+        string journalPath,
+        string responsePath,
+        string processingPath)
+    {
+        if (!TryGetMutationPlanFingerprint(request, out var planFingerprint))
+        {
+            MoveToFailed(processingPath, key, "invalid-claim", ReadBoundedTextIfPossible(processingPath));
+            return BridgeTransition.InvalidClaimFailed;
+        }
+
+        var preparedPath = MutationIntentPath(key, "prepared");
+        var confirmedPath = MutationIntentPath(key, "confirmed");
+        var ambiguousPath = MutationIntentPath(key, "ambiguous");
+        if (!PathExists(preparedPath))
+        {
+            if (PathExists(confirmedPath) || PathExists(ambiguousPath))
+            {
+                return BridgeTransition.Blocked;
+            }
+
+            var prepared = new MutationIntent(
+                MailboxRequest.CurrentSchemaVersion,
+                request.RequestId,
+                requestFingerprint,
+                planFingerprint,
+                request.Command,
+                "prepared",
+                null);
+            if (!TryWriteBoundedAtomically(preparedPath, JsonSerializer.Serialize(prepared, BridgeWireJson.Options)))
+            {
+                return BridgeTransition.Blocked;
+            }
+
+            _preparedMutationKeys.Add(key);
+            return BridgeTransition.MutationIntentCreated;
+        }
+
+        if (!TryReadValidatedMutationIntent(
+                preparedPath,
+                key,
+                request.RequestId,
+                requestFingerprint,
+                planFingerprint,
+                request.Command,
+                "prepared",
+                requireResponse: false,
+                out _))
+        {
+            WriteMutationIntentConflictDiagnostic(key, "prepared");
+            return BridgeTransition.Blocked;
+        }
+
+        var hasConfirmed = PathExists(confirmedPath);
+        var hasAmbiguous = PathExists(ambiguousPath);
+        if (hasConfirmed && hasAmbiguous)
+        {
+            WriteMutationIntentConflictDiagnostic(key, "multiple-outcomes");
+            return BridgeTransition.Blocked;
+        }
+
+        if (hasConfirmed || hasAmbiguous)
+        {
+            var outcomePath = hasConfirmed ? confirmedPath : ambiguousPath;
+            var outcomeState = hasConfirmed ? "confirmed" : "ambiguous";
+            if (!TryReadValidatedMutationIntent(
+                    outcomePath,
+                    key,
+                    request.RequestId,
+                    requestFingerprint,
+                    planFingerprint,
+                    request.Command,
+                    outcomeState,
+                    requireResponse: true,
+                    out var outcome))
+            {
+                WriteMutationIntentConflictDiagnostic(key, outcomeState);
+                return BridgeTransition.Blocked;
+            }
+
+            return AdvanceJournaledClaim(
+                key,
+                request,
+                requestFingerprint,
+                journalPath,
+                responsePath,
+                processingPath,
+                outcome.ResponseText);
+        }
+
+        if (!_preparedMutationKeys.Remove(key))
+        {
+            var response = MutationUnknownResponse(request, planFingerprint);
+            var responseText = JsonSerializer.Serialize(response, BridgeWireJson.Options);
+            var ambiguous = new MutationIntent(
+                MailboxRequest.CurrentSchemaVersion,
+                request.RequestId,
+                requestFingerprint,
+                planFingerprint,
+                request.Command,
+                "ambiguous",
+                responseText);
+            if (!TryWriteBoundedAtomically(ambiguousPath, JsonSerializer.Serialize(ambiguous, BridgeWireJson.Options)))
+            {
+                return BridgeTransition.Blocked;
+            }
+
+            return BridgeTransition.MutationAmbiguityRecorded;
+        }
+
+        if (_executeMutation is null)
+        {
+            return BridgeTransition.Blocked;
+        }
+
+        var executedResponse = _executeMutation(request);
+        ValidateResponse(executedResponse, request);
+        if (!TryReadPayloadPlanFingerprint(executedResponse.Payload, out var responseFingerprint) ||
+            !StringComparer.Ordinal.Equals(responseFingerprint, planFingerprint))
+        {
+            return BridgeTransition.Blocked;
+        }
+
+        var executedResponseText = JsonSerializer.Serialize(executedResponse, BridgeWireJson.Options);
+        var confirmed = new MutationIntent(
+            MailboxRequest.CurrentSchemaVersion,
+            request.RequestId,
+            requestFingerprint,
+            planFingerprint,
+            request.Command,
+            "confirmed",
+            executedResponseText);
+        if (!TryWriteBoundedAtomically(confirmedPath, JsonSerializer.Serialize(confirmed, BridgeWireJson.Options)))
+        {
+            return BridgeTransition.Blocked;
+        }
+
+        return BridgeTransition.MutationConfirmed;
+    }
+
+    private BridgeTransition AdvanceWithoutClaim(
+        string key,
+        string journalPath,
+        string responsePath)
+    {
+        if (Directory.Exists(journalPath))
+        {
+            return BridgeTransition.Blocked;
+        }
+
+        if (File.Exists(journalPath))
+        {
+            if (TryReadValidatedJournal(journalPath, expectedFingerprint: null, expectedRequestId: null, out var staleJournal) &&
+                StringComparer.Ordinal.Equals(Sha256(staleJournal.RequestId), key) &&
+                TryReadValidatedStandaloneResponse(staleJournal.ResponseText, staleJournal.RequestId, out _) &&
+                File.Exists(responsePath) &&
+                ResponsesEquivalent(staleJournal.ResponseText, ReadBoundedText(responsePath)))
+            {
+                File.Delete(journalPath);
+                return BridgeTransition.JournalDeleted;
+            }
+
+            return BridgeTransition.Blocked;
+        }
+
+        var preparedPath = MutationIntentPath(key, "prepared");
+        var confirmedPath = MutationIntentPath(key, "confirmed");
+        var ambiguousPath = MutationIntentPath(key, "ambiguous");
+        if (PathExists(ambiguousPath))
+        {
+            if (!TryReadValidatedMutationIntent(
+                    ambiguousPath,
+                    key,
+                    expectedRequestId: null,
+                    expectedRequestFingerprint: null,
+                    expectedPlanFingerprint: null,
+                    expectedCommand: "apply_plan",
+                    expectedState: "ambiguous",
+                    requireResponse: true,
+                    out var ambiguous))
+            {
+                return BridgeTransition.Blocked;
+            }
+
+            var diagnosticPath = Path.Combine(DirectoryPath("failed"), $"{key}.mutation-outcome-unknown.json");
+            if (Directory.Exists(diagnosticPath))
+            {
+                return BridgeTransition.Blocked;
+            }
+
+            if (!File.Exists(diagnosticPath))
+            {
+                if (!TryWriteBoundedAtomically(diagnosticPath, JsonSerializer.Serialize(ambiguous, BridgeWireJson.Options)))
+                {
+                    return BridgeTransition.Blocked;
+                }
+
+                return BridgeTransition.MutationAmbiguityRecorded;
+            }
+
+            return BridgeTransition.NoWork;
+        }
+
+        if (PathExists(confirmedPath))
+        {
+            if (!TryReadValidatedMutationIntent(
+                    confirmedPath,
+                    key,
+                    expectedRequestId: null,
+                    expectedRequestFingerprint: null,
+                    expectedPlanFingerprint: null,
+                    expectedCommand: "apply_plan",
+                    expectedState: "confirmed",
+                    requireResponse: true,
+                    out var confirmed) ||
+                !File.Exists(responsePath) ||
+                !ResponsesEquivalent(confirmed.ResponseText!, ReadBoundedText(responsePath)))
+            {
+                return BridgeTransition.Blocked;
+            }
+
+            return TryDeleteFile(confirmedPath)
+                ? BridgeTransition.MutationIntentDeleted
+                : BridgeTransition.Blocked;
+        }
+
+        if (PathExists(preparedPath))
+        {
+            if (!TryReadValidatedMutationIntent(
+                    preparedPath,
+                    key,
+                    expectedRequestId: null,
+                    expectedRequestFingerprint: null,
+                    expectedPlanFingerprint: null,
+                    expectedCommand: "apply_plan",
+                    expectedState: "prepared",
+                    requireResponse: false,
+                    out var prepared) ||
+                !File.Exists(responsePath) ||
+                !TryReadValidatedStandaloneResponse(ReadBoundedText(responsePath), prepared.RequestId, out var response) ||
+                !StringComparer.Ordinal.Equals(response.Command, prepared.Command) ||
+                !TryReadPayloadPlanFingerprint(response.Payload, out var responseFingerprint) ||
+                !StringComparer.Ordinal.Equals(responseFingerprint, prepared.PlanFingerprint))
+            {
+                return BridgeTransition.Blocked;
+            }
+
+            return TryDeleteFile(preparedPath)
+                ? BridgeTransition.MutationIntentDeleted
+                : BridgeTransition.Blocked;
+        }
+
+        return BridgeTransition.NoWork;
+    }
+
     public void RecoverAll()
     {
         foreach (var processingPath in Directory.EnumerateFiles(DirectoryPath("processing"), "*.json").OrderBy(Path.GetFileName, StringComparer.Ordinal))
@@ -137,7 +430,7 @@ public sealed class DungeondraftBridgeStateMachine
                 continue;
             }
 
-            for (var transitions = 0; transitions < 5; transitions++)
+            for (var transitions = 0; transitions < 8; transitions++)
             {
                 var transition = AdvanceClaim(fileName);
                 if (transition is BridgeTransition.NoWork or BridgeTransition.Blocked or BridgeTransition.JournalDeleted)
@@ -153,6 +446,25 @@ public sealed class DungeondraftBridgeStateMachine
             if (IsCanonicalMailboxFileName(fileName))
             {
                 AdvanceClaim(fileName);
+            }
+        }
+
+        var mutationFiles = Directory.EnumerateFiles(DirectoryPath("mutation-intents"), "*.json")
+            .Select(Path.GetFileName)
+            .Where(fileName => fileName is not null)
+            .Select(TryGetCanonicalFileNameFromIntent)
+            .Where(fileName => fileName is not null)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal);
+        foreach (var fileName in mutationFiles)
+        {
+            for (var transitions = 0; transitions < 8; transitions++)
+            {
+                var transition = AdvanceClaim(fileName!);
+                if (transition is BridgeTransition.NoWork or BridgeTransition.Blocked)
+                {
+                    break;
+                }
             }
         }
     }
@@ -300,10 +612,138 @@ public sealed class DungeondraftBridgeStateMachine
 
             return true;
         }
-        catch (Exception exception) when (exception is JsonException or InvalidDataException)
+        catch (Exception exception) when (exception is JsonException or InvalidDataException or IOException or UnauthorizedAccessException)
         {
             return false;
         }
+    }
+
+    private static bool TryGetMutationPlanFingerprint(MailboxRequest request, out string fingerprint)
+    {
+        fingerprint = string.Empty;
+        try
+        {
+            var plan = MapPlanJson.Deserialize(request.Payload.GetRawText());
+            if (!StringComparer.Ordinal.Equals(plan.RequestId, request.RequestId) ||
+                !RectangularRoomPlanValidator.Validate(plan).IsValid)
+            {
+                return false;
+            }
+
+            fingerprint = MapPlanJson.Fingerprint(plan);
+            return true;
+        }
+        catch (Exception exception) when (exception is JsonException or MapPlanValidationException or ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryReadValidatedMutationIntent(
+        string path,
+        string expectedKey,
+        string? expectedRequestId,
+        string? expectedRequestFingerprint,
+        string? expectedPlanFingerprint,
+        string expectedCommand,
+        string expectedState,
+        bool requireResponse,
+        out MutationIntent intent)
+    {
+        intent = null!;
+        try
+        {
+            intent = JsonSerializer.Deserialize<MutationIntent>(ReadBoundedText(path), BridgeWireJson.Options)
+                ?? throw new JsonException("Mutation intent JSON cannot be null.");
+            if (!StringComparer.Ordinal.Equals(intent.SchemaVersion, MailboxRequest.CurrentSchemaVersion) ||
+                string.IsNullOrWhiteSpace(intent.RequestId) ||
+                !StringComparer.Ordinal.Equals(Sha256(intent.RequestId), expectedKey) ||
+                (expectedRequestId is not null && !StringComparer.Ordinal.Equals(intent.RequestId, expectedRequestId)) ||
+                intent.RequestFingerprint is not { Length: 64 } ||
+                intent.RequestFingerprint.AsSpan().IndexOfAnyExcept("0123456789abcdef") >= 0 ||
+                (expectedRequestFingerprint is not null && !StringComparer.Ordinal.Equals(intent.RequestFingerprint, expectedRequestFingerprint)) ||
+                intent.PlanFingerprint is not { Length: 64 } ||
+                intent.PlanFingerprint.AsSpan().IndexOfAnyExcept("0123456789abcdef") >= 0 ||
+                (expectedPlanFingerprint is not null && !StringComparer.Ordinal.Equals(intent.PlanFingerprint, expectedPlanFingerprint)) ||
+                !StringComparer.Ordinal.Equals(intent.Command, expectedCommand) ||
+                !StringComparer.Ordinal.Equals(intent.State, expectedState) ||
+                (requireResponse && string.IsNullOrWhiteSpace(intent.ResponseText)) ||
+                (!requireResponse && intent.ResponseText is not null) ||
+                (intent.ResponseText is not null && Encoding.UTF8.GetByteCount(intent.ResponseText) > MaximumMessageBytes))
+            {
+                throw new JsonException("Mutation intent is invalid.");
+            }
+
+            if (intent.ResponseText is not null &&
+                (!TryReadValidatedStandaloneResponse(intent.ResponseText, intent.RequestId, out var response) ||
+                 !StringComparer.Ordinal.Equals(response.Command, intent.Command) ||
+                 !TryReadPayloadPlanFingerprint(response.Payload, out var responseFingerprint) ||
+                 !StringComparer.Ordinal.Equals(responseFingerprint, intent.PlanFingerprint)))
+            {
+                throw new JsonException("Mutation intent response is invalid.");
+            }
+
+            return true;
+        }
+        catch (Exception exception) when (exception is JsonException or InvalidDataException or IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryReadPayloadPlanFingerprint(JsonElement payload, out string fingerprint)
+    {
+        fingerprint = string.Empty;
+        if (payload.ValueKind != JsonValueKind.Object ||
+            !payload.TryGetProperty("plan_fingerprint", out var property) ||
+            property.ValueKind != JsonValueKind.String ||
+            property.GetString() is not { Length: 64 } value ||
+            value.AsSpan().IndexOfAnyExcept("0123456789abcdef") >= 0)
+        {
+            return false;
+        }
+
+        fingerprint = value;
+        return true;
+    }
+
+    private static MailboxResponse MutationUnknownResponse(MailboxRequest request, string planFingerprint) => new()
+    {
+        SchemaVersion = MailboxRequest.CurrentSchemaVersion,
+        RequestId = request.RequestId,
+        Command = request.Command,
+        Timestamp = DateTimeOffset.UtcNow,
+        Success = false,
+        Payload = JsonSerializer.SerializeToElement(new
+        {
+            plan_fingerprint = planFingerprint,
+            outcome_unknown = true,
+        }),
+        Error = new MailboxErrorDetails(
+            "mutation_outcome_unknown",
+            "Dungeondraft may have applied this room before interruption; inspect the map and use Undo once if it appeared.",
+            "request_id"),
+    };
+
+    private void WriteMutationIntentConflictDiagnostic(string key, string state)
+    {
+        var path = Path.Combine(DirectoryPath("failed"), $"{key}.mutation-intent-{state}.json");
+        if (PathExists(path))
+        {
+            return;
+        }
+
+        var record = JsonSerializer.Serialize(new
+        {
+            schema_version = MailboxRequest.CurrentSchemaVersion,
+            error = new
+            {
+                code = "mutation_intent_conflict",
+                message = "Mutation intent state is invalid or conflicting.",
+            },
+            state,
+        }, BridgeWireJson.Options);
+        _ = TryWriteBoundedAtomically(path, record);
     }
 
     private static bool ResponsesEquivalent(string left, string right)
@@ -352,6 +792,31 @@ public sealed class DungeondraftBridgeStateMachine
     private string DirectoryPath(string name) => Path.Combine(_root, name);
 
     private string StatePath(string state, string canonicalFileName) => Path.Combine(DirectoryPath(state), canonicalFileName);
+
+    private string MutationIntentPath(string key, string state) =>
+        Path.Combine(DirectoryPath("mutation-intents"), $"{key}.{state}.json");
+
+    private static bool PathExists(string path) => File.Exists(path) || Directory.Exists(path);
+
+    private static string? TryGetCanonicalFileNameFromIntent(string? fileName)
+    {
+        if (fileName is null ||
+            (!fileName.EndsWith(".prepared.json", StringComparison.Ordinal) &&
+             !fileName.EndsWith(".confirmed.json", StringComparison.Ordinal) &&
+             !fileName.EndsWith(".ambiguous.json", StringComparison.Ordinal)))
+        {
+            return null;
+        }
+
+        var separator = fileName.IndexOf('.', StringComparison.Ordinal);
+        if (separator != 64)
+        {
+            return null;
+        }
+
+        var canonical = fileName[..64] + ".json";
+        return IsCanonicalMailboxFileName(canonical) ? canonical : null;
+    }
 
     private static bool IsCanonicalMailboxFileName(string fileName) =>
         fileName.Length == 69 &&
@@ -414,6 +879,36 @@ public sealed class DungeondraftBridgeStateMachine
         }
     }
 
+    private static bool TryWriteAtomically(string destinationPath, string text)
+    {
+        try
+        {
+            WriteAtomically(destinationPath, text);
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryWriteBoundedAtomically(string destinationPath, string text) =>
+        Encoding.UTF8.GetByteCount(text) <= MaximumMessageBytes &&
+        TryWriteAtomically(destinationPath, text);
+
+    private static bool TryDeleteFile(string path)
+    {
+        try
+        {
+            File.Delete(path);
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
     private static string Sha256(string value) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
 
@@ -422,4 +917,13 @@ public sealed class DungeondraftBridgeStateMachine
         string RequestId,
         string RequestFingerprint,
         string ResponseText);
+
+    private sealed record MutationIntent(
+        string SchemaVersion,
+        string RequestId,
+        string RequestFingerprint,
+        string PlanFingerprint,
+        string Command,
+        string State,
+        [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ResponseText);
 }

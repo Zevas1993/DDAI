@@ -3,11 +3,66 @@ using System.Text;
 using System.Text.Json;
 
 using DDAI.Core.Mailbox;
+using DDAI.Core.MapPlans;
 
 namespace DDAI.Core.Tests;
 
 public sealed class MailboxBridgeConformanceTests
 {
+    [Fact]
+    public void MutationIntent_RejectsOversizeExecutedResponseBeforeConfirmation()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "ddai-mutation-size-tests", Guid.NewGuid().ToString("N"));
+        try
+        {
+            var plan = new MapPlan
+            {
+                SchemaVersion = MapPlan.CurrentSchemaVersion,
+                RequestId = "mutation-size-001",
+                BaseRevision = 0,
+                Mode = MapOperationMode.Add,
+                Canvas = new MapCanvas(40, 30),
+                Rooms = [new MapRoom("room-entrance", 8, 7, 10, 8)],
+            };
+            var mailbox = new AtomicMailbox(root);
+            Assert.True(mailbox.PublishRequest(
+                MailboxRequest.CreateApplyPlan(plan, DateTimeOffset.Parse("2026-08-09T12:00:00Z"))));
+            var claim = Assert.IsType<ClaimedMailboxRequest>(mailbox.ClaimNextRequest());
+            var key = Path.GetFileNameWithoutExtension(claim.ProcessingPath);
+            var fileName = key + ".json";
+            var bridge = new DungeondraftBridgeStateMachine(
+                root,
+                _ => throw new InvalidOperationException(),
+                request => new MailboxResponse
+                {
+                    SchemaVersion = MailboxRequest.CurrentSchemaVersion,
+                    RequestId = request.RequestId,
+                    Command = request.Command,
+                    Timestamp = DateTimeOffset.Parse("2026-08-09T12:00:01Z"),
+                    Success = true,
+                    Payload = JsonSerializer.SerializeToElement(new
+                    {
+                        plan_fingerprint = MapPlanJson.Fingerprint(plan),
+                        text = new string('x', checked((int)AtomicMailbox.MaximumMessageBytes)),
+                    }),
+                });
+
+            Assert.Equal(BridgeTransition.MutationIntentCreated, bridge.AdvanceClaim(fileName));
+            Assert.Equal(BridgeTransition.Blocked, bridge.AdvanceClaim(fileName));
+
+            Assert.True(File.Exists(claim.ProcessingPath));
+            Assert.True(File.Exists(Path.Combine(root, "mutation-intents", key + ".prepared.json")));
+            Assert.False(File.Exists(Path.Combine(root, "mutation-intents", key + ".confirmed.json")));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     [Theory]
     [InlineData("2026-08-09T12:00:00Z", "\"2026-08-09T12:00:00+00:00\"")]
     [InlineData("2026-08-09T12:00:00.1234000+05:30", "\"2026-08-09T12:00:00.1234+05:30\"")]
