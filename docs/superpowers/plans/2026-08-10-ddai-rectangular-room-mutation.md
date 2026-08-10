@@ -592,7 +592,7 @@ git commit -m "feat: model crash-safe map mutations"
 - Modify: `tests/DDAI.Core.Tests/MailboxBridgeConformanceTests.cs`
 
 **Interfaces:**
-- Bridge version becomes `0.2.0` and supported commands become `status`, `apply_plan` in that order.
+- Bridge version becomes `0.2.1` (`0.2.0` was the superseded cursor-driven live attempt) and supported commands become `status`, `apply_plan` in that order.
 - Produces: `_validate_rectangular_room_plan(plan, request_id) -> Dictionary`, empty on success or stable error on failure.
 - Produces: `_advance_apply_plan_claim(claim, request, canonical_request_text, request_fingerprint) -> String`.
 - Produces: `_execute_rectangular_room(plan, plan_fingerprint) -> Dictionary` containing a correlated response body.
