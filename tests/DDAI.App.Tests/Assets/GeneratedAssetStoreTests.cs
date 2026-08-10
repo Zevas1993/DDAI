@@ -501,61 +501,78 @@ public sealed class GeneratedAssetStoreTests
     public async Task ImportAsync_RealChildProcessCrashLeavesAnAbandonedTransactionRecoverable()
     {
         using var sandbox = new GeneratedAssetSandbox();
-        var gatePath = Path.Combine(sandbox.Root, "crash-start.gate");
-        var durableBoundaryPath = Path.Combine(sandbox.Root, "owner-manifest-durable.ready");
-        var retainedHandlePath = Path.Combine(sandbox.Root, "waiter-mutex-open.ready");
-        var allowOwnerCrashPath = Path.Combine(sandbox.Root, "parent-allows-owner-crash.ready");
-        File.WriteAllBytes(gatePath, []);
-        using var crashed = StartChildImport(
-            sandbox.Root,
-            "cross-process-crash",
-            1,
-            gatePath,
-            "crash",
-            GeneratedAssetDurableMove.Manifest.ToString(),
-            durableBoundaryPath,
-            retainedHandlePath,
-            allowOwnerCrashPath);
+        PausedCrashTopology? topology = null;
+        try
+        {
+            topology = StartPausedCrashTopology(sandbox);
+            File.WriteAllBytes(topology.AllowOwnerCrashPath, []);
 
-        Assert.True(SpinWait.SpinUntil(
-            () => File.Exists(durableBoundaryPath) || crashed.Process.HasExited,
-            TimeSpan.FromSeconds(30)), "The crash owner did not reach the manifest durability boundary.");
-        Assert.False(crashed.Process.HasExited, "The crash owner exited before a second process retained the mutex object.");
-        Assert.Single(Directory.EnumerateFiles(
-            Path.Combine(sandbox.Root, "generated-assets", "manifest"),
-            "*.json"));
+            var crashResult = await CompleteChildProcessAsync(topology.Owner);
+            Assert.NotEqual(0, crashResult.ExitCode);
+            Assert.Contains("Injected generated-asset child crash after Manifest.", crashResult.StandardError, StringComparison.Ordinal);
+            Assert.False(File.Exists(topology.Owner.ResultPath));
 
-        var waiter = StartChildImport(
-            sandbox.Root,
-            "cross-process-crash",
-            1,
-            gatePath,
-            "abandoned-waiter",
-            waitForAbandoned: true,
-            retainedHandlePath: retainedHandlePath);
-        Assert.True(SpinWait.SpinUntil(
-            () => File.Exists(retainedHandlePath) || waiter.Process.HasExited,
-            TimeSpan.FromSeconds(30)), "The recovery child did not open and retain the owner's mutex object.");
-        Assert.False(waiter.Process.HasExited, "The recovery child exited before the owner crash.");
-        File.WriteAllBytes(allowOwnerCrashPath, []);
+            var recovered = await CompleteChildImportAsync(topology.Waiter);
+            Assert.True(File.Exists(sandbox.ReceiptPath("cross-process-crash")));
+            var replay = await CompleteChildImportAsync(StartChildImport(
+                sandbox.Root, "cross-process-crash", 1, topology.GatePath, "replay"));
+            Assert.True(recovered.Success, recovered.Code);
+            Assert.True(recovered.AbandonedObserved);
+            Assert.True(recovered.Duplicate);
+            Assert.True(replay.Success, replay.Code);
+            Assert.False(replay.AbandonedObserved);
+            Assert.Equal(recovered.GeneratedAssetId, replay.GeneratedAssetId);
+            Assert.True(replay.Duplicate);
+            Assert.Empty(Directory.EnumerateFiles(sandbox.Root, "*.next", SearchOption.AllDirectories));
+        }
+        finally
+        {
+            topology?.Dispose();
+        }
+    }
 
-        var crashResult = await CompleteChildProcessAsync(crashed);
-        Assert.NotEqual(0, crashResult.ExitCode);
-        Assert.Contains("Injected generated-asset child crash after Manifest.", crashResult.StandardError, StringComparison.Ordinal);
-        Assert.False(File.Exists(crashed.ResultPath));
+    [Fact]
+    public void AbandonedOwnerChildTopology_EarlyFailureTerminatesBothProcessesBeforeSandboxCleanup()
+    {
+        var sandbox = new GeneratedAssetSandbox();
+        var root = sandbox.Root;
+        PausedCrashTopology? topology = null;
+        Exception? cleanupFailure = null;
+        var cleanupElapsed = new Stopwatch();
+        try
+        {
+            topology = StartPausedCrashTopology(sandbox);
+            throw new InjectedChildTopologyException();
+        }
+        catch (InjectedChildTopologyException)
+        {
+        }
+        finally
+        {
+            try
+            {
+                cleanupElapsed.Start();
+                topology?.Dispose();
+                cleanupElapsed.Stop();
+            }
+            catch (Exception exception)
+            {
+                cleanupFailure = exception;
+            }
+            finally
+            {
+                sandbox.Dispose();
+            }
+        }
 
-        var recovered = await CompleteChildImportAsync(waiter);
-        Assert.True(File.Exists(sandbox.ReceiptPath("cross-process-crash")));
-        var replay = await CompleteChildImportAsync(StartChildImport(
-            sandbox.Root, "cross-process-crash", 1, gatePath, "replay"));
-        Assert.True(recovered.Success, recovered.Code);
-        Assert.True(recovered.AbandonedObserved);
-        Assert.True(recovered.Duplicate);
-        Assert.True(replay.Success, replay.Code);
-        Assert.False(replay.AbandonedObserved);
-        Assert.Equal(recovered.GeneratedAssetId, replay.GeneratedAssetId);
-        Assert.True(replay.Duplicate);
-        Assert.Empty(Directory.EnumerateFiles(sandbox.Root, "*.next", SearchOption.AllDirectories));
+        Assert.Null(cleanupFailure);
+        Assert.NotNull(topology);
+        Assert.True(topology.Owner.ProcessTreeExitConfirmed);
+        Assert.True(topology.Waiter.ProcessTreeExitConfirmed);
+        Assert.True(topology.Owner.CapturedDescendantCount > 0);
+        Assert.True(topology.Waiter.CapturedDescendantCount > 0);
+        Assert.False(Directory.Exists(root));
+        Assert.True(cleanupElapsed.Elapsed < TimeSpan.FromSeconds(15), $"Child cleanup took {cleanupElapsed.Elapsed}.");
     }
 
     [Fact]
@@ -1005,6 +1022,77 @@ public sealed class GeneratedAssetStoreTests
         Assert.InRange(Math.Abs(expected.Blue - actual.Blue), 0, 20);
     }
 
+    private static PausedCrashTopology StartPausedCrashTopology(GeneratedAssetSandbox sandbox)
+    {
+        var gatePath = Path.Combine(sandbox.Root, "crash-start.gate");
+        var durableBoundaryPath = Path.Combine(sandbox.Root, "owner-manifest-durable.ready");
+        var retainedHandlePath = Path.Combine(sandbox.Root, "waiter-mutex-open.ready");
+        var allowOwnerCrashPath = Path.Combine(sandbox.Root, "parent-allows-owner-crash.ready");
+        File.WriteAllBytes(gatePath, []);
+        RunningChildImport? owner = null;
+        RunningChildImport? waiter = null;
+        try
+        {
+            owner = StartChildImport(
+                sandbox.Root,
+                "cross-process-crash",
+                1,
+                gatePath,
+                "crash",
+                GeneratedAssetDurableMove.Manifest.ToString(),
+                durableBoundaryPath,
+                retainedHandlePath,
+                allowOwnerCrashPath);
+            Assert.True(SpinWait.SpinUntil(
+                () => File.Exists(durableBoundaryPath) || owner.Process.HasExited,
+                TimeSpan.FromSeconds(30)), "The crash owner did not reach the manifest durability boundary.");
+            Assert.False(owner.Process.HasExited, "The crash owner exited before a second process retained the mutex object.");
+            Assert.Single(Directory.EnumerateFiles(
+                Path.Combine(sandbox.Root, "generated-assets", "manifest"),
+                "*.json"));
+
+            waiter = StartChildImport(
+                sandbox.Root,
+                "cross-process-crash",
+                1,
+                gatePath,
+                "abandoned-waiter",
+                waitForAbandoned: true,
+                retainedHandlePath: retainedHandlePath);
+            Assert.True(SpinWait.SpinUntil(
+                () => File.Exists(retainedHandlePath) || waiter.Process.HasExited,
+                TimeSpan.FromSeconds(30)), "The recovery child did not open and retain the owner's mutex object.");
+            Assert.False(waiter.Process.HasExited, "The recovery child exited before the owner crash.");
+            return new PausedCrashTopology(owner, waiter, gatePath, allowOwnerCrashPath);
+        }
+        catch
+        {
+            DisposeChildProcesses(waiter, owner);
+            throw;
+        }
+    }
+
+    private static void DisposeChildProcesses(params RunningChildImport?[] children)
+    {
+        Exception? failure = null;
+        foreach (var child in children)
+        {
+            if (child is null) continue;
+            try
+            {
+                child.Dispose();
+            }
+            catch (Exception exception)
+            {
+                failure ??= exception;
+            }
+        }
+        if (failure is not null)
+        {
+            throw new InvalidOperationException("A generated-asset child process could not be cleaned up.", failure);
+        }
+    }
+
     private static RunningChildImport StartChildImport(
         string root,
         string key,
@@ -1075,6 +1163,106 @@ public sealed class GeneratedAssetStoreTests
         GeneratedAssetImportRequest request) =>
         new GeneratedAssetStore(root).ImportAsync(request).GetAwaiter().GetResult();
 
+    private static IReadOnlyList<Process> CaptureDescendantProcesses(int rootProcessId)
+    {
+        using var snapshot = CreateToolhelp32Snapshot(0x00000002, 0);
+        if (snapshot.IsInvalid)
+        {
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        }
+        var entry = new ProcessEntry32
+        {
+            Size = checked((uint)Marshal.SizeOf<ProcessEntry32>()),
+            ExecutableFile = string.Empty,
+        };
+        var childrenByParent = new Dictionary<int, List<int>>();
+        if (Process32First(snapshot, ref entry))
+        {
+            do
+            {
+                var parent = checked((int)entry.ParentProcessId);
+                var process = checked((int)entry.ProcessId);
+                if (!childrenByParent.TryGetValue(parent, out var children))
+                {
+                    children = [];
+                    childrenByParent.Add(parent, children);
+                }
+                children.Add(process);
+                entry.Size = checked((uint)Marshal.SizeOf<ProcessEntry32>());
+            }
+            while (Process32Next(snapshot, ref entry));
+            var error = Marshal.GetLastWin32Error();
+            if (error != 18)
+            {
+                throw new System.ComponentModel.Win32Exception(error);
+            }
+        }
+        else
+        {
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        }
+
+        var result = new List<Process>();
+        var pending = new Queue<int>();
+        pending.Enqueue(rootProcessId);
+        try
+        {
+            while (pending.TryDequeue(out var parent))
+            {
+                if (!childrenByParent.TryGetValue(parent, out var children)) continue;
+                foreach (var childId in children)
+                {
+                    pending.Enqueue(childId);
+                    try
+                    {
+                        var process = Process.GetProcessById(childId);
+                        try
+                        {
+                            _ = process.SafeHandle;
+                            result.Add(process);
+                        }
+                        catch
+                        {
+                            process.Dispose();
+                            throw;
+                        }
+                    }
+                    catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
+                    {
+                        // The exact child exited between the snapshot and eagerly opening its native handle.
+                    }
+                }
+            }
+            return result;
+        }
+        catch
+        {
+            foreach (var process in result) process.Dispose();
+            throw;
+        }
+    }
+
+    private static bool WaitForExactProcessTreeExit(
+        Process root,
+        IReadOnlyList<Process> descendants,
+        TimeSpan timeout)
+    {
+        var elapsed = Stopwatch.StartNew();
+        if (!WaitForExactProcessExit(root, elapsed, timeout)) return false;
+        foreach (var descendant in descendants)
+        {
+            if (!WaitForExactProcessExit(descendant, elapsed, timeout)) return false;
+        }
+        return true;
+    }
+
+    private static bool WaitForExactProcessExit(Process process, Stopwatch elapsed, TimeSpan timeout)
+    {
+        if (process.HasExited) return true;
+        var remaining = timeout - elapsed.Elapsed;
+        return remaining > TimeSpan.Zero && process.WaitForExit(checked((int)Math.Ceiling(remaining.TotalMilliseconds)));
+    }
+
     private static void CreateDirectoryJunction(string linkPath, string targetPath)
     {
         using var process = Process.Start(new ProcessStartInfo
@@ -1120,6 +1308,32 @@ public sealed class GeneratedAssetStoreTests
         public IntPtr SecurityDescriptor;
         [MarshalAs(UnmanagedType.Bool)] public bool InheritHandle;
     }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct ProcessEntry32
+    {
+        public uint Size;
+        public uint UsageCount;
+        public uint ProcessId;
+        public UIntPtr DefaultHeapId;
+        public uint ModuleId;
+        public uint ThreadCount;
+        public uint ParentProcessId;
+        public int PriorityBase;
+        public uint Flags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string ExecutableFile;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern SafeFileHandle CreateToolhelp32Snapshot(uint flags, uint processId);
+
+    [DllImport("kernel32.dll", EntryPoint = "Process32FirstW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32First(SafeFileHandle snapshot, ref ProcessEntry32 entry);
+
+    [DllImport("kernel32.dll", EntryPoint = "Process32NextW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32Next(SafeFileHandle snapshot, ref ProcessEntry32 entry);
 
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -1271,6 +1485,7 @@ public sealed class GeneratedAssetStoreTests
     }
 
     private sealed class InjectedDurabilityException : IOException;
+    private sealed class InjectedChildTopologyException : IOException;
 
     private sealed record ChildImportOutcome(
         bool Success,
@@ -1287,6 +1502,58 @@ public sealed class GeneratedAssetStoreTests
         string ResultPath,
         string ReadyPath) : IDisposable
     {
-        public void Dispose() => Process.Dispose();
+        private int disposed;
+
+        public int CapturedDescendantCount { get; private set; }
+        public bool ProcessTreeExitConfirmed { get; private set; }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+            IReadOnlyList<Process> descendants = [];
+            try
+            {
+                descendants = CaptureDescendantProcesses(Process.Id);
+                CapturedDescendantCount = descendants.Count;
+                if (!Process.HasExited)
+                {
+                    try { Process.Kill(entireProcessTree: true); }
+                    catch (InvalidOperationException) { }
+                }
+                ProcessTreeExitConfirmed = WaitForExactProcessTreeExit(
+                    Process,
+                    descendants,
+                    TimeSpan.FromSeconds(5));
+                if (!ProcessTreeExitConfirmed)
+                {
+                    throw new TimeoutException($"Child process tree {Process.Id} did not exit after bounded cleanup.");
+                }
+            }
+            finally
+            {
+                foreach (var descendant in descendants) descendant.Dispose();
+                Process.Dispose();
+            }
+        }
+    }
+
+    private sealed class PausedCrashTopology(
+        RunningChildImport owner,
+        RunningChildImport waiter,
+        string gatePath,
+        string allowOwnerCrashPath) : IDisposable
+    {
+        private int disposed;
+
+        public RunningChildImport Owner { get; } = owner;
+        public RunningChildImport Waiter { get; } = waiter;
+        public string GatePath { get; } = gatePath;
+        public string AllowOwnerCrashPath { get; } = allowOwnerCrashPath;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+            DisposeChildProcesses(Waiter, Owner);
+        }
     }
 }
