@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Collections.Immutable;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
@@ -6,6 +7,8 @@ using System.Text;
 using System.Text.Json;
 using DDAI.Core.Assets;
 using Microsoft.Win32.SafeHandles;
+
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("DDAI.App.Tests")]
 
 namespace DDAI.App.Assets;
 
@@ -77,6 +80,7 @@ public sealed class AssetCatalogRepository
             or JsonException
             or InvalidDataException
             or CryptographicException
+            or Win32Exception
             or OverflowException)
         {
             return false;
@@ -95,12 +99,12 @@ public sealed class AssetCatalogRepository
         try
         {
             RequireExistingOrdinaryDirectory(catalogRoot, "Catalog root");
-            RequireExistingOrdinaryDirectory(previewsRoot, "Preview directory");
             var previewPath = Path.Combine(previewsRoot, previewHash + ".png");
             RequireBeneath(previewsRoot, previewPath);
-            RequireOrdinaryPath(previewsRoot, previewPath);
             var bytes = ReadBoundedFile(previewPath, MaximumPreviewBytes);
-            return string.Equals(Hash(bytes), previewHash, StringComparison.Ordinal) ? bytes : null;
+            return IsBoundedPng(bytes) && string.Equals(Hash(bytes), previewHash, StringComparison.Ordinal)
+                ? bytes
+                : null;
         }
         catch (Exception exception) when (exception is IOException
             or UnauthorizedAccessException
@@ -108,7 +112,8 @@ public sealed class AssetCatalogRepository
             or NotSupportedException
             or PathTooLongException
             or InvalidDataException
-            or CryptographicException)
+            or CryptographicException
+            or Win32Exception)
         {
             return null;
         }
@@ -335,7 +340,7 @@ public sealed class AssetCatalogRepository
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "Catalog file final path could not be read.");
             }
 
-            if (length < buffer.Capacity - 1)
+            if (FinalPathFitsBuffer(length, buffer.Capacity))
             {
                 var finalPath = buffer.ToString();
                 return finalPath.StartsWith("\\\\?\\UNC\\", StringComparison.OrdinalIgnoreCase)
@@ -391,6 +396,134 @@ public sealed class AssetCatalogRepository
             Path.TrimEndingDirectorySeparator(Path.GetFullPath(left)),
             Path.TrimEndingDirectorySeparator(Path.GetFullPath(right)),
             StringComparison.OrdinalIgnoreCase);
+
+    internal static bool FinalPathFitsBuffer(uint returnedLength, int bufferCapacity) =>
+        returnedLength < bufferCapacity;
+
+    private static bool IsBoundedPng(ReadOnlySpan<byte> bytes)
+    {
+        ReadOnlySpan<byte> signature = [137, 80, 78, 71, 13, 10, 26, 10];
+        if (bytes.Length < signature.Length || !bytes[..signature.Length].SequenceEqual(signature))
+        {
+            return false;
+        }
+
+        var offset = signature.Length;
+        var hasHeader = false;
+        var hasPalette = false;
+        var hasImageData = false;
+        var colorType = -1;
+        while (offset < bytes.Length)
+        {
+            if (bytes.Length - offset < 12)
+            {
+                return false;
+            }
+
+            var dataLength = BinaryPrimitives.ReadUInt32BigEndian(bytes.Slice(offset, 4));
+            if (dataLength > int.MaxValue || dataLength > bytes.Length - offset - 12)
+            {
+                return false;
+            }
+
+            var type = bytes.Slice(offset + 4, 4);
+            var data = bytes.Slice(offset + 8, (int)dataLength);
+            var expectedCrc = BinaryPrimitives.ReadUInt32BigEndian(bytes.Slice(offset + 8 + (int)dataLength, 4));
+            if (ComputePngCrc(type, data) != expectedCrc)
+            {
+                return false;
+            }
+
+            if (!hasHeader)
+            {
+                if (!type.SequenceEqual("IHDR"u8) || data.Length != 13 || !IsValidHeader(data, out colorType))
+                {
+                    return false;
+                }
+
+                hasHeader = true;
+            }
+            else if (type.SequenceEqual("PLTE"u8))
+            {
+                if (hasPalette || hasImageData || data.Length == 0 || data.Length % 3 != 0 || data.Length > 768 ||
+                    colorType is 0 or 4)
+                {
+                    return false;
+                }
+
+                hasPalette = true;
+            }
+            else if (type.SequenceEqual("IDAT"u8))
+            {
+                if (data.Length == 0 || colorType == 3 && !hasPalette)
+                {
+                    return false;
+                }
+
+                hasImageData = true;
+            }
+            else if (type.SequenceEqual("IEND"u8))
+            {
+                return data.Length == 0 && hasImageData && offset + 12 + (int)dataLength == bytes.Length;
+            }
+            else if ((type[0] & 0x20) == 0)
+            {
+                return false;
+            }
+
+            offset += 12 + (int)dataLength;
+        }
+
+        return false;
+    }
+
+    private static bool IsValidHeader(ReadOnlySpan<byte> header, out int colorType)
+    {
+        var width = BinaryPrimitives.ReadUInt32BigEndian(header);
+        var height = BinaryPrimitives.ReadUInt32BigEndian(header.Slice(4));
+        var bitDepth = header[8];
+        colorType = header[9];
+        if (width is 0 or > 256 || height is 0 or > 256 || header[10] != 0 || header[11] != 0 || header[12] > 1)
+        {
+            return false;
+        }
+
+        return colorType switch
+        {
+            0 => bitDepth is 1 or 2 or 4 or 8 or 16,
+            2 => bitDepth is 8 or 16,
+            3 => bitDepth is 1 or 2 or 4 or 8,
+            4 or 6 => bitDepth is 8 or 16,
+            _ => false,
+        };
+    }
+
+    private static uint ComputePngCrc(ReadOnlySpan<byte> type, ReadOnlySpan<byte> data)
+    {
+        var crc = 0xFFFFFFFFu;
+        foreach (var value in type)
+        {
+            crc = UpdatePngCrc(crc, value);
+        }
+
+        foreach (var value in data)
+        {
+            crc = UpdatePngCrc(crc, value);
+        }
+
+        return ~crc;
+    }
+
+    private static uint UpdatePngCrc(uint crc, byte value)
+    {
+        crc ^= value;
+        for (var bit = 0; bit < 8; bit++)
+        {
+            crc = (crc & 1) == 0 ? crc >> 1 : (crc >> 1) ^ 0xEDB88320u;
+        }
+
+        return crc;
+    }
 
     private static bool IsCanonicalHash(string? value)
     {

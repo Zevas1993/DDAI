@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -64,18 +66,17 @@ public sealed class AssetCatalogRepositoryTests
         File.Copy(sandbox.ManifestPath, Path.Combine(external, "manifest.json"));
         File.Copy(sandbox.ChunkPath, Path.Combine(external, "assets-000.json"));
         var link = Path.Combine(sandbox.SnapshotsPath, "linked");
+        CreateDirectoryJunction(link, external);
         try
         {
-            Directory.CreateSymbolicLink(link, external);
+            sandbox.WriteCurrent("linked/manifest.json", sandbox.SessionId);
+
+            Assert.False(new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider).TryRefresh());
         }
-        catch (Exception exception) when (exception is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
+        finally
         {
-            return;
+            Directory.Delete(link);
         }
-
-        sandbox.WriteCurrent("linked/manifest.json", sandbox.SessionId);
-
-        Assert.False(new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider).TryRefresh());
     }
 
     [Fact]
@@ -199,11 +200,28 @@ public sealed class AssetCatalogRepositoryTests
     }
 
     [Fact]
-    public void OpenPreview_RejectsHashMismatchAndReturnsVerifiedBytes()
+    public void OpenPreview_ReturnsNullWhenPreviewIsAbsent()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete();
+
+        Assert.Null(new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider).OpenPreview(new string('a', 64)));
+    }
+
+    [Fact]
+    public void TryRefresh_ReturnsFalseWhenPointerIsAbsent()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete();
+        File.Delete(sandbox.CurrentPath);
+
+        Assert.False(new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider).TryRefresh());
+    }
+
+    [Fact]
+    public void OpenPreview_ReturnsVerifiedOneByOnePngAndRejectsHashMismatch()
     {
         using var sandbox = CatalogSandbox.CreateComplete();
         var repository = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
-        var valid = Encoding.UTF8.GetBytes("bounded png derivative");
+        var valid = PngFixture.OneByOne;
         var validHash = sandbox.WritePreviewForContent(valid);
 
         Assert.Equal(valid, repository.OpenPreview(validHash));
@@ -213,25 +231,59 @@ public sealed class AssetCatalogRepositoryTests
     }
 
     [Fact]
-    public void OpenPreview_RejectsPreviewReparsePointWhenSupported()
+    public void OpenPreview_RejectsNonPngAndInvalidPngDimensions()
     {
         using var sandbox = CatalogSandbox.CreateComplete();
         var repository = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
-        var content = Encoding.UTF8.GetBytes("outside preview");
-        var hash = Convert.ToHexString(SHA256.HashData(content)).ToLowerInvariant();
-        var external = Path.Combine(sandbox.Root, "outside.png");
-        File.WriteAllBytes(external, content);
-        var preview = Path.Combine(sandbox.PreviewsPath, hash + ".png");
-        try
-        {
-            File.CreateSymbolicLink(preview, external);
-        }
-        catch (Exception exception) when (exception is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
-        {
-            return;
-        }
+
+        var notPngHash = sandbox.WritePreviewForContent(Encoding.ASCII.GetBytes("GIF89a"));
+        var zeroWidthHash = sandbox.WritePreviewForContent(PngFixture.WithDimensions(0, 1));
+        var oversizedHeightHash = sandbox.WritePreviewForContent(PngFixture.WithDimensions(1, 257));
+
+        Assert.Null(repository.OpenPreview(notPngHash));
+        Assert.Null(repository.OpenPreview(zeroWidthHash));
+        Assert.Null(repository.OpenPreview(oversizedHeightHash));
+    }
+
+    [Fact]
+    public void OpenPreview_RejectsMalformedPng()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete();
+        var repository = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
+        var malformed = PngFixture.OneByOne[..24];
+        var hash = sandbox.WritePreviewForContent(malformed);
 
         Assert.Null(repository.OpenPreview(hash));
+    }
+
+    [Fact]
+    public void OpenPreview_RejectsPreviewReparsePointThroughOpenedHandle()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete();
+        var repository = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
+        var content = PngFixture.OneByOne;
+        var hash = Convert.ToHexString(SHA256.HashData(content)).ToLowerInvariant();
+        var external = Path.Combine(sandbox.Root, "outside.png");
+        Directory.CreateDirectory(external);
+        var preview = Path.Combine(sandbox.PreviewsPath, hash + ".png");
+        File.WriteAllBytes(Path.Combine(external, hash + ".png"), content);
+        Directory.Delete(sandbox.PreviewsPath);
+        CreateDirectoryJunction(sandbox.PreviewsPath, external);
+        try
+        {
+            Assert.Null(repository.OpenPreview(hash));
+        }
+        finally
+        {
+            Directory.Delete(sandbox.PreviewsPath);
+        }
+    }
+
+    [Fact]
+    public void FinalPathBufferCapacity_AcceptsAnExact511CharacterFinalPath()
+    {
+        Assert.True(AssetCatalogRepository.FinalPathFitsBuffer(511, 512));
+        Assert.False(AssetCatalogRepository.FinalPathFitsBuffer(512, 512));
     }
 
     private sealed class CatalogSandbox : IDisposable
@@ -410,5 +462,49 @@ public sealed class AssetCatalogRepositoryTests
     private sealed class FixedTimeProvider : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => CatalogSandbox.Now;
+    }
+
+    private static void CreateDirectoryJunction(string linkPath, string targetPath)
+    {
+        using var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = "cmd.exe",
+            Arguments = $"/c mklink /J \"{linkPath}\" \"{targetPath}\"",
+            CreateNoWindow = true,
+            UseShellExecute = false,
+        }) ?? throw new InvalidOperationException("cmd.exe could not create the junction fixture.");
+        process.WaitForExit();
+        Assert.True(process.ExitCode == 0 && Directory.Exists(linkPath), "The Windows junction fixture could not be created.");
+    }
+
+    private static class PngFixture
+    {
+        // Hand-checked PNG: signature, 13-byte IHDR for 1x1, one IDAT, and IEND.
+        public static readonly byte[] OneByOne = Convert.FromBase64String(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFAAH/VscvDQAAAABJRU5ErkJggg==");
+
+        public static byte[] WithDimensions(uint width, uint height)
+        {
+            var bytes = OneByOne.ToArray();
+            BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(16, 4), width);
+            BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(20, 4), height);
+            BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(29, 4), ComputeCrc(bytes.AsSpan(12, 17)));
+            return bytes;
+        }
+
+        private static uint ComputeCrc(ReadOnlySpan<byte> bytes)
+        {
+            var crc = 0xFFFFFFFFu;
+            foreach (var value in bytes)
+            {
+                crc ^= value;
+                for (var bit = 0; bit < 8; bit++)
+                {
+                    crc = (crc & 1) == 0 ? crc >> 1 : (crc >> 1) ^ 0xEDB88320u;
+                }
+            }
+
+            return ~crc;
+        }
     }
 }
