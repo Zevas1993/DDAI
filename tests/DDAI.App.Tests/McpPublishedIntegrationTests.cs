@@ -4,17 +4,70 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using DDAI.App.Assets;
 using DDAI.Core.Assets;
 using DDAI.Core.Mailbox;
 using DDAI.Core.MapPlans;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
+using SkiaSharp;
 
 namespace DDAI.App.Tests;
 
 [Collection("Published executable")]
 public sealed class McpPublishedIntegrationTests
 {
+    [Fact(Timeout = 120_000)]
+    public async Task SdkClient_DiscoversAndCallsPublishedAssetPreviewWithBoundedPngContent()
+    {
+        using var sandbox = new TestDirectory();
+        var asset = sandbox.PublishAcceptedAssetCatalog(includePreview: true);
+        var executable = PublishSingleFile(sandbox.PublishDirectory);
+        var stderr = new ConcurrentQueue<string>();
+        var transport = new StdioClientTransport(new StdioClientTransportOptions
+        {
+            Name = "ddai-published-asset-preview-integration",
+            Command = executable,
+            Arguments = ["serve", "--stdio", "--mailbox-root", sandbox.MailboxDirectory, "--timeout-ms", "2000"],
+            WorkingDirectory = sandbox.PublishDirectory,
+            ShutdownTimeout = TimeSpan.FromSeconds(5),
+            StandardErrorLines = stderr.Enqueue,
+        });
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        await using var client = await McpClient.CreateAsync(transport, cancellationToken: deadline.Token);
+        var tool = Assert.Single(
+            await client.ListToolsAsync(cancellationToken: deadline.Token),
+            candidate => candidate.Name == "ddai_get_asset_preview");
+        Assert.True(tool.ProtocolTool.InputSchema.GetProperty("properties").TryGetProperty("assetRef", out _));
+
+        var result = await client.CallToolAsync(
+            "ddai_get_asset_preview",
+            new Dictionary<string, object?> { ["assetRef"] = asset.AssetRef },
+            cancellationToken: deadline.Token);
+
+        Assert.Null(result.IsError);
+        var text = Assert.IsType<TextContentBlock>(Assert.Single(result.Content.OfType<TextContentBlock>())).Text;
+        var image = Assert.IsType<ImageContentBlock>(Assert.Single(result.Content.OfType<ImageContentBlock>()));
+        Assert.Equal(2, result.Content.Count);
+        Assert.Equal("image/png", image.MimeType);
+        Assert.Equal(sandbox.PreviewBytes, image.DecodedData.ToArray());
+        Assert.True(image.DecodedData.Length <= AssetCatalogRepository.MaximumPreviewBytes);
+        using var bitmap = SKBitmap.Decode(image.DecodedData.ToArray());
+        Assert.NotNull(bitmap);
+        Assert.Equal(1, bitmap.Width);
+        Assert.Equal(1, bitmap.Height);
+        Assert.True(result.StructuredContent.HasValue);
+        using var textDocument = JsonDocument.Parse(text);
+        Assert.Equal(asset.AssetRef, textDocument.RootElement.GetProperty("asset_ref").GetString());
+        Assert.Equal("image/png", textDocument.RootElement.GetProperty("mime_type").GetString());
+        Assert.Equal(image.DecodedData.Length, textDocument.RootElement.GetProperty("byte_count").GetInt32());
+        Assert.True(JsonNode.DeepEquals(
+            JsonNode.Parse(text),
+            JsonNode.Parse(result.StructuredContent.Value.GetRawText())));
+        Assert.Empty(stderr);
+    }
+
     [Fact(Timeout = 120_000)]
     public async Task SdkClient_DiscoversBindsAndCallsPublishedAssetSearchWithStructuredContent()
     {
@@ -222,11 +275,20 @@ public sealed class McpPublishedIntegrationTests
         public string PublishDirectory { get; }
         public string MailboxDirectory { get; }
 
-        public void PublishAcceptedAssetCatalog()
+        public byte[] PreviewBytes { get; } = Convert.FromBase64String(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFAAH/VscvDQAAAABJRU5ErkJggg==");
+
+        public AssetCatalogEntry PublishAcceptedAssetCatalog(bool includePreview = false)
         {
             var catalogRoot = Path.Combine(MailboxDirectory, "catalog");
             var snapshotRoot = Path.Combine(catalogRoot, "snapshots", "fixture-snapshot");
             Directory.CreateDirectory(snapshotRoot);
+            var previewHash = includePreview ? Hash(PreviewBytes) : null;
+            if (previewHash is not null)
+            {
+                Directory.CreateDirectory(Path.Combine(catalogRoot, "previews"));
+                File.WriteAllBytes(Path.Combine(catalogRoot, "previews", previewHash + ".png"), PreviewBytes);
+            }
             var entry = new AssetCatalogEntry(
                 AssetReference.Create("official-pack", "Objects", "resource/ancient-gate"),
                 "Objects",
@@ -236,7 +298,7 @@ public sealed class McpPublishedIntegrationTests
                 "Official Pack",
                 ["ancient"],
                 ["fixture"],
-                null,
+                previewHash,
                 false,
                 false);
             var chunkBytes = Encoding.UTF8.GetBytes(AssetCatalogJson.SerializeChunk([entry]));
@@ -256,6 +318,7 @@ public sealed class McpPublishedIntegrationTests
             File.WriteAllText(
                 Path.Combine(catalogRoot, "current.json"),
                 JsonSerializer.Serialize(new { manifest = "fixture-snapshot/manifest.json", session_id = "published-fixture" }));
+            return entry;
         }
 
         public void Dispose() => Directory.Delete(Root, recursive: true);

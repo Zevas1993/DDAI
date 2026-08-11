@@ -1,6 +1,9 @@
 using System.Collections.Immutable;
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using DDAI.App.Assets;
 using DDAI.App.Mcp;
 using DDAI.Core.Assets;
@@ -18,6 +21,19 @@ public sealed class DdaiAssetToolTests
         var attribute = Assert.Single(method!.GetCustomAttributes<McpServerToolAttribute>());
 
         Assert.Equal("ddai_search_assets", attribute.Name);
+        Assert.True(attribute.ReadOnly);
+        Assert.False(attribute.Destructive);
+        Assert.True(attribute.Idempotent);
+        Assert.False(attribute.OpenWorld);
+    }
+
+    [Fact]
+    public void GetAssetPreview_DeclaresClosedReadOnlySafetyMetadata()
+    {
+        var method = typeof(DdaiAssetTools).GetMethod(nameof(DdaiAssetTools.GetAssetPreview));
+        var attribute = Assert.Single(method!.GetCustomAttributes<McpServerToolAttribute>());
+
+        Assert.Equal("ddai_get_asset_preview", attribute.Name);
         Assert.True(attribute.ReadOnly);
         Assert.False(attribute.Destructive);
         Assert.True(attribute.Idempotent);
@@ -134,6 +150,56 @@ public sealed class DdaiAssetToolTests
         Assert.DoesNotContain("101", ErrorText(invalid), StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void GetAssetPreview_ReturnsVerifiedPngWithStructuredMetadataAndExactlyOneTextAndImageBlock()
+    {
+        using var sandbox = new PreviewCatalogSandbox();
+        var asset = sandbox.PublishAssetWithPreview();
+        var repository = new AssetCatalogRepository(sandbox.CatalogRoot, sandbox.TimeProvider);
+
+        var result = DdaiAssetTools.GetAssetPreview(asset.AssetRef, repository);
+
+        Assert.Null(result.IsError);
+        var image = Assert.Single(result.Content.OfType<ImageContentBlock>());
+        var text = Assert.Single(result.Content.OfType<TextContentBlock>());
+        Assert.Equal(2, result.Content.Count);
+        Assert.NotNull(result.StructuredContent);
+        Assert.Equal("image/png", image.MimeType);
+        Assert.Equal(sandbox.PreviewBytes, image.DecodedData.ToArray());
+        using var structured = StructuredJson(result);
+        using var textJson = JsonDocument.Parse(text.Text);
+        Assert.Equal(asset.AssetRef, structured.RootElement.GetProperty("asset_ref").GetString());
+        Assert.Equal("image/png", structured.RootElement.GetProperty("mime_type").GetString());
+        Assert.Equal(sandbox.PreviewBytes.Length, structured.RootElement.GetProperty("byte_count").GetInt32());
+        Assert.True(JsonNode.DeepEquals(
+            JsonNode.Parse(structured.RootElement.GetRawText()),
+            JsonNode.Parse(textJson.RootElement.GetRawText())));
+    }
+
+    [Fact]
+    public void GetAssetPreview_ReturnsStructuredBoundedErrorsWithoutPathOrUriLeakage()
+    {
+        using var sandbox = new PreviewCatalogSandbox();
+        var asset = sandbox.PublishAssetWithPreview();
+        var repository = new AssetCatalogRepository(sandbox.CatalogRoot, sandbox.TimeProvider);
+
+        var absent = DdaiAssetTools.GetAssetPreview("sha256:" + new string('f', 64), repository);
+        var unavailable = DdaiAssetTools.GetAssetPreview(asset.AssetRef, new AssetCatalogRepository(
+            Path.Combine(sandbox.Root, "missing-catalog"), sandbox.TimeProvider));
+
+        Assert.True(absent.IsError);
+        Assert.Equal("asset_not_found", ErrorCode(absent));
+        Assert.True(unavailable.IsError);
+        Assert.Equal("catalog_unavailable", ErrorCode(unavailable));
+        Assert.NotNull(absent.StructuredContent);
+        Assert.NotNull(unavailable.StructuredContent);
+        Assert.DoesNotContain(sandbox.CatalogRoot, ErrorText(absent), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("file:", ErrorText(unavailable), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("path", ErrorText(unavailable), StringComparison.OrdinalIgnoreCase);
+        using var unavailableStructured = StructuredJson(unavailable);
+        Assert.Equal("catalog_unavailable", unavailableStructured.RootElement.GetProperty("error").GetString());
+    }
+
     private static JsonDocument StructuredJson(CallToolResult result) =>
         JsonDocument.Parse(JsonSerializer.Serialize(result.StructuredContent));
 
@@ -205,5 +271,73 @@ public sealed class DdaiAssetToolTests
     private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => now;
+    }
+
+    private sealed class PreviewCatalogSandbox : IDisposable
+    {
+        private static readonly DateTimeOffset SnapshotAt = new(2026, 8, 10, 18, 0, 0, TimeSpan.Zero);
+
+        public PreviewCatalogSandbox()
+        {
+            Root = Path.Combine(Path.GetTempPath(), "ddai-asset-preview-tool-tests", Guid.NewGuid().ToString("N"));
+            CatalogRoot = Path.Combine(Root, "catalog");
+            Directory.CreateDirectory(Path.Combine(CatalogRoot, "snapshots", "snapshot-1"));
+            Directory.CreateDirectory(Path.Combine(CatalogRoot, "previews"));
+            TimeProvider = new FixedTimeProvider(SnapshotAt);
+        }
+
+        public string Root { get; }
+        public string CatalogRoot { get; }
+        public TimeProvider TimeProvider { get; }
+        public byte[] PreviewBytes { get; } = Convert.FromBase64String(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFAAH/VscvDQAAAABJRU5ErkJggg==");
+
+        public AssetCatalogEntry PublishAssetWithPreview()
+        {
+            var previewHash = Hash(PreviewBytes);
+            File.WriteAllBytes(Path.Combine(CatalogRoot, "previews", previewHash + ".png"), PreviewBytes);
+            var entry = new AssetCatalogEntry(
+                AssetReference.Create("official-pack", "Objects", "resource/ancient-gate"),
+                "Objects",
+                "Ancient Gate",
+                Hash(Encoding.UTF8.GetBytes("resource/ancient-gate")),
+                "official-pack",
+                "Official Pack",
+                ["ancient"],
+                ["fixture"],
+                previewHash,
+                true,
+                false);
+            var chunkBytes = Encoding.UTF8.GetBytes(AssetCatalogJson.SerializeChunk([entry]));
+            var manifest = new AssetCatalogManifest(
+                AssetCatalogManifest.CurrentSchemaVersion,
+                "preview-session",
+                1,
+                new string('0', 64),
+                SnapshotAt,
+                true,
+                AssetCategory.All.ToDictionary(category => category, category => category == "Objects" ? 1 : 0, StringComparer.Ordinal),
+                [new AssetCatalogChunk("assets-000.json", Hash(chunkBytes), 1, chunkBytes.LongLength)],
+                []);
+            manifest = manifest with { CatalogFingerprint = AssetCatalogJson.ComputeCatalogFingerprint(manifest) };
+            var snapshotRoot = Path.Combine(CatalogRoot, "snapshots", "snapshot-1");
+            File.WriteAllBytes(Path.Combine(snapshotRoot, "assets-000.json"), chunkBytes);
+            File.WriteAllText(Path.Combine(snapshotRoot, "manifest.json"), AssetCatalogJson.SerializeManifest(manifest));
+            File.WriteAllText(
+                Path.Combine(CatalogRoot, "current.json"),
+                JsonSerializer.Serialize(new { manifest = "snapshot-1/manifest.json", session_id = "preview-session" }));
+            return entry;
+        }
+
+        public void Dispose()
+        {
+            if (Directory.Exists(Root))
+            {
+                Directory.Delete(Root, recursive: true);
+            }
+        }
+
+        private static string Hash(byte[] bytes) =>
+            Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
     }
 }
