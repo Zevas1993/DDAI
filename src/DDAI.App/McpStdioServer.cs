@@ -40,7 +40,10 @@ public static class McpStdioServer
                 },
                 catalogRepository.GetStagedGeneratedEntries);
         });
-        builder.Services.AddSingleton<DdaiStatusService>();
+        builder.Services.AddSingleton(serviceProvider => new DdaiStatusService(
+            serviceProvider.GetRequiredService<AtomicMailbox>(),
+            serviceProvider.GetRequiredService<TimeProvider>(),
+            serviceProvider.GetRequiredService<AssetCatalogRepository>()));
         builder.Services.AddSingleton<DdaiPlanService>();
         builder.Services.AddSingleton<DdaiMapInspectionService>();
         builder.Services.AddSingleton<DdaiCapabilityService>();
