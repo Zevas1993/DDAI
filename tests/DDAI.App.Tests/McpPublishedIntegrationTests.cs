@@ -18,6 +18,63 @@ namespace DDAI.App.Tests;
 public sealed class McpPublishedIntegrationTests
 {
     [Fact(Timeout = 120_000)]
+    public async Task PublishedAssetPreview_EmitsOnlyJsonRpcFramesOnStdout()
+    {
+        using var sandbox = new TestDirectory();
+        var asset = sandbox.PublishAcceptedAssetCatalog(includePreview: true);
+        var executable = PublishSingleFile(sandbox.PublishDirectory);
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var process = StartCapturedServer(executable, sandbox);
+
+        try
+        {
+            await WriteFrameAsync(process.StandardInput, new
+            {
+                jsonrpc = "2.0",
+                id = 1,
+                method = "initialize",
+                @params = new
+                {
+                    protocolVersion = "2025-11-25",
+                    capabilities = new { },
+                    clientInfo = new { name = "ddai-stdout-capture", version = "1.0" },
+                },
+            });
+            AssertJsonRpcResponse(await ReadFrameAsync(process.StandardOutput, 1, deadline.Token), 1);
+
+            await WriteFrameAsync(process.StandardInput, new { jsonrpc = "2.0", method = "notifications/initialized" });
+            await WriteFrameAsync(process.StandardInput, new
+            {
+                jsonrpc = "2.0",
+                id = 2,
+                method = "tools/call",
+                @params = new
+                {
+                    name = "ddai_get_asset_preview",
+                    arguments = new Dictionary<string, object?> { ["assetRef"] = asset.AssetRef },
+                },
+            });
+            AssertJsonRpcResponse(await ReadFrameAsync(process.StandardOutput, 2, deadline.Token), 2);
+
+            process.StandardInput.Close();
+            await process.WaitForExitAsync(deadline.Token);
+            var trailing = await process.StandardOutput.ReadToEndAsync(deadline.Token);
+            Assert.Equal(0, process.ExitCode);
+            Assert.Equal(string.Empty, process.StandardError.ReadToEnd());
+            Assert.All(trailing.Split('\n', StringSplitOptions.None).Where(line => line.Length > 0),
+                line => AssertJsonRpcResponse(line, expectedId: null));
+        }
+        finally
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync(CancellationToken.None);
+            }
+        }
+    }
+
+    [Fact(Timeout = 120_000)]
     public async Task SdkClient_DiscoversAndCallsPublishedAssetPreviewWithBoundedPngContent()
     {
         using var sandbox = new TestDirectory();
@@ -215,6 +272,52 @@ public sealed class McpPublishedIntegrationTests
         Canvas = new MapCanvas(40, 30),
         Rooms = [new MapRoom("room-entrance", 8, 7, 10, 8)],
     };
+
+    private static Process StartCapturedServer(string executable, TestDirectory sandbox)
+    {
+        var startInfo = new ProcessStartInfo(executable)
+        {
+            WorkingDirectory = sandbox.PublishDirectory,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        foreach (var argument in new[] { "serve", "--stdio", "--mailbox-root", sandbox.MailboxDirectory, "--timeout-ms", "2000" })
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        return Process.Start(startInfo) ?? throw new InvalidOperationException("Could not start published DDAI server.");
+    }
+
+    private static async Task WriteFrameAsync(StreamWriter input, object frame)
+    {
+        await input.WriteLineAsync(JsonSerializer.Serialize(frame));
+        await input.FlushAsync();
+    }
+
+    private static async Task<string> ReadFrameAsync(StreamReader output, int expectedId, CancellationToken cancellationToken)
+    {
+        var line = await output.ReadLineAsync(cancellationToken);
+        Assert.False(string.IsNullOrWhiteSpace(line), "Published server closed stdout before its JSON-RPC response.");
+        AssertJsonRpcResponse(line!, expectedId);
+        return line;
+    }
+
+    private static void AssertJsonRpcResponse(string line, int? expectedId)
+    {
+        using var document = JsonDocument.Parse(line);
+        var root = document.RootElement;
+        Assert.Equal(JsonValueKind.Object, root.ValueKind);
+        Assert.Equal("2.0", root.GetProperty("jsonrpc").GetString());
+        Assert.True(root.TryGetProperty("result", out _) || root.TryGetProperty("error", out _));
+        if (expectedId is not null)
+        {
+            Assert.Equal(expectedId.Value, root.GetProperty("id").GetInt32());
+        }
+    }
 
     private static string PublishSingleFile(string outputDirectory)
     {

@@ -99,7 +99,6 @@ internal static class DdaiToolResults
         var json = JsonSerializer.Serialize(new AssetPreviewResult(
             entry.AssetRef,
             entry.Category,
-            entry.DisplayName,
             entry.PreviewHash!,
             "image/png",
             preview.Length,
@@ -132,7 +131,6 @@ internal static class DdaiToolResults
     private sealed record AssetPreviewResult(
         string AssetRef,
         string Category,
-        string DisplayName,
         string PreviewHash,
         string MimeType,
         int ByteCount,

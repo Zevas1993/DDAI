@@ -177,6 +177,26 @@ public sealed class DdaiAssetToolTests
     }
 
     [Fact]
+    public void GetAssetPreview_OmitsOversizedDisplayNameFromBoundedConsistentMetadata()
+    {
+        using var sandbox = new PreviewCatalogSandbox();
+        const string pathMarker = "file:///not-a-response-path/";
+        var asset = sandbox.PublishAssetWithPreview(pathMarker + new string('x', 900_000));
+        var result = DdaiAssetTools.GetAssetPreview(asset.AssetRef, new AssetCatalogRepository(
+            sandbox.CatalogRoot, sandbox.TimeProvider));
+
+        Assert.Null(result.IsError);
+        var text = Assert.IsType<TextContentBlock>(Assert.Single(result.Content.OfType<TextContentBlock>())).Text;
+        Assert.True(Encoding.UTF8.GetByteCount(text) <= 1024);
+        Assert.DoesNotContain(pathMarker, text, StringComparison.OrdinalIgnoreCase);
+        using var structured = StructuredJson(result);
+        Assert.False(structured.RootElement.TryGetProperty("display_name", out _));
+        Assert.True(JsonNode.DeepEquals(
+            JsonNode.Parse(text),
+            JsonNode.Parse(structured.RootElement.GetRawText())));
+    }
+
+    [Fact]
     public void GetAssetPreview_ReturnsStructuredBoundedErrorsWithoutPathOrUriLeakage()
     {
         using var sandbox = new PreviewCatalogSandbox();
@@ -200,6 +220,37 @@ public sealed class DdaiAssetToolTests
         Assert.Equal("catalog_unavailable", unavailableStructured.RootElement.GetProperty("error").GetString());
     }
 
+    [Fact]
+    public void GetAssetPreview_ReturnsPreviewUnavailableForNoHashAndRejectedRepositoryPreviews()
+    {
+        using var noHashSandbox = new PreviewCatalogSandbox();
+        var noHashAsset = noHashSandbox.PublishAssetWithPreview(includePreview: false);
+        AssertPreviewUnavailable(DdaiAssetTools.GetAssetPreview(noHashAsset.AssetRef, new AssetCatalogRepository(
+            noHashSandbox.CatalogRoot, noHashSandbox.TimeProvider)));
+
+        using var missingSandbox = new PreviewCatalogSandbox();
+        var missingAsset = missingSandbox.PublishAssetWithPreview();
+        File.Delete(missingSandbox.PreviewPath(missingAsset.PreviewHash!));
+        AssertPreviewUnavailable(DdaiAssetTools.GetAssetPreview(missingAsset.AssetRef, new AssetCatalogRepository(
+            missingSandbox.CatalogRoot, missingSandbox.TimeProvider)));
+
+        using var mismatchSandbox = new PreviewCatalogSandbox();
+        var mismatchAsset = mismatchSandbox.PublishAssetWithPreview();
+        var mismatched = mismatchSandbox.PreviewBytes.ToArray();
+        mismatched[^1] ^= 1;
+        File.WriteAllBytes(mismatchSandbox.PreviewPath(mismatchAsset.PreviewHash!), mismatched);
+        AssertPreviewUnavailable(DdaiAssetTools.GetAssetPreview(mismatchAsset.AssetRef, new AssetCatalogRepository(
+            mismatchSandbox.CatalogRoot, mismatchSandbox.TimeProvider)));
+
+        using var oversizeSandbox = new PreviewCatalogSandbox();
+        var oversizeAsset = oversizeSandbox.PublishAssetWithPreview();
+        File.WriteAllBytes(
+            oversizeSandbox.PreviewPath(oversizeAsset.PreviewHash!),
+            new byte[AssetCatalogRepository.MaximumPreviewBytes + 1]);
+        AssertPreviewUnavailable(DdaiAssetTools.GetAssetPreview(oversizeAsset.AssetRef, new AssetCatalogRepository(
+            oversizeSandbox.CatalogRoot, oversizeSandbox.TimeProvider)));
+    }
+
     private static JsonDocument StructuredJson(CallToolResult result) =>
         JsonDocument.Parse(JsonSerializer.Serialize(result.StructuredContent));
 
@@ -209,6 +260,22 @@ public sealed class DdaiAssetToolTests
 
     private static string ErrorText(CallToolResult result) =>
         Assert.IsType<TextContentBlock>(Assert.Single(result.Content)).Text;
+
+    private static void AssertPreviewUnavailable(CallToolResult result)
+    {
+        Assert.True(result.IsError);
+        Assert.Equal("preview_unavailable", ErrorCode(result));
+        Assert.Single(result.Content.OfType<TextContentBlock>());
+        Assert.Empty(result.Content.OfType<ImageContentBlock>());
+        Assert.Single(result.Content);
+        Assert.NotNull(result.StructuredContent);
+        var text = ErrorText(result);
+        Assert.DoesNotContain("file:", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("path", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("exception", text, StringComparison.OrdinalIgnoreCase);
+        using var structured = StructuredJson(result);
+        Assert.True(JsonNode.DeepEquals(JsonNode.Parse(text), JsonNode.Parse(structured.RootElement.GetRawText())));
+    }
 
     private static readonly DateTimeOffset SnapshotAt = new(2026, 8, 10, 18, 0, 0, TimeSpan.Zero);
 
@@ -292,14 +359,19 @@ public sealed class DdaiAssetToolTests
         public byte[] PreviewBytes { get; } = Convert.FromBase64String(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFAAH/VscvDQAAAABJRU5ErkJggg==");
 
-        public AssetCatalogEntry PublishAssetWithPreview()
+        public string PreviewPath(string previewHash) => Path.Combine(CatalogRoot, "previews", previewHash + ".png");
+
+        public AssetCatalogEntry PublishAssetWithPreview(string? displayName = null, bool includePreview = true)
         {
-            var previewHash = Hash(PreviewBytes);
-            File.WriteAllBytes(Path.Combine(CatalogRoot, "previews", previewHash + ".png"), PreviewBytes);
+            var previewHash = includePreview ? Hash(PreviewBytes) : null;
+            if (previewHash is not null)
+            {
+                File.WriteAllBytes(PreviewPath(previewHash), PreviewBytes);
+            }
             var entry = new AssetCatalogEntry(
                 AssetReference.Create("official-pack", "Objects", "resource/ancient-gate"),
                 "Objects",
-                "Ancient Gate",
+                displayName ?? "Ancient Gate",
                 Hash(Encoding.UTF8.GetBytes("resource/ancient-gate")),
                 "official-pack",
                 "Official Pack",
