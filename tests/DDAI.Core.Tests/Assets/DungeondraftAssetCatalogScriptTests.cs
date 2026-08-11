@@ -100,6 +100,7 @@ public sealed class DungeondraftAssetCatalogScriptTests
             Assert.Equal(string.Empty, error);
             Assert.Contains("DDAI_TYPED_ARRAY_ENUMERATION:True", output, StringComparison.Ordinal);
             Assert.Contains("DDAI_WRONG_TYPE_FAILS_CLOSED:True", output, StringComparison.Ordinal);
+            Assert.Contains("DDAI_ENUMERATION_DIAGNOSTIC_CLOSED_WORLD:True", output, StringComparison.Ordinal);
         }
         finally
         {
