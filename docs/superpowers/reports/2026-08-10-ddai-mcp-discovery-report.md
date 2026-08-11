@@ -47,7 +47,7 @@ TDD receipt:
 | `ddai_validate_plan` | `plan` | true | false | true | false |
 | `ddai_apply_plan` | `plan` | false | true | true | false |
 
-The committed [acceptance receipt](./2026-08-10-ddai-mcp-acceptance-receipt.json) is the canonical full-schema snapshot. The official client deep-compares every complete `inputSchema`, not selected names. It therefore locks object/array/scalar/null types, every required array, the complete canvas/room/region/import/search nesting, list item types, search/inspection defaults, and the plan-mode `Add`/`Replace`/`Patch` enum emitted by ModelContextProtocol 1.4.1. The receipt is 5,794 bytes with SHA-256 `8aadb9b7d306d678ccafeb1d356ea552235ca79a2215046742a39a46668dd0d6`.
+The committed [acceptance receipt](./2026-08-10-ddai-mcp-acceptance-receipt.json) is the canonical full-schema snapshot. The official client deep-compares every complete `inputSchema`, not selected names. It therefore locks object/array/scalar/null types, every required array, the complete canvas/room/region/import/search nesting, list item types, search/inspection defaults, and the plan-mode `Add`/`Replace`/`Patch` enum emitted by ModelContextProtocol 1.4.1. The receipt is 5,794 bytes with SHA-256 `b7559ef80225724a75956d73f8874d75368bcf84c6b7c46680b0c0f36d2a0f4b`.
 
 The exact schema shapes are:
 
@@ -77,14 +77,16 @@ The same client imported `Cross Tool Lantern`, then searched with `generated: tr
 
 Cancellation is no longer inferred from a local SDK token. The official 1.4.1 client sends a low-level `tools/call` with request ID 200, waits until the real mailbox peer has claimed the correlated processing file, then sends `notifications/cancelled` through `SendNotificationAsync`. Server stderr records the resulting `OperationCanceledException` before the local wait token is cancelled. The test verifies no mailbox response existed at cancellation, calls status successfully, deliberately publishes the late bridge response, verifies the processing-to-response transition, and calls capabilities successfully afterward.
 
-The independent raw harness initializes, lists, and invokes all eight tools, including import-then-search, image, inspection, status, capability, mutation, validation, and shaped-error paths. It also sends request ID 20 plus `notifications/cancelled`, publishes a late mailbox response, and proves stdout never contains ID 20. Every nonempty stdout line/frame—initialization, list, eight tools, the second search, error, and post-cancellation status—is parsed as a JSON-RPC 2.0 response. Expected cancellation diagnostics remain on stderr only. The complete `McpPublishedIntegrationTests` slice passed 9/9.
+The independent raw harness initializes, lists, and invokes all eight tools, including import-then-search, image, inspection, status, capability, mutation, validation, and shaped-error paths. It also sends request ID 20 plus `notifications/cancelled`, publishes a late mailbox response, and proves stdout never contains ID 20. Every nonempty stdout line/frame—initialization, list, eight tools, the second search, error, and post-cancellation status—is parsed as a JSON-RPC 2.0 response. Expected cancellation diagnostics remain on stderr only. The complete `McpPublishedIntegrationTests` slice passed 10/10, including separate source-publish immutability coverage.
 
-Round-one acceptance RED/GREEN:
+Acceptance RED/GREEN history:
 
 - retained artifact/schema RED: the published preview test failed 1/1 on the intentionally missing committed receipt; GREEN passed 1/1 after publishing and executing the exact retained path and matching the receipt;
 - raw breadth RED: the exact tool-set assertion failed 1/1 with only `ddai_get_asset_preview` observed; GREEN passed 1/1 with all eight tools and all stdout frames parsed;
 - cancellation RED: merely cancelling the high-level SDK call left the server diagnostic queue empty even after the bridge had claimed the request; GREEN passed 1/1 after explicit official-SDK `notifications/cancelled` tied to request ID 200;
-- complete focused published acceptance: 9/9 passed.
+- round-two artifact RED: the reviewer's unchanged focused command passed the three status tests and failed raw plus official SDK before launch because a test-triggered fresh publish had SHA-256 `8a0924ab...a4a87` while the receipt still named `7e666846...80945`;
+- round-two GREEN: retained resolution became read-only, a single explicit final publish established the receipted bytes, the separate temp source-publish test preserved retained hash and timestamp, and both raw and SDK paths launched the same retained executable without modifying it;
+- complete focused published acceptance: 10/10 passed.
 
 ## Limits verified or advertised
 
@@ -108,13 +110,15 @@ Round-one acceptance RED/GREEN:
 - Files in publish directory: 1
 - Runtime: self-contained `win-x64`
 - Size: 86,871,226 bytes
-- SHA-256: `7e666846bf938bdfeed92e24247bd6da8a2165487e4d9fb041d8b310f3380945`
+- SHA-256: `8a0924ab33e4700e3e5b876d6a33a446f2f949f49964fab7999c1655e35a4a87`
 
-Every published-process acceptance test runs this exact retained path and rechecks both size and hash against the committed receipt before process launch. The artifact directory is machine-local/ignored evidence and is not part of the source commit.
+One explicit `dotnet publish` invocation generated this retained executable after the final source state. Published-process acceptance never publishes or writes that directory: it resolves the existing path and rechecks path, one-file contents, size, and hash against the committed JSON receipt and this report before launch. A separate source-freshness test publishes current source only to a temporary directory and proves the retained artifact's hash and last-write time remain unchanged; no hash equality between separate publishes is assumed. The artifact directory is machine-local/ignored evidence and is not part of the source commit.
 
 ## Verification receipts
 
-- `dotnet test DDAI.slnx -c Release --no-restore`: fresh final rerun passed 325/325 Core and 310/310 App tests; 635/635 total. The first full attempt observed one non-reproducible unrelated catalog quarantine count (`5` instead of `8`); the exact test then passed 1/1 and the unchanged full suite passed cleanly on rerun.
+- Reviewer-exact round-two focus: the unchanged five-test command passed 5/5; external before/after checks proved retained SHA-256 and last-write time unchanged.
+- `dotnet test tests\DDAI.App.Tests\DDAI.App.Tests.csproj -c Release --no-restore --filter FullyQualifiedName~McpPublishedIntegrationTests`: passed 10/10; retained SHA-256 and last-write time remained unchanged.
+- Full Release tests run sequentially to avoid unrelated cross-project filesystem contention: App passed 311/311 and Core passed 325/325, 636/636 total. Two parallel `dotnet test DDAI.slnx` attempts observed four different untouched filesystem/timing tests fail; every exact failure passed immediately in isolation. Both parallel attempts also proved the retained artifact unchanged.
 - `dotnet build DDAI.slnx -c Release --no-restore`: succeeded with 0 warnings and 0 errors.
 - `dotnet list DDAI.slnx package --vulnerable --include-transitive`: no vulnerable packages for `DDAI.App`, `DDAI.Core`, both test projects, or `DDAI.McpProbe` using the configured NuGet sources.
 - `dotnet format src\DDAI.App\DDAI.App.csproj --verify-no-changes --no-restore` and the same scoped to `tests\DDAI.App.Tests\McpPublishedIntegrationTests.cs`: passed. `dotnet format` 9.0.201 cannot parse `DDAI.slnx`; unscoped test-project verification also reports a pre-existing whitespace issue in untouched `AssetCatalogRepositoryTests.cs:537`.
@@ -122,7 +126,7 @@ Every published-process acceptance test runs this exact retained path and rechec
 - Pinned Godot 3.5.3 exact bridge parser, exact bounded inspection behavior, and package listener test: 3/3 passed with empty parser/behavior stderr.
 - Durable network-listener scan across `src`, `mods`, and `tools`: 0 listener hits.
 - `git diff --check`: rerun immediately before the scoped commit.
-- GitNexus round-one pre-change impact: `DdaiStatusService` LOW (2 direct callers, 1 affected `RunAsync` flow); `McpPublishedIntegrationTests` and `McpStdioServer` LOW (0 upstream dependents). Final staged-only detection reported LOW across 50 changed symbols, 0 affected execution flows, and exactly the four Task 6 fix files; most indexed changes are acceptance-test locals/helpers, with the production blast radius already covered by the pre-change status analysis.
+- GitNexus round-one pre-change impact: `DdaiStatusService` LOW (2 direct callers, 1 affected `RunAsync` flow); `McpPublishedIntegrationTests` and `McpStdioServer` LOW (0 upstream dependents). Round-two pre-change impact for `McpPublishedIntegrationTests` was LOW with 0 upstream dependents. Final round-two staged-only detection reported LOW across 7 changed symbols, 0 affected execution flows, and exactly the three scoped Task 6 files.
 
 ## Remaining live gaps
 

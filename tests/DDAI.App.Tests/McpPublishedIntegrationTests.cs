@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -181,13 +182,32 @@ public sealed class McpPublishedIntegrationTests
         Assert.Equal(["status"], result.BridgeCapabilities);
     }
 
+    [Fact]
+    public void SourcePublish_IsSeparateAndDoesNotMutateTheReceiptedArtifact()
+    {
+        using var sandbox = new TestDirectory();
+        var retainedArtifact = ResolveRetainedSingleFile();
+        var retainedHash = HashFile(retainedArtifact);
+        var retainedWriteTime = File.GetLastWriteTimeUtc(retainedArtifact);
+
+        var sourceArtifact = PublishSourceSingleFile(sandbox.PublishDirectory);
+
+        Assert.False(string.Equals(
+            Path.GetFullPath(retainedArtifact),
+            Path.GetFullPath(sourceArtifact),
+            StringComparison.OrdinalIgnoreCase));
+        Assert.True(new FileInfo(sourceArtifact).Length > 0);
+        Assert.Equal(retainedHash, HashFile(retainedArtifact));
+        Assert.Equal(retainedWriteTime, File.GetLastWriteTimeUtc(retainedArtifact));
+    }
+
     [Fact(Timeout = 120_000)]
     public async Task RawProtocol_InvokesAllToolsAndEmitsOnlyJsonRpcFramesOnStdout()
     {
         using var sandbox = new TestDirectory();
         var asset = sandbox.PublishAcceptedAssetCatalog(includePreview: true, revision: 73);
         sandbox.WriteRuntimeReceipt();
-        var executable = PublishRetainedSingleFile();
+        var executable = ResolveRetainedSingleFile();
         var mailbox = new AtomicMailbox(sandbox.MailboxDirectory);
         var fakeBridge = new PublishedDiscoveryBridgeHarness(mailbox, asset.AssetRef);
         using var workerCancellation = new CancellationTokenSource();
@@ -415,7 +435,7 @@ public sealed class McpPublishedIntegrationTests
     {
         using var sandbox = new TestDirectory();
         var asset = sandbox.PublishAcceptedAssetCatalog(includePreview: true);
-        var executable = PublishRetainedSingleFile();
+        var executable = ResolveRetainedSingleFile();
         var stderr = new ConcurrentQueue<string>();
         var transport = new StdioClientTransport(new StdioClientTransportOptions
         {
@@ -466,7 +486,7 @@ public sealed class McpPublishedIntegrationTests
     {
         using var sandbox = new TestDirectory();
         sandbox.PublishAcceptedAssetCatalog();
-        var executable = PublishRetainedSingleFile();
+        var executable = ResolveRetainedSingleFile();
         var stderr = new ConcurrentQueue<string>();
         var transport = new StdioClientTransport(new StdioClientTransportOptions
         {
@@ -526,7 +546,7 @@ public sealed class McpPublishedIntegrationTests
     {
         using var sandbox = new TestDirectory();
         sandbox.PublishAcceptedAssetCatalog();
-        var executable = PublishRetainedSingleFile();
+        var executable = ResolveRetainedSingleFile();
         var stderr = new ConcurrentQueue<string>();
         var transport = new StdioClientTransport(new StdioClientTransportOptions
         {
@@ -622,7 +642,7 @@ public sealed class McpPublishedIntegrationTests
         using var sandbox = new TestDirectory();
         var asset = sandbox.PublishAcceptedAssetCatalog(includePreview: true, revision: 73);
         sandbox.WriteRuntimeReceipt();
-        var executable = PublishRetainedSingleFile();
+        var executable = ResolveRetainedSingleFile();
         var mailbox = new AtomicMailbox(sandbox.MailboxDirectory);
         var fakeBridge = new PublishedDiscoveryBridgeHarness(mailbox, asset.AssetRef);
         using var workerCancellation = new CancellationTokenSource();
@@ -1063,11 +1083,42 @@ public sealed class McpPublishedIntegrationTests
         }
     }
 
-    private static string PublishRetainedSingleFile()
+    private static string ResolveRetainedSingleFile()
+    {
+        var repositoryRoot = FindRepositoryRoot();
+        var outputDirectory = Path.Combine(repositoryRoot, "artifacts", "task6", "win-x64");
+        var executable = Path.Combine(outputDirectory, "ddai.exe");
+        Assert.True(File.Exists(executable), $"Retained executable not found: {executable}");
+        Assert.Equal(["ddai.exe"], Directory.GetFiles(outputDirectory).Select(path => Path.GetFileName(path)!).Order().ToArray());
+
+        using var receipt = ReadAcceptanceReceipt();
+        var artifact = receipt.RootElement.GetProperty("artifact");
+        var relativePath = artifact.GetProperty("relative_path").GetString()!;
+        Assert.Equal(
+            Path.GetFullPath(Path.Combine(repositoryRoot, relativePath)),
+            Path.GetFullPath(executable),
+            ignoreCase: true);
+        var expectedSize = artifact.GetProperty("size_bytes").GetInt64();
+        var expectedHash = artifact.GetProperty("sha256").GetString();
+        Assert.Equal(expectedSize, new FileInfo(executable).Length);
+        Assert.Equal(expectedHash, HashFile(executable));
+
+        var report = File.ReadAllText(Path.Combine(
+            repositoryRoot,
+            "docs",
+            "superpowers",
+            "reports",
+            "2026-08-10-ddai-mcp-discovery-report.md"));
+        Assert.Contains($"- Path: `{relativePath}`", report, StringComparison.Ordinal);
+        Assert.Contains($"- Size: {expectedSize.ToString("N0", CultureInfo.InvariantCulture)} bytes", report, StringComparison.Ordinal);
+        Assert.Contains($"- SHA-256: `{expectedHash}`", report, StringComparison.Ordinal);
+        return executable;
+    }
+
+    private static string PublishSourceSingleFile(string outputDirectory)
     {
         var repositoryRoot = FindRepositoryRoot();
         var project = Path.Combine(repositoryRoot, "src", "DDAI.App", "DDAI.App.csproj");
-        var outputDirectory = Path.Combine(repositoryRoot, "artifacts", "task6", "win-x64");
         Directory.CreateDirectory(outputDirectory);
         var startInfo = new ProcessStartInfo("dotnet")
         {
@@ -1091,19 +1142,15 @@ public sealed class McpPublishedIntegrationTests
         process.WaitForExit();
         Assert.True(process.ExitCode == 0, $"dotnet publish failed:\n{stdout}\n{stderr}");
         var executable = Path.Combine(outputDirectory, "ddai.exe");
-        Assert.True(File.Exists(executable), $"Published executable not found: {executable}");
+        Assert.True(File.Exists(executable), $"Fresh source executable not found: {executable}");
         Assert.Equal(["ddai.exe"], Directory.GetFiles(outputDirectory).Select(path => Path.GetFileName(path)!).Order().ToArray());
-        using var receipt = ReadAcceptanceReceipt();
-        var artifact = receipt.RootElement.GetProperty("artifact");
-        Assert.Equal(
-            Path.GetFullPath(Path.Combine(repositoryRoot, artifact.GetProperty("relative_path").GetString()!)),
-            Path.GetFullPath(executable),
-            ignoreCase: true);
-        Assert.Equal(artifact.GetProperty("size_bytes").GetInt64(), new FileInfo(executable).Length);
-        Assert.Equal(
-            artifact.GetProperty("sha256").GetString(),
-            Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(executable))).ToLowerInvariant());
         return executable;
+    }
+
+    private static string HashFile(string path)
+    {
+        using var stream = File.OpenRead(path);
+        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
     }
 
     private static JsonDocument ReadAcceptanceReceipt() => JsonDocument.Parse(File.ReadAllText(
