@@ -41,6 +41,79 @@ public sealed class DdaiAssetToolTests
     }
 
     [Fact]
+    public void ImportAsset_DeclaresClosedStateChangingIdempotentSafetyMetadata()
+    {
+        var method = typeof(DdaiAssetTools).GetMethod(nameof(DdaiAssetTools.ImportAssetAsync));
+        var attribute = Assert.Single(method!.GetCustomAttributes<McpServerToolAttribute>());
+
+        Assert.Equal("ddai_import_asset", attribute.Name);
+        Assert.False(attribute.ReadOnly);
+        Assert.False(attribute.Destructive);
+        Assert.True(attribute.Idempotent);
+        Assert.False(attribute.OpenWorld);
+    }
+
+    [Fact]
+    public async Task ImportAsset_ImportsInlinePngAndReturnsBoundedStructuredMetadataAndPreview()
+    {
+        using var sandbox = new GeneratedAssetToolSandbox();
+        var request = GeneratedAssetRequest("tool-import-001", sandbox.PngBase64);
+
+        var result = await DdaiAssetTools.ImportAssetAsync(request, sandbox.Store, CancellationToken.None);
+
+        Assert.Null(result.IsError);
+        Assert.Equal(2, result.Content.Count);
+        var text = Assert.IsType<TextContentBlock>(Assert.Single(result.Content.OfType<TextContentBlock>())).Text;
+        var image = Assert.IsType<ImageContentBlock>(Assert.Single(result.Content.OfType<ImageContentBlock>()));
+        Assert.Equal("image/png", image.MimeType);
+        Assert.True(image.DecodedData.Length <= GeneratedAssetStore.MaximumPreviewBytes);
+        using var metadata = JsonDocument.Parse(text);
+        Assert.Equal("staged", metadata.RootElement.GetProperty("activation_state").GetString());
+        Assert.Equal("Objects", metadata.RootElement.GetProperty("category").GetString());
+        Assert.False(metadata.RootElement.GetProperty("duplicate").GetBoolean());
+        Assert.True(result.StructuredContent.HasValue);
+        Assert.True(JsonNode.DeepEquals(JsonNode.Parse(text), JsonNode.Parse(result.StructuredContent.Value.GetRawText())));
+    }
+
+    [Fact]
+    public async Task ImportAsset_ReplaysExactRequestAndBoundsConflictAndValidationErrors()
+    {
+        using var sandbox = new GeneratedAssetToolSandbox();
+        var request = GeneratedAssetRequest("tool-replay-001", sandbox.PngBase64);
+
+        var first = await DdaiAssetTools.ImportAssetAsync(request, sandbox.Store, CancellationToken.None);
+        var replay = await DdaiAssetTools.ImportAssetAsync(request, sandbox.Store, CancellationToken.None);
+        var conflict = await DdaiAssetTools.ImportAssetAsync(request with { Name = "Changed Name" }, sandbox.Store, CancellationToken.None);
+        var invalid = await DdaiAssetTools.ImportAssetAsync(request with { IdempotencyKey = "tool-invalid-001", ContentBase64 = "not-base64" }, sandbox.Store, CancellationToken.None);
+
+        using var firstJson = StructuredJson(first);
+        using var replayJson = StructuredJson(replay);
+        Assert.Equal(firstJson.RootElement.GetProperty("generated_asset_id").GetString(), replayJson.RootElement.GetProperty("generated_asset_id").GetString());
+        Assert.False(firstJson.RootElement.GetProperty("duplicate").GetBoolean());
+        Assert.True(replayJson.RootElement.GetProperty("duplicate").GetBoolean());
+        Assert.True(conflict.IsError);
+        Assert.Equal("request_conflict", ErrorCode(conflict));
+        Assert.True(invalid.IsError);
+        Assert.Equal("invalid_base64", ErrorCode(invalid));
+        Assert.DoesNotContain("exception", ErrorText(invalid), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(sandbox.Root, ErrorText(invalid), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ImportAsset_PropagatesCancellationWithoutCreatingAnIdempotencyReceipt()
+    {
+        using var sandbox = new GeneratedAssetToolSandbox();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => DdaiAssetTools.ImportAssetAsync(
+            GeneratedAssetRequest("tool-cancel-001", sandbox.PngBase64), sandbox.Store, cancellation.Token));
+
+        var receiptRoot = Path.Combine(sandbox.Root, "generated-assets", "idempotency");
+        Assert.Empty(Directory.Exists(receiptRoot) ? Directory.GetFiles(receiptRoot) : []);
+    }
+
+    [Fact]
     public void SearchAssets_DelegatesEveryFilterAndReturnsSnakeCaseStructuredPagination()
     {
         var service = CreateService(
@@ -411,5 +484,34 @@ public sealed class DdaiAssetToolTests
 
         private static string Hash(byte[] bytes) =>
             Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+    }
+
+    private static GeneratedAssetImportRequest GeneratedAssetRequest(string idempotencyKey, string contentBase64) => new(
+        idempotencyKey,
+        "Objects",
+        "Generated Torch",
+        ["generated", "fixture"],
+        1,
+        1,
+        contentBase64,
+        null);
+
+    private sealed class GeneratedAssetToolSandbox : IDisposable
+    {
+        public GeneratedAssetToolSandbox()
+        {
+            Root = Path.Combine(Path.GetTempPath(), "ddai-generated-asset-tool-tests", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(Root);
+            Store = new GeneratedAssetStore(Root);
+        }
+
+        public string Root { get; }
+        public GeneratedAssetStore Store { get; }
+        public string PngBase64 { get; } = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFAAH/VscvDQAAAABJRU5ErkJggg==";
+
+        public void Dispose()
+        {
+            if (Directory.Exists(Root)) Directory.Delete(Root, recursive: true);
+        }
     }
 }

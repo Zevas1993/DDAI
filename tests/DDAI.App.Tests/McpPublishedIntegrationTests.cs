@@ -186,6 +186,101 @@ public sealed class McpPublishedIntegrationTests
     }
 
     [Fact(Timeout = 120_000)]
+    public async Task SdkClient_ImportsGeneratedPngIdempotentlyAndFindsStagedNonPlaceableAsset()
+    {
+        using var sandbox = new TestDirectory();
+        sandbox.PublishAcceptedAssetCatalog();
+        var executable = PublishSingleFile(sandbox.PublishDirectory);
+        var stderr = new ConcurrentQueue<string>();
+        var transport = new StdioClientTransport(new StdioClientTransportOptions
+        {
+            Name = "ddai-published-generated-import-integration",
+            Command = executable,
+            Arguments = ["serve", "--stdio", "--mailbox-root", sandbox.MailboxDirectory, "--timeout-ms", "2000"],
+            WorkingDirectory = sandbox.PublishDirectory,
+            ShutdownTimeout = TimeSpan.FromSeconds(5),
+            StandardErrorLines = stderr.Enqueue,
+        });
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        await using var client = await McpClient.CreateAsync(transport, cancellationToken: deadline.Token);
+        var tool = Assert.Single(
+            await client.ListToolsAsync(cancellationToken: deadline.Token),
+            candidate => candidate.Name == "ddai_import_asset");
+        var requestSchema = tool.ProtocolTool.InputSchema.GetProperty("properties").GetProperty("request").GetProperty("properties");
+        foreach (var field in new[] { "idempotencyKey", "category", "name", "tags", "gridWidth", "gridHeight", "contentBase64", "inboxToken" })
+        {
+            Assert.True(requestSchema.TryGetProperty(field, out _), $"Missing generated-import request field '{field}'.");
+        }
+
+        var request = new
+        {
+            idempotencyKey = "published-generated-import-001",
+            category = "Objects",
+            name = "Generated Torch",
+            tags = new[] { "generated", "fixture" },
+            gridWidth = 1,
+            gridHeight = 1,
+            contentBase64 = Convert.ToBase64String(sandbox.PreviewBytes),
+        };
+        var first = await client.CallToolAsync(
+            "ddai_import_asset",
+            new Dictionary<string, object?> { ["request"] = request },
+            cancellationToken: deadline.Token);
+        var replay = await client.CallToolAsync(
+            "ddai_import_asset",
+            new Dictionary<string, object?> { ["request"] = request },
+            cancellationToken: deadline.Token);
+        var conflict = await client.CallToolAsync(
+            "ddai_import_asset",
+            new Dictionary<string, object?>
+            {
+                ["request"] = new
+                {
+                    idempotencyKey = request.idempotencyKey,
+                    category = request.category,
+                    name = "Changed Torch",
+                    tags = request.tags,
+                    gridWidth = request.gridWidth,
+                    gridHeight = request.gridHeight,
+                    contentBase64 = request.contentBase64,
+                },
+            },
+            cancellationToken: deadline.Token);
+
+        Assert.Null(first.IsError);
+        var firstText = Assert.IsType<TextContentBlock>(Assert.Single(first.Content.OfType<TextContentBlock>())).Text;
+        var firstImage = Assert.IsType<ImageContentBlock>(Assert.Single(first.Content.OfType<ImageContentBlock>()));
+        Assert.Equal("image/png", firstImage.MimeType);
+        Assert.True(firstImage.DecodedData.Length <= GeneratedAssetStore.MaximumPreviewBytes);
+        using var firstJson = JsonDocument.Parse(firstText);
+        var generatedAssetId = firstJson.RootElement.GetProperty("generated_asset_id").GetString();
+        Assert.False(firstJson.RootElement.GetProperty("duplicate").GetBoolean());
+        Assert.True(replay.StructuredContent.HasValue);
+        using var replayJson = JsonDocument.Parse(replay.StructuredContent.Value.GetRawText());
+        Assert.Equal(generatedAssetId, replayJson.RootElement.GetProperty("generated_asset_id").GetString());
+        Assert.True(replayJson.RootElement.GetProperty("duplicate").GetBoolean());
+        Assert.True(conflict.IsError);
+        Assert.Contains("request_conflict", Assert.IsType<TextContentBlock>(Assert.Single(conflict.Content)).Text, StringComparison.Ordinal);
+
+        var found = await client.CallToolAsync(
+            "ddai_search_assets",
+            new Dictionary<string, object?>
+            {
+                ["query"] = new { generated = true, includeStagedGenerated = true, limit = 10 },
+            },
+            cancellationToken: deadline.Token);
+        Assert.Null(found.IsError);
+        using var foundJson = JsonDocument.Parse(Assert.IsType<TextContentBlock>(Assert.Single(found.Content)).Text);
+        Assert.Matches("^[0-9a-f]{64}$", generatedAssetId);
+        var staged = Assert.Single(foundJson.RootElement.GetProperty("items").EnumerateArray(), item =>
+            item.GetProperty("display_name").GetString() == "Generated Torch");
+        Assert.True(staged.GetProperty("generated").GetBoolean());
+        Assert.False(staged.GetProperty("placeable").GetBoolean());
+        Assert.Empty(stderr);
+    }
+
+    [Fact(Timeout = 120_000)]
     public async Task SdkClient_InitializesListsAndCallsPublishedStdioServerWithoutStdoutContamination()
     {
         using var sandbox = new TestDirectory();

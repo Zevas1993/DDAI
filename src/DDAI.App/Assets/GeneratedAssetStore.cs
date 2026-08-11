@@ -129,6 +129,22 @@ public sealed class GeneratedAssetStore
         }
     }
 
+    public byte[]? OpenPreview(string previewHash)
+    {
+        if (!IsHash(previewHash)) return null;
+        var path = Path.Combine(previewRoot, previewHash + ".png");
+        try
+        {
+            if (!fileSystem.EntryExists(path)) return null;
+            var preview = fileSystem.ReadBounded(path, MaximumPreviewBytes);
+            return string.Equals(Hash(preview), previewHash, StringComparison.Ordinal) ? preview : null;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
     private GeneratedAssetImportResult Import(GeneratedAssetImportRequest request)
     {
         var metadata = ValidateAndCanonicalizeRequest(request);

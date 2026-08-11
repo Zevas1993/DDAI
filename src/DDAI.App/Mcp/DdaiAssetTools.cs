@@ -71,6 +71,19 @@ public sealed class DdaiAssetTools
             ? DdaiToolResults.Error("preview_unavailable")
             : DdaiToolResults.FromPreview(entry, catalog, preview);
     }
+
+    [McpServerTool(
+        Name = "ddai_import_asset",
+        ReadOnly = false,
+        Destructive = false,
+        Idempotent = true,
+        OpenWorld = false)]
+    [Description("Import one generated PNG, JPEG, or WebP asset into the staged local catalog. The same idempotency_key replays only the same normalized import.")]
+    public static Task<CallToolResult> ImportAssetAsync(
+        GeneratedAssetImportRequest request,
+        GeneratedAssetStore store,
+        CancellationToken cancellationToken) =>
+        DdaiToolResults.FromGeneratedImportAsync(store, request, cancellationToken);
 }
 
 internal static class DdaiToolResults
@@ -106,6 +119,42 @@ internal static class DdaiToolResults
             catalog.Manifest.CatalogFingerprint,
             catalog.Manifest.SnapshotAt,
             catalog.Live), JsonOptions);
+        return new CallToolResult
+        {
+            Content =
+            [
+                new TextContentBlock { Text = json },
+                ImageContentBlock.FromBytes(preview, "image/png"),
+            ],
+            StructuredContent = JsonSerializer.Deserialize<JsonElement>(json, JsonOptions),
+        };
+    }
+
+    public static async Task<CallToolResult> FromGeneratedImportAsync(
+        GeneratedAssetStore store,
+        GeneratedAssetImportRequest request,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        try
+        {
+            var result = await store.ImportAsync(request, cancellationToken).ConfigureAwait(false);
+            var preview = store.OpenPreview(result.PreviewHash);
+            return preview is null ? Error("preview_unavailable") : FromGeneratedImport(result, preview);
+        }
+        catch (GeneratedAssetImportException exception)
+        {
+            return Error(exception.Code);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            return Error("import_unavailable");
+        }
+    }
+
+    private static CallToolResult FromGeneratedImport(GeneratedAssetImportResult result, byte[] preview)
+    {
+        var json = JsonSerializer.Serialize(result, JsonOptions);
         return new CallToolResult
         {
             Content =
