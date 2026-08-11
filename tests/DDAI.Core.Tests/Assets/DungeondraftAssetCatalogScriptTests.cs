@@ -56,7 +56,15 @@ public sealed class DungeondraftAssetCatalogScriptTests
             Assert.Contains(toolScriptDeclaration, productionScript, StringComparison.Ordinal);
             productionScript = productionScript.Replace(
                 toolScriptDeclaration,
-                toolScriptDeclaration + "var Script = null\n",
+                toolScriptDeclaration + "var Script = null\nvar DdaiTestClock = null\n",
+                StringComparison.Ordinal);
+            const string wireTimestampFunction =
+                "func _utc_wire_timestamp():\n\tvar current = OS.get_datetime_from_unix_time(OS.get_unix_time())";
+            Assert.Contains(wireTimestampFunction, productionScript, StringComparison.Ordinal);
+            productionScript = productionScript.Replace(
+                wireTimestampFunction,
+                "func _utc_wire_timestamp():\n\tif DdaiTestClock != null:\n\t\treturn DdaiTestClock.now()\n" +
+                "\tvar current = OS.get_datetime_from_unix_time(OS.get_unix_time())",
                 StringComparison.Ordinal);
             if (Environment.GetEnvironmentVariable("DDAI_GODOT_CATALOG_TEST_MUTATION") == "array-only")
             {
@@ -108,6 +116,7 @@ public sealed class DungeondraftAssetCatalogScriptTests
             Assert.Contains("DDAI_WRONG_TYPE_FAILS_CLOSED:True", output, StringComparison.Ordinal);
             Assert.Contains("DDAI_ENUMERATION_DIAGNOSTIC_CLOSED_WORLD:True", output, StringComparison.Ordinal);
             Assert.Contains("DDAI_TOOL_SCOPE_LIVE_WIRING:True", output, StringComparison.Ordinal);
+            Assert.Contains("DDAI_SNAPSHOT_TIMESTAMP_FINALIZED_ONCE:True", output, StringComparison.Ordinal);
         }
         finally
         {

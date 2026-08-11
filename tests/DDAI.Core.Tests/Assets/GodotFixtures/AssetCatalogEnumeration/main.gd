@@ -36,15 +36,34 @@ class ToolScopedScriptApi:
 		])
 
 
+class ReadyHelperAdapter:
+	func begin_helper_verification():
+		return true
+
+	func advance_helper_verification():
+		return {"status": "ready"}
+
+
+class ControlledWireClock:
+	var current = ""
+	var calls = 0
+
+	func now():
+		calls += 1
+		return current
+
+
 func _ready():
 	var typed_array = _test_typed_array_enumeration()
 	var wrong_type = _test_wrong_type_fails_closed()
 	var tool_scope_wiring = _test_production_live_wiring_uses_tool_scope()
+	var snapshot_finalization = _test_snapshot_timestamp_finalizes_once()
 	print("DDAI_TYPED_ARRAY_ENUMERATION:", typed_array)
 	print("DDAI_WRONG_TYPE_FAILS_CLOSED:", wrong_type)
 	print("DDAI_ENUMERATION_DIAGNOSTIC_CLOSED_WORLD:", wrong_type)
 	print("DDAI_TOOL_SCOPE_LIVE_WIRING:", tool_scope_wiring)
-	get_tree().quit(0 if typed_array and wrong_type and tool_scope_wiring else 1)
+	print("DDAI_SNAPSHOT_TIMESTAMP_FINALIZED_ONCE:", snapshot_finalization)
+	get_tree().quit(0 if typed_array and wrong_type and tool_scope_wiring and snapshot_finalization else 1)
 
 
 func _test_typed_array_enumeration():
@@ -137,3 +156,56 @@ func _test_production_live_wiring_uses_tool_scope():
 		"res://tool-scope/alpha.png",
 		"res://tool-scope/zeta.png",
 	]
+
+
+func _test_snapshot_timestamp_finalizes_once():
+	var catalog = CatalogScript.new()
+	catalog.catalog_root = "res://snapshot-finalization/catalog"
+	var clock = ControlledWireClock.new()
+	clock.current = "2026-08-11T12:00:00.0000000+00:00"
+	catalog.DdaiTestClock = clock
+	catalog._runtime_adapter = ReadyHelperAdapter.new()
+	catalog._state = "helper_verification"
+	catalog._advance_helper_verification_state()
+	catalog._advance_helper_verification_state()
+	if catalog._state != "enumerating":
+		return false
+
+	clock.current = "2026-08-11T12:02:00.0000000+00:00"
+	catalog._category_index = CatalogScript.CATEGORIES.size()
+	catalog._advance_enumerating_state()
+	catalog._advance_previewing_state()
+	catalog._advance_writing_chunks_state()
+	if catalog._state != "publishing_candidate":
+		return false
+	if catalog._snapshot_at != clock.current or clock.calls != 1:
+		return false
+	var parsed_manifest = JSON.parse(catalog._manifest_text)
+	if parsed_manifest.error != OK or parsed_manifest.result.snapshot_at != clock.current:
+		return false
+	var snapshot_at = catalog._snapshot_at
+	var manifest_text = catalog._manifest_text
+	var candidate_fingerprint = catalog._candidate_fingerprint
+
+	catalog._last_update_file_publications = 0
+	catalog._advance_publishing_candidate_state()
+	catalog._last_update_file_publications = 0
+	catalog._advance_publishing_candidate_state()
+	if catalog._snapshot_at != snapshot_at or catalog._manifest_text != manifest_text:
+		return false
+	if catalog._candidate_fingerprint != candidate_fingerprint or clock.calls != 1:
+		return false
+
+	catalog._last_update_file_publications = 0
+	catalog._advance_catalog_commit_request_state()
+	var request_id = catalog._commit_request_id
+	var request_hash = catalog._commit_request_hash
+	catalog._last_update_file_publications = 0
+	catalog._advance_catalog_commit_request_state()
+	return (
+		catalog._snapshot_at == snapshot_at and
+		catalog._manifest_text == manifest_text and
+		catalog._candidate_fingerprint == candidate_fingerprint and
+		catalog._commit_request_id == request_id and
+		catalog._commit_request_hash == request_hash and
+		clock.calls == 1)

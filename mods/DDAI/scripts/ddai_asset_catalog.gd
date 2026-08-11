@@ -332,7 +332,6 @@ func _advance_helper_verification_state():
 		return
 	_helper_ready = true
 	_catalog_revision = 0
-	_snapshot_at = _utc_wire_timestamp()
 	for category in CATEGORIES:
 		_category_counts[category] = 0
 	_state = "enumerating"
@@ -512,6 +511,8 @@ func _advance_writing_chunks_state():
 			return
 		if _chunk_entry_json.size() > 0:
 			_queue_current_chunk()
+		if _snapshot_at.length() == 0:
+			_snapshot_at = _utc_wire_timestamp()
 		_manifest_text = _build_manifest_text()
 		if _manifest_text.to_utf8().size() > MAX_MANIFEST_BYTES:
 			_record_error("catalog_manifest_too_large", "The bounded catalog manifest exceeds the reader limit.", null)
