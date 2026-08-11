@@ -1,0 +1,16 @@
+; Exact Godot 3.5.3 behavior harness for the production inspection bridge.
+config_version=4
+
+[application]
+config/name="DDAI Map Inspection Behavior"
+run/main_scene="res://main.tscn"
+
+[autoload]
+Global="*res://global.gd"
+
+[display]
+window/size/width=320
+window/size/height=200
+
+[rendering]
+driver/driver_name="GLES2"

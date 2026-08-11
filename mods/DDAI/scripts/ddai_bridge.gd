@@ -9,7 +9,10 @@ const POLL_INTERVAL_SECONDS = 0.25
 const HEARTBEAT_INTERVAL_SECONDS = 10.0
 const SUPPORTED_COMMANDS = ["status", "apply_plan", "inspect_map"]
 const MAXIMUM_INSPECTION_LIMIT = 500
-const MAXIMUM_INSPECTION_CURSOR_OFFSET = 100000
+const MAXIMUM_INSPECTION_CURSOR_OFFSET = 10000
+const MAXIMUM_INSPECTION_STATE_ITEMS = 10000
+const MAXIMUM_INSPECTION_LEVELS = 128
+const MAXIMUM_INSPECTION_LABEL_LENGTH = 256
 const RUNTIME_RECEIPT_SLOT_PATHS = ["user://ddai/runtime-receipt-slot-0.json", "user://ddai/runtime-receipt-slot-1.json"]
 
 var _poll_elapsed = POLL_INTERVAL_SECONDS
@@ -712,10 +715,12 @@ func _inspect_map_payload(payload):
 		return {"ok": false, "error": _error("invalid_request", "Inspection level must be a non-negative integer or null.", "payload.level")}
 	if Global.World == null:
 		return {"ok": false, "error": _error("map_not_available", "No Dungeondraft map is available.", "")}
-	if Global.World.Width == null or Global.World.Height == null or int(Global.World.Width) <= 0 or int(Global.World.Height) <= 0:
+	if not _is_runtime_positive_int32(Global.World.Width) or not _is_runtime_positive_int32(Global.World.Height):
 		return {"ok": false, "error": _error("map_not_available", "The current map canvas is unavailable.", "")}
-	if Global.World.GridSize == null or float(Global.World.GridSize) <= 0.0 or is_nan(float(Global.World.GridSize)) or is_inf(float(Global.World.GridSize)):
+	if not _is_runtime_positive_finite_number(Global.World.GridSize):
 		return {"ok": false, "error": _error("map_not_available", "The current map grid scale is unavailable.", "")}
+	if not _is_runtime_nonnegative_int32(Global.World.CurrentLevelId):
+		return {"ok": false, "error": _error("active_level_unavailable", "The current map level ID is invalid.", "")}
 	var current_level_id = int(Global.World.CurrentLevelId)
 	if payload.level != null and int(payload.level) != current_level_id:
 		return {"ok": false, "error": _error("unsupported_level", "Only the documented current level can be inspected.", "payload.level")}
@@ -728,76 +733,127 @@ func _inspect_map_payload(payload):
 	var region_result = _inspection_region(payload.region, int(Global.World.Width), int(Global.World.Height))
 	if not region_result.ok:
 		return region_result
-	var map_revision = int(Global.World.nextNodeID)
-	if map_revision < 0 or map_revision > 9007199254740991:
-		return {"ok": false, "error": _error("map_not_available", "The current map revision is unavailable.", "")}
-	var map_id_input = _framed_string("session_id=", _session_id)
-	map_id_input += _framed_string("title=", str(Global.World.Title))
-	map_id_input += "width=" + str(int(Global.World.Width)) + "\n"
-	map_id_input += "height=" + str(int(Global.World.Height)) + "\n"
-	var map_id = map_id_input.sha256_text()
-	var cursor_fingerprint = _inspection_cursor_fingerprint(map_id, map_revision, current_level_id, payload.region)
-	var offset_result = _inspection_cursor_offset(payload.cursor, cursor_fingerprint)
-	if not offset_result.ok:
-		return offset_result
-
-	var state = {
-		"items": [],
-		"seen": 0,
-		"offset": offset_result.offset,
-		"limit": int(payload.limit),
-		"has_more": false,
-	}
+	var levels_result = _inspection_levels(current_level_id, level)
+	if not levels_result.ok:
+		return levels_result
+	var state = {"items": [], "node_ids": {}}
 	var grid_size = float(Global.World.GridSize)
 	# This is a fixed allowlist of documented public containers on the current
 	# Level. It deliberately does not reflect over or recursively crawl the scene.
-	_append_inspection_container(level.Walls, "wall", state, current_level_id, grid_size, region_result.rect)
-	if not state.has_more:
-		_append_inspection_container(level.Pathways, "path", state, current_level_id, grid_size, region_result.rect)
-	if not state.has_more:
-		_append_inspection_container(level.Roofs, "roof", state, current_level_id, grid_size, region_result.rect)
-	if not state.has_more:
-		_append_inspection_container(level.PatternShapes, "pattern_shape", state, current_level_id, grid_size, region_result.rect)
+	var fixed_container_count = level.Walls.get_child_count() + level.Pathways.get_child_count() + level.Roofs.get_child_count()
+	if fixed_container_count < 0 or fixed_container_count > MAXIMUM_INSPECTION_STATE_ITEMS:
+		return {"ok": false, "error": _error("inspection_state_too_large", "The documented inspection state exceeds its item bound.", "")}
+	var pattern_shapes = level.PatternShapes.GetShapes()
+	if typeof(pattern_shapes) != TYPE_ARRAY:
+		return {"ok": false, "error": _error("inspection_state_invalid", "The documented pattern shape container did not return an array.", "")}
+	if pattern_shapes.size() > MAXIMUM_INSPECTION_STATE_ITEMS - fixed_container_count:
+		return {"ok": false, "error": _error("inspection_state_too_large", "The documented inspection state exceeds its item bound.", "")}
+	var append_result = _append_inspection_container(level.Walls.get_children(), "wall", state, current_level_id, grid_size)
+	if not append_result.ok:
+		return append_result
+	append_result = _append_inspection_container(level.Pathways.get_children(), "path", state, current_level_id, grid_size)
+	if not append_result.ok:
+		return append_result
+	append_result = _append_inspection_container(level.Roofs.get_children(), "roof", state, current_level_id, grid_size)
+	if not append_result.ok:
+		return append_result
+	append_result = _append_inspection_container(pattern_shapes, "pattern_shape", state, current_level_id, grid_size)
+	if not append_result.ok:
+		return append_result
+	var unsupported_kinds = ["object", "portal", "light", "text", "material", "floor_shape"]
+	var revision_result = _inspection_state_revision(
+		int(Global.World.Width),
+		int(Global.World.Height),
+		grid_size,
+		levels_result.levels,
+		state.items,
+		unsupported_kinds)
+	if not revision_result.ok:
+		return revision_result
+	var map_revision = revision_result.revision
+	var map_id = (_framed_string("session_id=", _session_id) + "world_instance_id=" + str(Global.World.get_instance_id()) + "\n").sha256_text()
+	var offset_result = _inspection_cursor_offset(
+		payload.cursor,
+		map_id,
+		map_revision,
+		current_level_id,
+		payload.region)
+	if not offset_result.ok:
+		return offset_result
+
+	var matching_items = []
+	for item in state.items:
+		if _inspection_bounds_intersect(item.bounds, region_result.rect):
+			matching_items.append(item)
+	if offset_result.offset > matching_items.size() or (payload.cursor != null and offset_result.offset == matching_items.size()):
+		return {"ok": false, "error": _error("invalid_cursor", "Inspection cursor offset does not identify a remaining page.", "payload.cursor")}
+	var page_items = []
+	var page_end = min(offset_result.offset + int(payload.limit), matching_items.size())
+	for index in range(offset_result.offset, page_end):
+		page_items.append(matching_items[index])
+	var truncated = page_end < matching_items.size()
 	var next_cursor = null
-	if state.has_more:
-		var next_offset = state.offset + state.items.size()
-		if next_offset > MAXIMUM_INSPECTION_CURSOR_OFFSET:
+	if truncated:
+		if page_end > MAXIMUM_INSPECTION_CURSOR_OFFSET:
 			return {"ok": false, "error": _error("invalid_cursor", "The inspection cursor exceeds its bounded offset.", "payload.cursor")}
-		next_cursor = cursor_fingerprint + ":" + str(next_offset)
-	var label = str(level.Label).strip_edges()
-	if label == "":
-		label = "Level " + str(current_level_id)
+		next_cursor = _inspection_cursor_value(map_id, map_revision, current_level_id, payload.region, page_end)
 	return {"ok": true, "payload": {
 		"map_id": map_id,
 		"map_revision": map_revision,
 		"canvas": {"width": int(Global.World.Width), "height": int(Global.World.Height)},
 		"grid_size": grid_size,
-		"levels": [{"id": current_level_id, "label": label, "current": true}],
-		"items": state.items,
+		"levels": levels_result.levels,
+		"items": page_items,
 		"next_cursor": next_cursor,
-		"truncated": state.has_more,
-		"unsupported_kinds": ["object", "portal", "light", "text", "material", "floor_shape"],
+		"truncated": truncated,
+		"unsupported_kinds": unsupported_kinds,
 	}}
 
 
-func _append_inspection_container(container, kind, state, level_id, grid_size, region_rect):
-	for node in container.get_children():
-		var item = _inspection_item(node, kind, level_id, grid_size)
-		if item == null or not _inspection_bounds_intersect(item.bounds, region_rect):
-			continue
-		if state.seen < state.offset:
-			state.seen += 1
-			continue
-		if state.items.size() >= state.limit:
-			state.has_more = true
-			return
+func _inspection_levels(current_level_id, expected_current_level):
+	if typeof(Global.World.levels) != TYPE_ARRAY or Global.World.levels.size() == 0 or Global.World.levels.size() > MAXIMUM_INSPECTION_LEVELS:
+		return {"ok": false, "error": _error("inspection_state_invalid", "The documented map level structure is invalid or exceeds its bound.", "")}
+	var levels = []
+	var level_ids = {}
+	var current_count = 0
+	for map_level in Global.World.levels:
+		if map_level == null or not _is_runtime_nonnegative_int32(map_level.ID) or typeof(map_level.Label) != TYPE_STRING or map_level.Label.strip_edges() == "" or map_level.Label.length() > MAXIMUM_INSPECTION_LABEL_LENGTH:
+			return {"ok": false, "error": _error("inspection_state_invalid", "A documented map level record is invalid.", "")}
+		var level_id = int(map_level.ID)
+		if level_ids.has(level_id):
+			return {"ok": false, "error": _error("inspection_state_invalid", "Documented map level IDs must be unique.", "")}
+		level_ids[level_id] = true
+		var current = level_id == current_level_id
+		if current:
+			if map_level != expected_current_level:
+				return {"ok": false, "error": _error("inspection_state_invalid", "The current level lookup does not match the public level structure.", "")}
+			current_count += 1
+		levels.append({"id": level_id, "label": map_level.Label, "current": current})
+	if current_count != 1:
+		return {"ok": false, "error": _error("active_level_unavailable", "The current level is not represented exactly once.", "")}
+	return {"ok": true, "levels": levels}
+
+
+func _append_inspection_container(nodes, kind, state, level_id, grid_size):
+	if typeof(nodes) != TYPE_ARRAY:
+		return {"ok": false, "error": _error("inspection_state_invalid", "A documented inspection container did not return an array.", "")}
+	for node in nodes:
+		if state.items.size() >= MAXIMUM_INSPECTION_STATE_ITEMS:
+			return {"ok": false, "error": _error("inspection_state_too_large", "The documented inspection state exceeds its item bound.", "")}
+		var item_result = _inspection_item(node, kind, level_id, grid_size)
+		if not item_result.ok:
+			return item_result
+		var item = item_result.item
+		if state.node_ids.has(item.node_id):
+			return {"ok": false, "error": _error("inspection_state_invalid", "Native inspection node IDs must be unique.", "")}
+		state.node_ids[item.node_id] = true
 		state.items.append(item)
-		state.seen += 1
+	return {"ok": true}
 
 
 func _inspection_item(node, kind, level_id, grid_size):
 	if node == null:
-		return null
+		return {"ok": false, "error": _error("inspection_state_invalid", "A documented inspection container contains a null node.", "")}
 	var global_rect = null
 	if kind == "wall":
 		global_rect = node.GlobalRect
@@ -808,13 +864,14 @@ func _inspection_item(node, kind, level_id, grid_size):
 	elif kind == "pattern_shape":
 		global_rect = node.GlobalRect
 	else:
-		return null
-	if typeof(global_rect) != TYPE_RECT2 or global_rect.size.x <= 0.0 or global_rect.size.y <= 0.0:
-		return null
-	var node_id = int(node.GetNodeID())
-	if node_id < 0 or node_id > 9007199254740991:
-		return null
-	return {
+		return {"ok": false, "error": _error("inspection_state_invalid", "Inspection item kind is not supported.", "")}
+	if typeof(global_rect) != TYPE_RECT2 or not _inspection_rect_is_finite_positive(global_rect):
+		return {"ok": false, "error": _error("inspection_state_invalid", "A native inspection item has invalid global bounds.", "")}
+	var raw_node_id = node.GetNodeID()
+	if not _is_runtime_nonnegative_safe_integer(raw_node_id):
+		return {"ok": false, "error": _error("inspection_state_invalid", "A native inspection item has an invalid node ID.", "")}
+	var node_id = int(raw_node_id)
+	var item = {
 		"node_id": node_id,
 		"kind": kind,
 		"bounds": {
@@ -828,6 +885,30 @@ func _inspection_item(node, kind, level_id, grid_size):
 		# Never guess one or enumerate the filesystem; unresolved references are null.
 		"asset_ref": null,
 	}
+	return {"ok": true, "item": item}
+
+
+func _inspection_rect_is_finite_positive(rect):
+	for value in [rect.position.x, rect.position.y, rect.size.x, rect.size.y]:
+		if is_nan(float(value)) or is_inf(float(value)):
+			return false
+	return rect.size.x > 0.0 and rect.size.y > 0.0
+
+
+func _is_runtime_nonnegative_safe_integer(value):
+	return (typeof(value) == TYPE_INT or typeof(value) == TYPE_REAL) and not is_nan(float(value)) and not is_inf(float(value)) and float(value) == floor(float(value)) and float(value) >= 0.0 and float(value) <= 9007199254740991.0
+
+
+func _is_runtime_nonnegative_int32(value):
+	return _is_runtime_nonnegative_safe_integer(value) and float(value) <= 2147483647.0
+
+
+func _is_runtime_positive_int32(value):
+	return _is_runtime_nonnegative_int32(value) and float(value) > 0.0
+
+
+func _is_runtime_positive_finite_number(value):
+	return (typeof(value) == TYPE_INT or typeof(value) == TYPE_REAL) and not is_nan(float(value)) and not is_inf(float(value)) and float(value) > 0.0
 
 
 func _inspection_region(region, canvas_width, canvas_height):
@@ -838,6 +919,8 @@ func _inspection_region(region, canvas_width, canvas_height):
 	for key in ["x", "y", "width", "height"]:
 		if not region.has(key) or typeof(region[key]) != TYPE_REAL or is_nan(region[key]) or is_inf(region[key]):
 			return {"ok": false, "error": _error("invalid_region", "Inspection region values must be finite numbers.", "payload.region." + key)}
+		if float("%.6f" % region[key]) != region[key]:
+			return {"ok": false, "error": _error("invalid_region", "Inspection region values may use at most six decimal places.", "payload.region." + key)}
 	if region.x < 0.0 or region.y < 0.0 or region.width <= 0.0 or region.height <= 0.0:
 		return {"ok": false, "error": _error("invalid_region", "Inspection region must be non-negative and have positive size.", "payload.region")}
 	if region.x > canvas_width or region.y > canvas_height or region.width > canvas_width - region.x or region.height > canvas_height - region.y:
@@ -851,33 +934,73 @@ func _inspection_bounds_intersect(bounds, region_rect):
 	return bounds.x < region_rect.position.x + region_rect.size.x and bounds.x + bounds.width > region_rect.position.x and bounds.y < region_rect.position.y + region_rect.size.y and bounds.y + bounds.height > region_rect.position.y
 
 
-func _inspection_cursor_fingerprint(map_id, map_revision, level_id, region):
-	var text = _framed_string("map_id=", map_id)
-	text += "map_revision=" + str(map_revision) + "\n"
+func _inspection_cursor_value(map_id, map_revision, level_id, region, offset):
+	var text = "map_id=" + map_id + "\n"
+	text += "map_revision=" + map_revision + "\n"
 	text += "level=" + str(level_id) + "\n"
 	if region == null:
 		text += "region=null\n"
 	else:
-		text += "region_x=" + str(region.x) + "\n"
-		text += "region_y=" + str(region.y) + "\n"
-		text += "region_width=" + str(region.width) + "\n"
-		text += "region_height=" + str(region.height) + "\n"
-	return text.sha256_text()
+		text += "region=" + ("%.6f" % region.x) + "," + ("%.6f" % region.y) + "," + ("%.6f" % region.width) + "," + ("%.6f" % region.height) + "\n"
+	text += "offset=" + str(offset) + "\n"
+	return text.sha256_text() + ":" + str(offset)
 
 
-func _inspection_cursor_offset(cursor, expected_fingerprint):
+func _inspection_cursor_offset(cursor, map_id, map_revision, level_id, region):
 	if cursor == null:
 		return {"ok": true, "offset": 0}
 	if typeof(cursor) != TYPE_STRING or cursor.length() < 66 or cursor.length() > 71 or cursor.substr(64, 1) != ":":
 		return {"ok": false, "error": _error("invalid_cursor", "Inspection cursor is malformed.", "payload.cursor")}
 	var fingerprint = cursor.substr(0, 64)
 	var digits = cursor.substr(65, cursor.length() - 65)
-	if not _is_sha256(fingerprint) or fingerprint != expected_fingerprint or not _is_ascii_decimal_digits(digits) or (digits.length() > 1 and digits.begins_with("0")):
-		return {"ok": false, "error": _error("invalid_cursor", "Inspection cursor does not match this map, revision, level, and region.", "payload.cursor")}
+	if not _is_sha256(fingerprint) or not _is_ascii_decimal_digits(digits) or (digits.length() > 1 and digits.begins_with("0")):
+		return {"ok": false, "error": _error("invalid_cursor", "Inspection cursor is not canonical.", "payload.cursor")}
 	var offset = int(digits)
 	if offset < 0 or offset > MAXIMUM_INSPECTION_CURSOR_OFFSET:
 		return {"ok": false, "error": _error("invalid_cursor", "Inspection cursor offset is outside the bounded range.", "payload.cursor")}
+	if cursor != _inspection_cursor_value(map_id, map_revision, level_id, region, offset):
+		return {"ok": false, "error": _error("invalid_cursor", "Inspection cursor does not match this exact map state, level, filters, and offset.", "payload.cursor")}
 	return {"ok": true, "offset": offset}
+
+
+func _inspection_state_revision(canvas_width, canvas_height, grid_size, levels, items, unsupported_kinds):
+	var context = HashingContext.new()
+	if context.start(HashingContext.HASH_SHA256) != OK:
+		return {"ok": false, "error": _error("inspection_unavailable", "The inspection revision hash could not be initialized.", "")}
+	_inspection_hash_value(context, "canvas_width", canvas_width)
+	_inspection_hash_value(context, "canvas_height", canvas_height)
+	_inspection_hash_value(context, "grid_size", grid_size)
+	_inspection_hash_value(context, "levels_count", levels.size())
+	for level_index in range(levels.size()):
+		var map_level = levels[level_index]
+		_inspection_hash_value(context, "level_index", level_index)
+		_inspection_hash_value(context, "level_id", map_level.id)
+		_inspection_hash_value(context, "level_label", map_level.label)
+		_inspection_hash_value(context, "level_current", map_level.current)
+	_inspection_hash_value(context, "items_count", items.size())
+	for item_index in range(items.size()):
+		var item = items[item_index]
+		_inspection_hash_value(context, "item_index", item_index)
+		_inspection_hash_value(context, "item_node_id", item.node_id)
+		_inspection_hash_value(context, "item_kind", item.kind)
+		_inspection_hash_value(context, "item_x", item.bounds.x)
+		_inspection_hash_value(context, "item_y", item.bounds.y)
+		_inspection_hash_value(context, "item_width", item.bounds.width)
+		_inspection_hash_value(context, "item_height", item.bounds.height)
+		_inspection_hash_value(context, "item_level", item.level)
+		_inspection_hash_value(context, "item_asset_ref", item.asset_ref)
+	_inspection_hash_value(context, "unsupported_count", unsupported_kinds.size())
+	for unsupported_index in range(unsupported_kinds.size()):
+		_inspection_hash_value(context, "unsupported_index", unsupported_index)
+		_inspection_hash_value(context, "unsupported_kind", unsupported_kinds[unsupported_index])
+	return {"ok": true, "revision": context.finish().hex_encode()}
+
+
+func _inspection_hash_value(context, name, value):
+	var encoded = var2bytes(value)
+	context.update((name + "=" + str(encoded.size()) + ":").to_utf8())
+	context.update(encoded)
+	context.update("\n".to_utf8())
 
 
 func _inspect_map_failure(request, code, message, path):

@@ -60,7 +60,7 @@ public sealed class DdaiMapInspectionToolTests
         using var structured = StructuredJson(result);
         var text = Assert.IsType<TextContentBlock>(Assert.Single(result.Content)).Text;
         Assert.True(JsonNode.DeepEquals(JsonNode.Parse(text), JsonNode.Parse(structured.RootElement.GetRawText())));
-        Assert.Equal(41, structured.RootElement.GetProperty("map_revision").GetInt64());
+        Assert.Equal(new string('b', 64), structured.RootElement.GetProperty("map_revision").GetString());
         Assert.Equal(73, structured.RootElement.GetProperty("catalog_revision").GetInt64());
         Assert.Equal(asset.AssetRef, structured.RootElement.GetProperty("items")[0].GetProperty("asset_ref").GetString());
         Assert.Equal("inspect_map", observed!.Command);
@@ -141,6 +141,50 @@ public sealed class DdaiMapInspectionToolTests
     }
 
     [Fact]
+    public async Task InspectMap_RejectsPagesOutsideTheSubmittedLimitLevelAndRegion()
+    {
+        var overLimit = await InvokeWithPageAsync(
+            new MapInspectionQuery(Limit: 1),
+            Page() with
+            {
+                Items =
+                [
+                    new MapSnapshotItem(7, "wall", new MapSnapshotBounds(1, 2, 3, 4), 3, null),
+                    new MapSnapshotItem(8, "wall", new MapSnapshotBounds(5, 2, 3, 4), 3, null),
+                ],
+            });
+        var wrongLevel = await InvokeWithPageAsync(
+            new MapInspectionQuery(Level: 4, Limit: 1),
+            Page());
+        var outsideRegion = await InvokeWithPageAsync(
+            new MapInspectionQuery(new MapInspectionRegion(20, 20, 2, 2), Level: 3, Limit: 1),
+            Page());
+
+        Assert.Equal("invalid_response", ErrorCode(overLimit));
+        Assert.Equal("invalid_response", ErrorCode(wrongLevel));
+        Assert.Equal("invalid_response", ErrorCode(outsideRegion));
+    }
+
+    [Fact]
+    public async Task InspectMap_RejectsCursorsNotCorrelatedToReturnedStateAndExactProgression()
+    {
+        var arbitrarySubmittedCursor = new string('c', 64) + ":0";
+        var submitted = await InvokeWithPageAsync(
+            new MapInspectionQuery(Level: 3, Limit: 1, Cursor: arbitrarySubmittedCursor),
+            Page());
+        var arbitraryNext = await InvokeWithPageAsync(
+            new MapInspectionQuery(Level: 3, Limit: 1),
+            Page() with
+            {
+                NextCursor = new string('d', 64) + ":1",
+                Truncated = true,
+            });
+
+        Assert.Equal("invalid_response", ErrorCode(submitted));
+        Assert.Equal("invalid_response", ErrorCode(arbitraryNext));
+    }
+
+    [Fact]
     public async Task InspectMap_PropagatesCancellationWithoutWaitingForMailboxTimeout()
     {
         using var sandbox = new InspectionSandbox();
@@ -208,7 +252,7 @@ public sealed class DdaiMapInspectionToolTests
             Assert.Null(result.IsError);
             var text = Assert.IsType<TextContentBlock>(Assert.Single(result.Content)).Text;
             using var document = JsonDocument.Parse(text);
-            Assert.Equal(41, document.RootElement.GetProperty("map_revision").GetInt64());
+            Assert.Equal(new string('b', 64), document.RootElement.GetProperty("map_revision").GetString());
             Assert.Equal(73, document.RootElement.GetProperty("catalog_revision").GetInt64());
             Assert.Equal(asset.AssetRef, document.RootElement.GetProperty("items")[0].GetProperty("asset_ref").GetString());
             Assert.True(result.StructuredContent.HasValue);
@@ -238,9 +282,28 @@ public sealed class DdaiMapInspectionToolTests
         Payload = JsonSerializer.Deserialize<JsonElement>(MapSnapshotJson.SerializePage(page)),
     };
 
+    private static async Task<CallToolResult> InvokeWithPageAsync(
+        MapInspectionQuery query,
+        MapSnapshotPage page)
+    {
+        using var sandbox = new InspectionSandbox();
+        var bridge = Task.Run(() =>
+        {
+            var claim = WaitForClaim(sandbox.Mailbox);
+            sandbox.Mailbox.PublishResponse(claim, SuccessResponse(claim.Request, page));
+        });
+        var result = await DdaiMapTools.InspectMapAsync(
+            query,
+            sandbox.CreateService(),
+            new DdaiMcpRuntimeOptions(TimeSpan.FromSeconds(2)),
+            CancellationToken.None);
+        await bridge;
+        return result;
+    }
+
     private static MapSnapshotPage Page(string? assetRef = null) => new(
         new string('a', 64),
-        41,
+        new string('b', 64),
         new MapCanvas(40, 30),
         256,
         [new MapSnapshotLevel(3, "Ground", true)],

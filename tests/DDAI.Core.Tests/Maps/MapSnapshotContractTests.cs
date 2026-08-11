@@ -37,6 +37,7 @@ public sealed class MapSnapshotContractTests
                      query with { Region = new MapInspectionRegion(0, 0, 0, 1) },
                      query with { Region = new MapInspectionRegion(0, 0, 1, double.NaN) },
                      query with { Region = new MapInspectionRegion(double.MaxValue, 0, double.MaxValue, 1) },
+                     query with { Region = new MapInspectionRegion(1.0000001, 0, 1, 1) },
                      query with { Cursor = "not-a-correlated-cursor" },
                  })
         {
@@ -71,7 +72,7 @@ public sealed class MapSnapshotContractTests
         Assert.True(Encoding.UTF8.GetByteCount(json) <= MapSnapshotJson.MaximumJsonBytes);
         using var document = JsonDocument.Parse(json);
         Assert.Equal(9, document.RootElement.EnumerateObject().Count());
-        Assert.Equal(41, document.RootElement.GetProperty("map_revision").GetInt64());
+        Assert.Equal(new string('b', 64), document.RootElement.GetProperty("map_revision").GetString());
         Assert.Equal(7, document.RootElement.GetProperty("items")[0].GetProperty("node_id").GetInt64());
         Assert.Equal(JsonValueKind.Null, document.RootElement.GetProperty("items")[0].GetProperty("asset_ref").ValueKind);
         Assert.Equal(["object", "portal", "light", "text", "material", "floor_shape"],
@@ -98,7 +99,7 @@ public sealed class MapSnapshotContractTests
         Assert.Throws<JsonException>(() => MapSnapshotJson.DeserializePage(duplicate));
 
         var wrongRevision = valid.DeepClone().AsObject();
-        wrongRevision["map_revision"] = -1;
+        wrongRevision["map_revision"] = "allocation-token-not-a-state-revision";
         Assert.Throws<JsonException>(() => MapSnapshotJson.DeserializePage(wrongRevision.ToJsonString()));
 
         var uncorrelatedCursor = valid.DeepClone().AsObject();
@@ -108,6 +109,53 @@ public sealed class MapSnapshotContractTests
         var duplicateNode = valid.DeepClone().AsObject();
         duplicateNode["items"]!.AsArray().Add(duplicateNode["items"]![0]!.DeepClone());
         Assert.Throws<JsonException>(() => MapSnapshotJson.DeserializePage(duplicateNode.ToJsonString()));
+    }
+
+    [Fact]
+    public void InspectionCursor_BindsExactMapStateFiltersAndOffset()
+    {
+        var mapId = new string('a', 64);
+        var revision = new string('b', 64);
+        var region = new MapInspectionRegion(1, 2, 10, 8);
+
+        var cursor = MapSnapshotJson.CreateCursor(mapId, revision, 3, region, 5);
+
+        Assert.Equal("9da31f0d36cb0547a1cf21211cc2d894fd9da2de4a94385331a7f156361d5265:5", cursor);
+        Assert.Equal(5, MapSnapshotJson.GetCursorOffset(cursor));
+        Assert.NotEqual(cursor, MapSnapshotJson.CreateCursor(mapId, revision, 4, region, 5));
+        Assert.NotEqual(cursor, MapSnapshotJson.CreateCursor(mapId, revision, 3, region with { X = 2 }, 5));
+        Assert.NotEqual(cursor, MapSnapshotJson.CreateCursor(mapId, revision, 3, region, 6));
+    }
+
+    [Fact]
+    public void PageQueryCorrelation_RejectsLimitLevelRegionAndCursorDrift()
+    {
+        var query = new MapInspectionQuery(new MapInspectionRegion(0, 0, 10, 10), Level: 3, Limit: 1);
+        var page = ValidPage() with
+        {
+            NextCursor = MapSnapshotJson.CreateCursor(
+                ValidPage().MapId,
+                ValidPage().MapRevision,
+                3,
+                query.Region,
+                1),
+        };
+
+        MapSnapshotJson.ValidatePageForQuery(page, query);
+
+        Assert.Throws<JsonException>(() => MapSnapshotJson.ValidatePageForQuery(
+            page with { Items = [.. page.Items, page.Items[0] with { NodeId = 8 }] },
+            query));
+        Assert.Throws<JsonException>(() => MapSnapshotJson.ValidatePageForQuery(page, query with { Level = 4 }));
+        Assert.Throws<JsonException>(() => MapSnapshotJson.ValidatePageForQuery(
+            page,
+            query with { Region = new MapInspectionRegion(20, 20, 2, 2) }));
+        Assert.Throws<JsonException>(() => MapSnapshotJson.ValidatePageForQuery(
+            page with { NextCursor = new string('c', 64) + ":1" },
+            query));
+        Assert.Throws<JsonException>(() => MapSnapshotJson.ValidatePageForQuery(
+            page with { Truncated = false, NextCursor = null },
+            query with { Cursor = new string('c', 64) + ":0" }));
     }
 
     [Fact]
@@ -140,16 +188,31 @@ public sealed class MapSnapshotContractTests
             Assert.DoesNotContain(forbidden, inspection, StringComparison.Ordinal);
         }
 
-        var cursorFingerprint = FunctionBody(script, "_inspection_cursor_fingerprint");
-        foreach (var correlationField in new[] { "map_id", "map_revision", "level", "region_x", "region_y", "region_width", "region_height" })
+        var cursorFingerprint = FunctionBody(script, "_inspection_cursor_value");
+        foreach (var correlationField in new[] { "map_id=", "map_revision=", "level=", "region=", "offset=" })
         {
             Assert.Contains(correlationField, cursorFingerprint, StringComparison.Ordinal);
         }
 
-        Assert.Contains(
-            "fingerprint != expected_fingerprint",
-            FunctionBody(script, "_inspection_cursor_offset"),
-            StringComparison.Ordinal);
+        Assert.Contains("_inspection_cursor_value", FunctionBody(script, "_inspection_cursor_offset"), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void GdscriptPackage_HasNoNetworkListenerOrProcessLaunchSurface()
+    {
+        var repositoryRoot = FindRepositoryRoot();
+        var surface = File.ReadAllText(Path.Combine(repositoryRoot, "mods", "DDAI", "scripts", "ddai_bridge.gd")) +
+            File.ReadAllText(Path.Combine(repositoryRoot, "mods", "DDAI", "ddai_bridge.ddmod"));
+
+        Assert.Empty(ListenerSurfaceFindings(surface));
+        foreach (var prohibited in new[]
+                 {
+                     "TCPServer.new(", "HTTPServer.new(", "PacketPeerUDP.new(", "WebSocketServer.new(",
+                     "UDPServer.new(", ".listen(", ".bind(", "create_server(", "OS.execute(",
+                 })
+        {
+            Assert.NotEmpty(ListenerSurfaceFindings("prefix " + prohibited + " suffix"));
+        }
     }
 
     [Fact(Timeout = 60_000)]
@@ -215,9 +278,85 @@ public sealed class MapSnapshotContractTests
         }
     }
 
+    [Fact(Timeout = 60_000)]
+    public async Task GdscriptBridge_ExecutesExactBoundedReadOnlyInspectionBehaviorOnGodot353()
+    {
+        var repositoryRoot = FindRepositoryRoot();
+        var godotPath = Path.Combine(
+            repositoryRoot,
+            "artifacts", "rectangular-room", "tooling", "godot-3.5.3",
+            "Godot_v3.5.3-stable_win64.exe");
+        Assert.True(File.Exists(godotPath), $"Pinned Godot 3.5.3 runtime not found: {godotPath}");
+
+        var fixtureRoot = Path.Combine(
+            repositoryRoot,
+            "tests", "DDAI.Core.Tests", "Maps", "GodotFixtures", "MapInspectionBehavior");
+        var temporaryRoot = Path.Combine(Path.GetTempPath(), "ddai-map-behavior-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temporaryRoot);
+        try
+        {
+            foreach (var fixture in Directory.EnumerateFiles(fixtureRoot))
+            {
+                File.Copy(fixture, Path.Combine(temporaryRoot, Path.GetFileName(fixture)));
+            }
+
+            File.Copy(
+                Path.Combine(repositoryRoot, "mods", "DDAI", "scripts", "ddai_bridge.gd"),
+                Path.Combine(temporaryRoot, "ddai_bridge.gd"));
+            using var process = Process.Start(new ProcessStartInfo(godotPath)
+            {
+                WorkingDirectory = temporaryRoot,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                ArgumentList =
+                {
+                    "--path", temporaryRoot,
+                    "--no-window",
+                    "--scene", "res://main.tscn",
+                },
+            });
+            Assert.NotNull(process);
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorTask = process.StandardError.ReadToEndAsync();
+            var exited = process.WaitForExit(30_000);
+            if (!exited)
+            {
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit();
+            }
+
+            var output = await outputTask;
+            var error = await errorTask;
+            Assert.True(exited, "Pinned Godot 3.5.3 behavior harness timed out.");
+            Assert.True(
+                process.ExitCode == 0,
+                $"Pinned Godot behavior harness exited {process.ExitCode}.{Environment.NewLine}stdout:{Environment.NewLine}{output}{Environment.NewLine}stderr:{Environment.NewLine}{error}");
+            Assert.True(string.IsNullOrEmpty(error), $"Pinned Godot behavior harness stderr:{Environment.NewLine}{error}");
+            foreach (var receipt in new[]
+                     {
+                         "DDAI_INSPECTION_PAGINATION:True",
+                         "DDAI_INSPECTION_STALE_CURSOR:True",
+                         "DDAI_INSPECTION_BOUNDS_AND_CAP:True",
+                         "DDAI_INSPECTION_CURSOR_VECTOR:True",
+                         "DDAI_INSPECTION_MAP_IDENTITY:True",
+                         "DDAI_INSPECTION_READ_ONLY:True",
+                     })
+            {
+                Assert.Contains(receipt, output, StringComparison.Ordinal);
+            }
+        }
+        finally
+        {
+            Directory.Delete(temporaryRoot, recursive: true);
+        }
+    }
+
     private static MapSnapshotPage ValidPage() => new(
         new string('a', 64),
-        41,
+        new string('b', 64),
         new MapCanvas(40, 30),
         256,
         [new MapSnapshotLevel(3, "Ground", true)],
@@ -233,6 +372,18 @@ public sealed class MapSnapshotContractTests
         Assert.True(start >= 0, $"Missing GDScript function {functionName}.");
         var next = script.IndexOf("\nfunc ", start + marker.Length, StringComparison.Ordinal);
         return next < 0 ? script[start..] : script[start..next];
+    }
+
+    private static IReadOnlyList<string> ListenerSurfaceFindings(string surface)
+    {
+        string[] prohibited =
+        [
+            "tcpserver", "tcp_server", "httpserver", "http_server", "packetpeer", "packet_peer",
+            "websocket", "web_socket", "udpserver", "udp_server", ".listen(", ".bind(",
+            "create_server(", "os.execute(",
+        ];
+        var normalized = string.Concat(surface.Where(character => !char.IsWhiteSpace(character))).ToLowerInvariant();
+        return prohibited.Where(token => normalized.Contains(token, StringComparison.Ordinal)).ToArray();
     }
 
     private static string FindRepositoryRoot()

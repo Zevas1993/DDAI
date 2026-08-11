@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -37,7 +39,7 @@ public sealed record MapSnapshotItem(
 
 public sealed record MapSnapshotPage(
     [property: JsonPropertyName("map_id")] string MapId,
-    [property: JsonPropertyName("map_revision")] long MapRevision,
+    [property: JsonPropertyName("map_revision")] string MapRevision,
     [property: JsonPropertyName("canvas")] MapCanvas Canvas,
     [property: JsonPropertyName("grid_size")] double GridSize,
     [property: JsonPropertyName("levels")] IReadOnlyList<MapSnapshotLevel> Levels,
@@ -51,7 +53,7 @@ public static class MapSnapshotJson
     public const int MaximumJsonBytes = 1024 * 1024;
     public const int MaximumLimit = 500;
     private const long MaximumSafeInteger = 9_007_199_254_740_991;
-    private const int MaximumCursorOffset = 100_000;
+    private const int MaximumCursorOffset = 10_000;
 
     private static readonly HashSet<string> SupportedKinds =
         new(["wall", "path", "roof", "pattern_shape"], StringComparer.Ordinal);
@@ -107,15 +109,124 @@ public static class MapSnapshotJson
             if (!IsFinite(region.X) || !IsFinite(region.Y) ||
                 !IsFinite(region.Width) || !IsFinite(region.Height) ||
                 region.X < 0 || region.Y < 0 || region.Width <= 0 || region.Height <= 0 ||
-                !IsFinite(region.X + region.Width) || !IsFinite(region.Y + region.Height))
+                !IsFinite(region.X + region.Width) || !IsFinite(region.Y + region.Height) ||
+                !HasCanonicalPrecision(region.X) || !HasCanonicalPrecision(region.Y) ||
+                !HasCanonicalPrecision(region.Width) || !HasCanonicalPrecision(region.Height))
             {
-                throw new ArgumentOutOfRangeException(nameof(query), "Inspection region must be finite, non-negative, and have positive size.");
+                throw new ArgumentOutOfRangeException(nameof(query), "Inspection region must be finite, non-negative, have positive size, and use at most six decimal places.");
             }
         }
 
         if (query.Cursor is not null && !TryParseCursor(query.Cursor, out _))
         {
             throw new ArgumentException("Inspection cursor is not canonical.", nameof(query));
+        }
+    }
+
+    public static string CreateCursor(
+        string mapId,
+        string mapRevision,
+        int level,
+        MapInspectionRegion? region,
+        int offset)
+    {
+        RequireHash(mapId, "map id");
+        RequireHash(mapRevision, "map revision");
+        if (level < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(level));
+        }
+
+        if (offset is < 0 or > MaximumCursorOffset)
+        {
+            throw new ArgumentOutOfRangeException(nameof(offset));
+        }
+
+        if (region is not null)
+        {
+            ValidateQuery(new MapInspectionQuery(region, level, 1));
+        }
+
+        var regionText = region is null
+            ? "null"
+            : string.Join(",",
+                FormatCoordinate(region.X),
+                FormatCoordinate(region.Y),
+                FormatCoordinate(region.Width),
+                FormatCoordinate(region.Height));
+        var input = string.Concat(
+            "map_id=", mapId, "\n",
+            "map_revision=", mapRevision, "\n",
+            "level=", level.ToString(CultureInfo.InvariantCulture), "\n",
+            "region=", regionText, "\n",
+            "offset=", offset.ToString(CultureInfo.InvariantCulture), "\n");
+        var fingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(input))).ToLowerInvariant();
+        return string.Concat(fingerprint, ":", offset.ToString(CultureInfo.InvariantCulture));
+    }
+
+    public static int GetCursorOffset(string cursor) =>
+        TryParseCursor(cursor, out var offset)
+            ? offset
+            : throw new ArgumentException("Inspection cursor is not canonical.", nameof(cursor));
+
+    public static void ValidatePageForQuery(MapSnapshotPage page, MapInspectionQuery query)
+    {
+        ValidateQuery(query);
+        ValidatePage(page);
+
+        var currentLevel = page.Levels.Single(level => level.Current);
+        if (query.Level is { } requestedLevel && requestedLevel != currentLevel.Id)
+        {
+            throw new JsonException("Map snapshot current level does not match the requested level.");
+        }
+
+        if (page.Items.Count > query.Limit || page.Items.Any(item => item.Level != currentLevel.Id))
+        {
+            throw new JsonException("Map snapshot items do not satisfy the requested limit or current level.");
+        }
+
+        if (query.Region is { } region && page.Items.Any(item => !Intersects(item.Bounds, region)))
+        {
+            throw new JsonException("Map snapshot contains an item outside the requested region.");
+        }
+
+        var requestOffset = query.Cursor is null ? 0 : GetCursorOffset(query.Cursor);
+        if (query.Cursor is not null)
+        {
+            var expectedSubmitted = CreateCursor(
+                page.MapId,
+                page.MapRevision,
+                currentLevel.Id,
+                query.Region,
+                requestOffset);
+            if (!string.Equals(query.Cursor, expectedSubmitted, StringComparison.Ordinal) || page.Items.Count == 0)
+            {
+                throw new JsonException("Submitted cursor does not correlate to the returned map state and filters.");
+            }
+        }
+
+        if (page.Truncated)
+        {
+            int nextOffset;
+            try
+            {
+                nextOffset = checked(requestOffset + page.Items.Count);
+            }
+            catch (OverflowException exception)
+            {
+                throw new JsonException("Map snapshot cursor progression overflows.", exception);
+            }
+
+            var expectedNext = CreateCursor(
+                page.MapId,
+                page.MapRevision,
+                currentLevel.Id,
+                query.Region,
+                nextOffset);
+            if (!string.Equals(page.NextCursor, expectedNext, StringComparison.Ordinal))
+            {
+                throw new JsonException("Next cursor does not represent exact item-count progression.");
+            }
         }
     }
 
@@ -213,7 +324,7 @@ public static class MapSnapshotJson
     {
         ArgumentNullException.ThrowIfNull(page);
         RequireHash(page.MapId, "map id");
-        RequireSafeInteger(page.MapRevision, "map revision");
+        RequireHash(page.MapRevision, "map revision");
         if (page.Canvas is null || page.Canvas.Width <= 0 || page.Canvas.Height <= 0)
         {
             throw new JsonException("Map canvas dimensions must be positive.");
@@ -284,7 +395,8 @@ public static class MapSnapshotJson
             throw new JsonException("Unsupported kinds must be unique members of the closed inspection-kind set.");
         }
 
-        if (page.Truncated != (page.NextCursor is not null) ||
+        if (page.Truncated && page.Items.Count == 0 ||
+            page.Truncated != (page.NextCursor is not null) ||
             (page.NextCursor is not null && !TryParseCursor(page.NextCursor, out _)))
         {
             throw new JsonException("Pagination state is inconsistent or non-canonical.");
@@ -303,7 +415,7 @@ public static class MapSnapshotJson
     private static bool TryParseCursor(string cursor, out int offset)
     {
         offset = 0;
-        if (cursor.Length is < 66 or > 71 || cursor[64] != ':' || !IsCanonicalHash(cursor.AsSpan(0, 64)))
+        if (cursor is null || cursor.Length is < 66 or > 71 || cursor[64] != ':' || !IsCanonicalHash(cursor.AsSpan(0, 64)))
         {
             return false;
         }
@@ -356,6 +468,23 @@ public static class MapSnapshotJson
 
         return true;
     }
+
+    private static bool Intersects(MapSnapshotBounds bounds, MapInspectionRegion region) =>
+        bounds.X < region.X + region.Width && bounds.X + bounds.Width > region.X &&
+        bounds.Y < region.Y + region.Height && bounds.Y + bounds.Height > region.Y;
+
+    private static bool HasCanonicalPrecision(double value)
+    {
+        if (value == 0 && BitConverter.DoubleToInt64Bits(value) < 0)
+        {
+            return false;
+        }
+
+        return double.TryParse(FormatCoordinate(value), NumberStyles.Float, CultureInfo.InvariantCulture, out var canonical) &&
+            canonical.Equals(value);
+    }
+
+    private static string FormatCoordinate(double value) => value.ToString("F6", CultureInfo.InvariantCulture);
 
     private static bool IsFinite(double value) => !double.IsNaN(value) && !double.IsInfinity(value);
 }

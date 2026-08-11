@@ -22,6 +22,8 @@ public sealed class DdaiMapTools
             "unsupported_level",
             "invalid_region",
             "invalid_cursor",
+            "inspection_state_invalid",
+            "inspection_state_too_large",
             "response_too_large",
             "inspection_unavailable",
         ],

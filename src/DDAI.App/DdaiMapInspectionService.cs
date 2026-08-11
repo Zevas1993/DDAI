@@ -82,6 +82,7 @@ public sealed class DdaiMapInspectionService(
         try
         {
             var page = MapSnapshotJson.DeserializePage(response.Payload.GetRawText());
+            MapSnapshotJson.ValidatePageForQuery(page, query);
             if (page.Items.Any(item => item.AssetRef is not null &&
                     (catalog is null || !catalog.Entries.Any(entry =>
                         string.Equals(entry.AssetRef, item.AssetRef, StringComparison.Ordinal)))))
