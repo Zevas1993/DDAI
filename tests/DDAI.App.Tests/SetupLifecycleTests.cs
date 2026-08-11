@@ -41,6 +41,54 @@ public sealed class SetupLifecycleTests
     }
 
     [Fact]
+    public void Setup_UpgradesAValidOwnedAssetHelperReceiptToTheNewExecutable()
+    {
+        using var sandbox = new LifecycleSandbox();
+        File.WriteAllText(sandbox.ClaudePath, "{}");
+        File.WriteAllText(sandbox.GeminiPath, "{}");
+        var service = new LocalSetupService(new FixedTimeProvider(), new StubProcessProbe(false));
+        var receiptPath = sandbox.Paths.AssetHelperReceiptPath;
+
+        _ = service.Setup(sandbox.Paths);
+        var firstReceipt = JsonNode.Parse(File.ReadAllText(receiptPath))!;
+        var firstHelperPath = firstReceipt["executable_path"]!.GetValue<string>();
+        File.WriteAllBytes(sandbox.SourceExecutable, [0x44, 0x44, 0x41, 0x49, 0x32]);
+
+        var result = service.Setup(sandbox.Paths);
+
+        var upgradedReceipt = JsonNode.Parse(File.ReadAllText(receiptPath))!;
+        var upgradedHelperPath = upgradedReceipt["executable_path"]!.GetValue<string>();
+        const string expectedHash = "930122bbd2aa65c8c6a0c826d25116eff9887d24dcbefd6f6ff44eb62ac944ec";
+        Assert.Equal("repaired", result.State);
+        Assert.NotEqual(firstHelperPath, upgradedHelperPath);
+        Assert.Equal(expectedHash, upgradedReceipt["sha256"]!.GetValue<string>());
+        Assert.Equal(Path.Combine(sandbox.Paths.AssetHelperRoot, $"ddai-{expectedHash}.exe"), upgradedHelperPath);
+        Assert.Equal(File.ReadAllBytes(sandbox.SourceExecutable), File.ReadAllBytes(upgradedHelperPath));
+        Assert.Equal(File.ReadAllBytes(sandbox.SourceExecutable), File.ReadAllBytes(sandbox.Paths.InstalledExecutable));
+    }
+
+    [Fact]
+    public void Setup_ForeignAssetHelperReceiptFailsBeforeConnectorUpgrade()
+    {
+        using var sandbox = new LifecycleSandbox();
+        File.WriteAllText(sandbox.ClaudePath, "{}");
+        File.WriteAllText(sandbox.GeminiPath, "{}");
+        var service = new LocalSetupService(new FixedTimeProvider(), new StubProcessProbe(false));
+
+        _ = service.Setup(sandbox.Paths);
+        var installedBefore = File.ReadAllBytes(sandbox.Paths.InstalledExecutable);
+        var receipt = JsonNode.Parse(File.ReadAllText(sandbox.Paths.AssetHelperReceiptPath))!;
+        receipt["owner"] = "foreign.owner";
+        File.WriteAllText(sandbox.Paths.AssetHelperReceiptPath, receipt.ToJsonString());
+        File.WriteAllBytes(sandbox.SourceExecutable, [0x44, 0x44, 0x41, 0x49, 0x32]);
+
+        Assert.Throws<LocalSetupException>(() => service.Setup(sandbox.Paths));
+
+        Assert.Equal(installedBefore, File.ReadAllBytes(sandbox.Paths.InstalledExecutable));
+        Assert.Equal("foreign.owner", JsonNode.Parse(File.ReadAllText(sandbox.Paths.AssetHelperReceiptPath))!["owner"]!.GetValue<string>());
+    }
+
+    [Fact]
     public void Setup_RejectsHelperRootOutsidePerUserLocalAppData()
     {
         using var sandbox = new LifecycleSandbox();

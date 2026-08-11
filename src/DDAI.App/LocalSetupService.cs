@@ -397,6 +397,7 @@ public sealed class LocalSetupService
             throw new LocalSetupException($"Source executable is missing: {paths.SourceExecutable}");
         }
 
+        _ = ReadOwnedAssetHelperReceipt(paths);
         ValidateModManifest(paths.SourceModDirectory);
         if (Directory.Exists(paths.InstalledModDirectory))
         {
@@ -692,6 +693,7 @@ public sealed class LocalSetupService
     private static void WriteAssetHelperReceipt(LocalSetupPaths paths)
     {
         ValidateAssetHelperRoot(paths.AssetHelperRoot);
+        _ = ReadOwnedAssetHelperReceipt(paths);
         Directory.CreateDirectory(paths.AssetHelperRoot);
         ValidateOrdinaryPath(paths.AssetHelperRoot);
         var executableHash = HashFile(paths.InstalledExecutable);
@@ -723,25 +725,6 @@ public sealed class LocalSetupService
         }
         var receiptPath = paths.AssetHelperReceiptPath;
         Directory.CreateDirectory(Path.GetDirectoryName(receiptPath)!);
-        if (File.Exists(receiptPath))
-        {
-            AssetHelperReceipt? existing;
-            try
-            {
-                existing = JsonSerializer.Deserialize<AssetHelperReceipt>(File.ReadAllBytes(receiptPath), JsonOptions);
-            }
-            catch (Exception exception) when (exception is JsonException or IOException or UnauthorizedAccessException)
-            {
-                throw new LocalSetupException("Refusing to replace invalid asset-helper ownership metadata.", exception);
-            }
-
-            if (existing is null || existing.Owner != Owner ||
-                !Path.GetFullPath(existing.ExecutablePath).Equals(Path.GetFullPath(helperPath), StringComparison.OrdinalIgnoreCase))
-            {
-                throw new LocalSetupException("Refusing to replace foreign asset-helper ownership metadata.");
-            }
-        }
-
         WriteJsonAtomically(
             receiptPath,
             new AssetHelperReceipt(
@@ -750,6 +733,53 @@ public sealed class LocalSetupService
                 Path.GetFullPath(helperPath),
                 executableHash));
     }
+
+    private static AssetHelperReceipt? ReadOwnedAssetHelperReceipt(LocalSetupPaths paths)
+    {
+        if (!File.Exists(paths.AssetHelperReceiptPath))
+        {
+            return null;
+        }
+
+        AssetHelperReceipt? receipt;
+        try
+        {
+            receipt = JsonSerializer.Deserialize<AssetHelperReceipt>(
+                File.ReadAllBytes(paths.AssetHelperReceiptPath),
+                JsonOptions);
+        }
+        catch (Exception exception) when (exception is JsonException or IOException or UnauthorizedAccessException)
+        {
+            throw new LocalSetupException("Refusing to replace invalid asset-helper ownership metadata.", exception);
+        }
+
+        try
+        {
+            ValidateAssetHelperRoot(paths.AssetHelperRoot);
+            var expectedPath = receipt is null || !IsSha256(receipt.Sha256)
+                ? string.Empty
+                : Path.Combine(paths.AssetHelperRoot, "ddai-" + receipt.Sha256 + ".exe");
+            if (receipt is null || receipt.SchemaVersion != "1.0" || receipt.Owner != Owner ||
+                !Path.GetFullPath(receipt.ExecutablePath).Equals(Path.GetFullPath(expectedPath), StringComparison.OrdinalIgnoreCase) ||
+                !File.Exists(expectedPath) || HashFile(expectedPath) != receipt.Sha256)
+            {
+                throw new LocalSetupException("Refusing to replace foreign asset-helper ownership metadata.");
+            }
+
+            return receipt;
+        }
+        catch (LocalSetupException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or IOException or UnauthorizedAccessException)
+        {
+            throw new LocalSetupException("Refusing to replace invalid asset-helper ownership metadata.", exception);
+        }
+    }
+
+    private static bool IsSha256(string? value) => value is not null && value.Length == 64 &&
+        value.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f');
 
     private static void DeleteOwnedAssetHelperReceipt(LocalSetupPaths paths)
     {
