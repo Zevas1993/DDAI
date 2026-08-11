@@ -865,6 +865,47 @@ public sealed class GeneratedAssetStoreTests
     }
 
     [Fact]
+    public async Task ImportAsync_ObservesCancellationAfterManifestBeforeReceiptAndLeavesRecoverablePartials()
+    {
+        using var cancellation = new CancellationTokenSource();
+        using var sandbox = new GeneratedAssetSandbox(
+            _ => new CancelAfterMove(GeneratedAssetDurableMove.Manifest, cancellation));
+        var request = Request("cancel-after-manifest", CreatePng(2, 2));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => sandbox.Store.ImportAsync(request, cancellation.Token));
+
+        Assert.True(cancellation.IsCancellationRequested);
+        Assert.False(File.Exists(sandbox.ReceiptPath(request.IdempotencyKey)));
+        Assert.Single(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "generated-assets", "content"), "*.png"));
+        Assert.Single(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "generated-assets", "preview"), "*.png"));
+        Assert.Single(Directory.EnumerateFiles(Path.Combine(sandbox.Root, "generated-assets", "manifest"), "*.json"));
+
+        var recovered = await new GeneratedAssetStore(sandbox.Root).ImportAsync(request);
+
+        Assert.True(recovered.Duplicate);
+        Assert.True(File.Exists(sandbox.ReceiptPath(request.IdempotencyKey)));
+    }
+
+    [Fact]
+    public async Task ImportAsync_ReportsCompletedResultWhenCancellationArrivesAfterDurableReceipt()
+    {
+        using var cancellation = new CancellationTokenSource();
+        using var sandbox = new GeneratedAssetSandbox(
+            _ => new CancelAfterMove(GeneratedAssetDurableMove.IdempotencyReceipt, cancellation));
+        var request = Request("cancel-after-receipt", CreatePng(2, 2));
+
+        var completed = await sandbox.Store.ImportAsync(request, cancellation.Token);
+
+        Assert.True(cancellation.IsCancellationRequested);
+        Assert.False(completed.Duplicate);
+        Assert.True(File.Exists(sandbox.ReceiptPath(request.IdempotencyKey)));
+        var replay = await new GeneratedAssetStore(sandbox.Root).ImportAsync(request);
+        Assert.True(replay.Duplicate);
+        Assert.Equal(completed.GeneratedAssetId, replay.GeneratedAssetId);
+    }
+
+    [Fact]
     public async Task ImportAsync_DownscalesIncompressiblePreviewUntilTheEncodedCapIsMet()
     {
         using var sandbox = new GeneratedAssetSandbox();
@@ -1523,6 +1564,16 @@ public sealed class GeneratedAssetStoreTests
             {
                 throw new InjectedDurabilityException();
             }
+        }
+    }
+
+    private sealed class CancelAfterMove(GeneratedAssetDurableMove target, CancellationTokenSource cancellation) : IGeneratedAssetDurability
+    {
+        private int canceled;
+
+        public void AfterDurableMove(GeneratedAssetDurableMove move)
+        {
+            if (move == target && Interlocked.Exchange(ref canceled, 1) == 0) cancellation.Cancel();
         }
     }
 

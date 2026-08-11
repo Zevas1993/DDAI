@@ -121,7 +121,7 @@ public sealed class GeneratedAssetStore
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            return Import(request);
+            return Import(request, cancellationToken);
         }
         finally
         {
@@ -145,7 +145,7 @@ public sealed class GeneratedAssetStore
         }
     }
 
-    private GeneratedAssetImportResult Import(GeneratedAssetImportRequest request)
+    private GeneratedAssetImportResult Import(GeneratedAssetImportRequest request, CancellationToken cancellationToken)
     {
         var metadata = ValidateAndCanonicalizeRequest(request);
         var source = request.ContentBase64 is not null
@@ -226,6 +226,11 @@ public sealed class GeneratedAssetStore
 
             var duplicate = fileSystem.EntryExists(manifestPath);
             PublishPriorArtifacts(contentHash, content, previewHash, preview, manifestPath, manifestBytes);
+            // This is the final rollback-safe cancellation boundary. Content, preview, and
+            // manifest publication are immutable and recoverable without a receipt; once the
+            // receipt is durable, the import is complete and later cancellation must not
+            // misreport a completed idempotent operation as canceled.
+            cancellationToken.ThrowIfCancellationRequested();
             var receiptBytes = JsonSerializer.SerializeToUtf8Bytes(new IdempotencyReceipt(requestFingerprint, result), JsonOptions);
             try
             {
