@@ -1,4 +1,5 @@
 using DDAI.Core.Assets;
+using System.Diagnostics;
 
 namespace DDAI.Core.Tests.Assets;
 
@@ -27,16 +28,83 @@ public sealed class DungeondraftAssetCatalogScriptTests
     }
 
     [Fact]
-    public void Script_AcceptsGodotStringArraysButStillRejectsOtherEnumerationTypes()
+    public async Task Script_AcceptsGodotStringArraysButStillRejectsOtherEnumerationTypes()
     {
-        var enumeration = FunctionBody(ReadCatalogScript(), "_advance_enumerating_state");
+        var repositoryRoot = FindRepositoryRoot();
+        var godotPath = Path.Combine(
+            repositoryRoot,
+            "artifacts", "rectangular-room", "tooling", "godot-3.5.3",
+            "Godot_v3.5.3-stable_win64.exe");
+        Assert.True(
+            File.Exists(godotPath),
+            $"The pinned Godot 3.5.3 test runtime is required at '{godotPath}'.");
 
-        Assert.Contains(
-            "if typeof(listed) != TYPE_ARRAY and typeof(listed) != TYPE_STRING_ARRAY:",
-            enumeration,
-            StringComparison.Ordinal);
-        Assert.Contains("asset_enumeration_failed", enumeration, StringComparison.Ordinal);
-        Assert.Contains("_enumeration_raw = listed", enumeration, StringComparison.Ordinal);
+        var fixtureRoot = Path.Combine(
+            repositoryRoot,
+            "tests", "DDAI.Core.Tests", "Assets", "GodotFixtures", "AssetCatalogEnumeration");
+        var temporaryRoot = Path.Combine(Path.GetTempPath(), "ddai-godot-catalog-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temporaryRoot);
+        try
+        {
+            foreach (var fixtureName in new[] { "project.godot", "main.tscn", "main.gd", "global.gd" })
+            {
+                File.Copy(Path.Combine(fixtureRoot, fixtureName), Path.Combine(temporaryRoot, fixtureName));
+            }
+
+            var productionScript = ReadCatalogScript();
+            if (Environment.GetEnvironmentVariable("DDAI_GODOT_CATALOG_TEST_MUTATION") == "array-only")
+            {
+                const string fixedPredicate = "typeof(listed) != TYPE_ARRAY and typeof(listed) != TYPE_STRING_ARRAY";
+                Assert.Contains(fixedPredicate, productionScript, StringComparison.Ordinal);
+                productionScript = productionScript.Replace(
+                    fixedPredicate,
+                    "typeof(listed) != TYPE_ARRAY",
+                    StringComparison.Ordinal);
+            }
+
+            File.WriteAllText(Path.Combine(temporaryRoot, "ddai_asset_catalog.gd"), productionScript);
+
+            using var process = Process.Start(new ProcessStartInfo(godotPath)
+            {
+                WorkingDirectory = temporaryRoot,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                ArgumentList =
+                {
+                    "--path", temporaryRoot,
+                    "--no-window",
+                    "--scene", "res://main.tscn",
+                },
+            });
+            Assert.NotNull(process);
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorTask = process.StandardError.ReadToEndAsync();
+            var exited = process.WaitForExit(30_000);
+            if (!exited)
+            {
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit();
+            }
+
+            var output = await outputTask;
+            var error = await errorTask;
+            Assert.True(exited, "The pinned Godot behavior harness timed out.");
+
+            Assert.True(
+                process.ExitCode == 0,
+                $"The pinned Godot behavior harness exited {process.ExitCode}.{Environment.NewLine}" +
+                $"stdout:{Environment.NewLine}{output}{Environment.NewLine}stderr:{Environment.NewLine}{error}");
+            Assert.Equal(string.Empty, error);
+            Assert.Contains("DDAI_TYPED_ARRAY_ENUMERATION:True", output, StringComparison.Ordinal);
+            Assert.Contains("DDAI_WRONG_TYPE_FAILS_CLOSED:True", output, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(temporaryRoot, recursive: true);
+        }
     }
 
     [Fact]
