@@ -1,5 +1,7 @@
 using System.ComponentModel;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using DDAI.App.Assets;
 using DDAI.Core.Mailbox;
 using DDAI.Core.MapPlans;
@@ -47,6 +49,8 @@ public static class McpStdioServer
         builder.Services.AddSingleton<DdaiPlanService>();
         builder.Services.AddSingleton<DdaiMapInspectionService>();
         builder.Services.AddSingleton<DdaiCapabilityService>();
+        builder.Services.AddSingleton<IUniversalPlanContextProvider, LiveUniversalPlanContextProvider>();
+        builder.Services.AddSingleton<DdaiUniversalPlanService>();
         builder.Services.AddSingleton(new DdaiMcpRuntimeOptions(options.Timeout));
         builder.Services
             .AddMcpServer(server => server.ServerInfo = new Implementation
@@ -56,12 +60,52 @@ public static class McpStdioServer
                 Description = "Local Dungeondraft AI connector",
             })
             .WithStdioServerTransport()
-            .WithTools<DdaiTools>()
+            .WithRequestFilters(filters => filters.AddCallToolFilter(next => async (request, token) =>
+            {
+                ValidatePlanToolArguments(request.Params);
+                return await next(request, token).ConfigureAwait(false);
+            }))
+            .WithTools<DdaiTools>(CreatePlanToolJsonOptions())
             .WithTools<DdaiCapabilityTools>()
             .WithTools<DdaiAssetTools>()
             .WithTools<DdaiMapTools>();
 
         await builder.Build().RunAsync(cancellationToken);
+    }
+
+    internal static void ValidatePlanToolArguments(CallToolRequestParams? parameters)
+    {
+        if (parameters?.Name is not ("ddai_validate_plan" or "ddai_apply_plan"))
+        {
+            return;
+        }
+
+        if (parameters.Arguments is null ||
+            !parameters.Arguments.TryGetValue("plan", out var plan))
+        {
+            throw new JsonException("The plan tool requires a plan argument.");
+        }
+
+        try
+        {
+            _ = MapPlanJson.Deserialize(plan.GetRawText());
+        }
+        catch (MapPlanValidationException)
+        {
+            // Wire shape is strict here; semantic issues belong to the tool's structured result.
+        }
+    }
+
+    internal static JsonSerializerOptions CreatePlanToolJsonOptions()
+    {
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web)
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+            TypeInfoResolver = new DefaultJsonTypeInfoResolver(),
+            AllowOutOfOrderMetadataProperties = true,
+        };
+        options.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower));
+        return options;
     }
 }
 
@@ -97,9 +141,22 @@ public sealed class DdaiTools
         Destructive = false,
         Idempotent = true,
         OpenWorld = false)]
-    [Description("Validate one grid-relative rectangular-room plan without changing Dungeondraft.")]
-    public static string ValidatePlan(MapPlan plan, DdaiPlanService planService) =>
-        JsonSerializer.Serialize(planService.Validate(plan), JsonOptions);
+    [Description("Validate a legacy rectangular-room plan locally, or validate a universal all-category plan against the live map, catalog revision, and certified Dungeondraft executors, without changing the map.")]
+    public static async Task<string> ValidatePlan(
+        MapPlan plan,
+        DdaiPlanService planService,
+        DdaiUniversalPlanService universalPlanService,
+        DdaiMcpRuntimeOptions runtimeOptions,
+        CancellationToken cancellationToken)
+    {
+        object result = StringComparer.Ordinal.Equals(plan.SchemaVersion, MapPlan.LegacySchemaVersion)
+            ? planService.Validate(plan)
+            : await universalPlanService.ValidateAsync(
+                plan,
+                runtimeOptions.RequestTimeout,
+                cancellationToken).ConfigureAwait(false);
+        return JsonSerializer.Serialize(result, JsonOptions);
+    }
 
     [McpServerTool(
         Name = "ddai_apply_plan",
@@ -107,13 +164,16 @@ public sealed class DdaiTools
         Destructive = true,
         Idempotent = true,
         OpenWorld = false)]
-    [Description("Create one native rectangular wall in the open blank Dungeondraft map. The same request_id is idempotent.")]
+    [Description("Apply a legacy rectangular room or revision-locked universal all-category plan to the open Dungeondraft map. The same request_id and plan are idempotent.")]
     public static async Task<string> ApplyPlanAsync(
         MapPlan plan,
         DdaiPlanService planService,
+        DdaiUniversalPlanService universalPlanService,
         DdaiMcpRuntimeOptions runtimeOptions,
         CancellationToken cancellationToken) =>
         JsonSerializer.Serialize(
-            await planService.ApplyAsync(plan, runtimeOptions.RequestTimeout, cancellationToken),
+            StringComparer.Ordinal.Equals(plan.SchemaVersion, MapPlan.LegacySchemaVersion)
+                ? await planService.ApplyAsync(plan, runtimeOptions.RequestTimeout, cancellationToken).ConfigureAwait(false)
+                : await universalPlanService.ApplyAsync(plan, runtimeOptions.RequestTimeout, cancellationToken).ConfigureAwait(false),
             JsonOptions);
 }

@@ -113,6 +113,31 @@ public sealed class AtomicMailboxTests
     }
 
     [Fact]
+    public void TryReadActiveRequest_FollowsRequestIntoProcessingAndThenReturnsNullAfterResponse()
+    {
+        using var sandbox = new MailboxSandbox();
+        var mailbox = new AtomicMailbox(sandbox.Root);
+        var request = MailboxRequest.CreateStatus("active-read-001", Timestamp);
+        Assert.True(mailbox.PublishRequest(request));
+
+        Assert.Equal("active-read-001", mailbox.TryReadActiveRequest(request.RequestId)!.RequestId);
+        var claim = mailbox.ClaimNextRequest();
+        Assert.NotNull(claim);
+        Assert.Equal("active-read-001", mailbox.TryReadActiveRequest(request.RequestId)!.RequestId);
+        mailbox.PublishResponse(claim!, new MailboxResponse
+        {
+            SchemaVersion = MailboxRequest.CurrentSchemaVersion,
+            RequestId = request.RequestId,
+            Command = request.Command,
+            Timestamp = Timestamp,
+            Success = true,
+            Payload = JsonSerializer.SerializeToElement(new { state = "ready" }),
+        });
+
+        Assert.Null(mailbox.TryReadActiveRequest(request.RequestId));
+    }
+
+    [Fact]
     public void PublishRequest_ConcurrentDuplicateRequestIdHasOneWinner()
     {
         using var sandbox = new MailboxSandbox();

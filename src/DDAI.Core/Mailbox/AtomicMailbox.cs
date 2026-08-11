@@ -77,10 +77,7 @@ public sealed class AtomicMailbox
 
             try
             {
-                var json = ReadBoundedText(processingPath);
-                var request = JsonSerializer.Deserialize<MailboxRequest>(json, JsonOptions)
-                    ?? throw new JsonException("Request JSON cannot be null.");
-                ValidateRequest(request);
+                var request = ReadValidatedRequest(processingPath);
                 if (!Path.GetFileNameWithoutExtension(processingPath).Equals(MessageKey(request.RequestId), StringComparison.Ordinal))
                 {
                     throw new JsonException("Request ID does not match the mailbox file key.");
@@ -170,6 +167,37 @@ public sealed class AtomicMailbox
             }
 
             Thread.Sleep(10);
+        }
+
+        return null;
+    }
+
+    public MailboxRequest? TryReadActiveRequest(string requestId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(requestId);
+        var key = MessageKey(requestId);
+        foreach (var directory in new[] { _requestsDirectory, _processingDirectory })
+        {
+            var path = MessagePath(directory, key);
+            try
+            {
+                var request = ReadValidatedRequest(path);
+                if (!StringComparer.Ordinal.Equals(request.RequestId, requestId) ||
+                    !StringComparer.Ordinal.Equals(Path.GetFileNameWithoutExtension(path), key))
+                {
+                    throw new JsonException("Active request does not match its mailbox identity.");
+                }
+
+                return request;
+            }
+            catch (FileNotFoundException)
+            {
+                // The bridge may have atomically advanced requests -> processing -> response.
+            }
+            catch (DirectoryNotFoundException)
+            {
+                // The mailbox root changed underneath this read; the caller will recheck response state.
+            }
         }
 
         return null;
@@ -298,7 +326,9 @@ public sealed class AtomicMailbox
     {
         try
         {
-            var response = JsonSerializer.Deserialize<MailboxResponse>(ReadBoundedText(path), JsonOptions)
+            var json = ReadBoundedText(path);
+            RejectDuplicateProperties(json);
+            var response = JsonSerializer.Deserialize<MailboxResponse>(json, JsonOptions)
                 ?? throw new JsonException("Response JSON cannot be null.");
             ValidateResponse(response);
             if (!StringComparer.Ordinal.Equals(response.RequestId, awaitedRequestId))
@@ -318,7 +348,9 @@ public sealed class AtomicMailbox
     {
         try
         {
-            var request = JsonSerializer.Deserialize<MailboxRequest>(ReadBoundedText(path), JsonOptions)
+            var json = ReadBoundedText(path);
+            RejectDuplicateProperties(json);
+            var request = JsonSerializer.Deserialize<MailboxRequest>(json, JsonOptions)
                 ?? throw new JsonException("Request JSON cannot be null.");
             ValidateRequest(request);
             return request;
@@ -333,9 +365,7 @@ public sealed class AtomicMailbox
     {
         try
         {
-            var request = JsonSerializer.Deserialize<MailboxRequest>(ReadBoundedText(processingPath), JsonOptions)
-                ?? throw new JsonException("Request JSON cannot be null.");
-            ValidateRequest(request);
+            var request = ReadValidatedRequest(processingPath);
             var key = MessageKey(request.RequestId);
             if (!Path.GetFileNameWithoutExtension(processingPath).Equals(key, StringComparison.Ordinal))
             {
@@ -362,6 +392,36 @@ public sealed class AtomicMailbox
         catch (JsonException)
         {
             return false;
+        }
+    }
+
+    private static void RejectDuplicateProperties(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        RejectDuplicateProperties(document.RootElement);
+    }
+
+    private static void RejectDuplicateProperties(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var property in element.EnumerateObject())
+            {
+                if (!names.Add(property.Name))
+                {
+                    throw new JsonException($"Duplicate mailbox property '{property.Name}'.");
+                }
+
+                RejectDuplicateProperties(property.Value);
+            }
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+            {
+                RejectDuplicateProperties(item);
+            }
         }
     }
 
