@@ -115,10 +115,10 @@ git commit -m "feat: execute native wall and portal operations"
 **Interfaces and fixed routes:**
 - Paths configure PathTool Texture/Width/Smoothness/layer/sorting/fades, StartPath, set exact edit points through the certified active Pathway, and EndPath(loop); observe Pathways count and NodeID.
 - Materials configure MaterialBrush.SetMaterial, layer, size, smoothness, and mutate its certified MaterialMesh; observe a captured mesh/bitmap hash and worker idle state.
-- Objects configure ObjectTool texture/rotation/scale/layer/sorting/shadow/block-light, create or update Preview at the explicit plan position, and Confirm; observe Objects count, NodeID, texture identity, and transform.
+- Objects configure ObjectTool texture/rotation/scale/layer/sorting/shadow/block-light and optional custom color through `ChangeColor`, create or update Preview at the explicit plan position, and Confirm; observe Objects count, NodeID, texture identity, transform, layer/sorting, shadow/block-light, and applied custom color when requested.
 - Lights configure LightTool texture/range/intensity/color/shadows, CreatePreview, place through the certified Lights container route, and observe light NodeID and properties.
 
-- [ ] **Step 1: Write RED tests for exact configuration order, idle checks, explicit positions, postconditions, and cleanup**
+- [ ] **Step 1: Write RED tests for exact configuration order, idle checks, explicit positions, every Object Tool option (rotation, scale, layer, sorting, shadow, block-light, custom color), postconditions, and cleanup**
 - [ ] **Step 2: Implement path and material, run parser/tests, and live-certify create/undo**
 - [ ] **Step 3: Implement object and light, run parser/tests, and live-certify create/undo**
 - [ ] **Step 4: Save, close, reopen, and inspect all four native elements**

@@ -244,3 +244,37 @@ git commit -m "feat: inspect live Dungeondraft maps"
 git add -- src/DDAI.App tests/DDAI.App.Tests/McpPublishedIntegrationTests.cs docs/superpowers/reports/2026-08-10-ddai-mcp-discovery-report.md
 git commit -m "feat: complete MCP asset discovery surface"
 ~~~
+
+### Task 7: Dungeondraft Library search and tag metadata parity
+
+**Files:**
+- Modify: mods/DDAI/scripts/ddai_asset_catalog.gd
+- Modify: tests/DDAI.Core.Tests/Assets/DungeondraftAssetCatalogScriptTests.cs
+- Modify: tests/DDAI.Core.Tests/Assets/GodotFixtures/AssetCatalogEnumeration
+- Modify: src/DDAI.Core/Assets/AssetCatalogJson.cs
+- Modify: tests/DDAI.Core.Tests/Assets/AssetCatalogContractTests.cs
+- Modify: tests/DDAI.App.Tests/Assets/AssetCatalogRepositoryTests.cs
+- Modify: tests/DDAI.App.Tests/Mcp/DdaiAssetToolTests.cs
+- Modify: mods/DDAI/scripts/ddai_bridge.gd
+- Modify: src/DDAI.Core/Maps/MapSnapshotContracts.cs
+- Modify: src/DDAI.App/DdaiMapInspectionService.cs
+- Modify: tests/DDAI.Core.Tests/Maps/MapSnapshotContractTests.cs
+- Modify: tests/DDAI.App.Tests/Mcp/DdaiMapInspectionToolTests.cs
+- Create: docs/superpowers/reports/2026-08-11-ddai-library-metadata-report.md
+
+**Interfaces and fixed route:**
+- Preserve `Script.GetAssetList` as the complete asset authority.
+- At top-level tool scope, read the documented `Global.Editor.ObjectLibraryPanel.searchEngine` (`Dictionary[String, Array[Texture]]`) and invert it into bounded per-resource search terms without serializing resource paths.
+- Emit a catalog tag only when exact membership is provable by intersecting a documented public `TagsPanel.tagIndexLookup` key with the same search-engine texture membership. Otherwise keep the value as a search term; never guess tags.
+- Default assets may legitimately have null pack metadata. Custom pack metadata comes only from a boundary-safe match against documented `Global.Header.AssetManifest`.
+- Reproduce the Library's read-only `Used` information by inspecting the documented current-level `Objects` container and `Prop` contract. The bridge may return only a SHA-256 resource fingerprint derived from `Prop.Sprite.texture.resource_path`; the .NET service must resolve it uniquely against the accepted catalog and expose only the opaque `asset_ref`, never the resource path or fingerprint.
+- Tighten the catalog reader and writer to exact per-entry term/tag count, scalar, canonicalization, control-character, duplicate, and path-like limits before accepting any live metadata. The GDScript producer and .NET reader must share an executable hostile-value corpus.
+
+- [ ] **Step 1: Write genuine RED tests proving exact production GDScript omits non-filename Library terms and exact tags**
+- [ ] **Step 2: Implement bounded read-only metadata indexing at tool scope; no UI calls, scene traversal, reflection, or private `TagsPanel.ObjectTool` access**
+- [ ] **Step 3: Prove typed-array, wrong-type, hostile-key, deduplication, operation-bound, and path-nondisclosure behavior under pinned Godot 3.5.3**
+- [ ] **Step 4: Prove a real repository and MCP client find a known asset by a non-filename Library term and an exact tag where publicly available; prove map inspection returns placed objects with uniquely correlated opaque `asset_ref` values**
+- [ ] **Step 5: Run parser/listener scans, isolated no-MCP catalog publication, real repository validation, full Release tests/build/audit/format/diff, and independent review**
+- [ ] **Step 6: After clean review only, install the ownership-proven DDAI files, normally reload a disposable map, and certify new revision/fingerprint, entry/preview counts, non-filename term coverage, exact tag coverage, bounded errors, and no crash**
+
+This task is read-only and must not select assets, change tag sets, invoke `ShowUsedObjects`, mutate the Library UI, or mutate the map.

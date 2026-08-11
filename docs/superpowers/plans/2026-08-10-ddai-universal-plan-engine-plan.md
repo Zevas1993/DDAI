@@ -45,7 +45,7 @@
 
 **Interfaces:**
 - MapOperation derived records: TerrainStroke, PatternRegion, ColorablePatternRegion, CaveRegion, RoofRegion, ObjectPlacement, WallPolyline, MaterialStroke, PortalPlacement, PathPolyline, LightPlacement, SimpleTileRegion, SmartTileRegion, SmartTileDoubleRegion.
-- Every operation contains OperationId and LevelId. Asset-bearing records contain AssetRef. Geometry uses GridPoint, GridPolyline, or GridPolygon.
+- Every operation contains OperationId and LevelId. Asset-bearing records contain AssetRef. Geometry uses GridPoint, GridPolyline, or GridPolygon. `ObjectPlacement` carries rotation, scale, layer, sorting, shadow, block-light, and optional normalized custom-color RGBA so the wire contract covers every documented Object Tool placement control.
 
 - [ ] **Step 1: Write failing round-trip tests containing all fourteen operation discriminators**
 
@@ -109,7 +109,7 @@ Require schema 2.0, safe request/map/operation IDs, nonnegative revisions, add/p
 
 - [ ] **Step 4: Implement category-specific validation**
 
-Require asset category match, finite bounded geometry, polygons with at least three unique points, polylines with at least two points, positive widths/scales/intensities, normalized RGBA hex, rotation in -360..360, valid layer/sorting enums, and capability RuntimeCertified true. Require every referenced generated asset to be active.
+Require asset category match, finite bounded geometry, polygons with at least three unique points, polylines with at least two points, positive widths/scales/intensities, normalized RGBA hex (including optional object custom color), rotation in -360..360, valid layer/sorting enums, and capability RuntimeCertified true. Require every referenced generated asset to be active.
 
 - [ ] **Step 5: Implement deterministic dependency order**
 
