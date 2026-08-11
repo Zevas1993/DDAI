@@ -355,7 +355,7 @@ func _advance_enumerating_state():
 	var category = CATEGORIES[_category_index]
 	if not _enumeration_loaded:
 		var listed = _runtime_adapter.get_asset_list(category)
-		if typeof(listed) != TYPE_ARRAY:
+		if typeof(listed) != TYPE_ARRAY and typeof(listed) != TYPE_STRING_ARRAY:
 			_record_error("asset_enumeration_failed", "Dungeondraft did not return an asset list for this category.", category)
 			listed = []
 		_enumeration_raw = listed

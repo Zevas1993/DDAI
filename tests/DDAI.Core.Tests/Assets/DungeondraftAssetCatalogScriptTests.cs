@@ -27,6 +27,19 @@ public sealed class DungeondraftAssetCatalogScriptTests
     }
 
     [Fact]
+    public void Script_AcceptsGodotStringArraysButStillRejectsOtherEnumerationTypes()
+    {
+        var enumeration = FunctionBody(ReadCatalogScript(), "_advance_enumerating_state");
+
+        Assert.Contains(
+            "if typeof(listed) != TYPE_ARRAY and typeof(listed) != TYPE_STRING_ARRAY:",
+            enumeration,
+            StringComparison.Ordinal);
+        Assert.Contains("asset_enumeration_failed", enumeration, StringComparison.Ordinal);
+        Assert.Contains("_enumeration_raw = listed", enumeration, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Script_BoundsPerFrameWorkPreviewsAndChunkPayloads()
     {
         var script = ReadCatalogScript();
