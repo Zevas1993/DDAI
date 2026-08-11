@@ -26,13 +26,25 @@ class WrongTypeAdapter:
 		return {"secret": "res://private/" + category + "-must-not-be-reflected.png"}
 
 
+class ToolScopedScriptApi:
+	func GetAssetList(category):
+		if category != "Terrain":
+			return PoolStringArray()
+		return PoolStringArray([
+			"res://tool-scope/zeta.png",
+			"res://tool-scope/alpha.png",
+		])
+
+
 func _ready():
 	var typed_array = _test_typed_array_enumeration()
 	var wrong_type = _test_wrong_type_fails_closed()
+	var tool_scope_wiring = _test_production_live_wiring_uses_tool_scope()
 	print("DDAI_TYPED_ARRAY_ENUMERATION:", typed_array)
 	print("DDAI_WRONG_TYPE_FAILS_CLOSED:", wrong_type)
 	print("DDAI_ENUMERATION_DIAGNOSTIC_CLOSED_WORLD:", wrong_type)
-	get_tree().quit(0 if typed_array and wrong_type else 1)
+	print("DDAI_TOOL_SCOPE_LIVE_WIRING:", tool_scope_wiring)
+	get_tree().quit(0 if typed_array and wrong_type and tool_scope_wiring else 1)
 
 
 func _test_typed_array_enumeration():
@@ -104,3 +116,24 @@ func _test_wrong_type_fails_closed():
 		if category_resources.category != category or category_resources.identities.size() != 0:
 			return false
 	return true
+
+
+func _test_production_live_wiring_uses_tool_scope():
+	var catalog = CatalogScript.new()
+	catalog.Script = ToolScopedScriptApi.new()
+	catalog.start()
+	catalog._state = "enumerating"
+	for category in CatalogScript.CATEGORIES:
+		catalog._category_counts[category] = 0
+	var advances = 0
+	while catalog._category_index == 0 and advances < 8:
+		catalog._advance_enumerating_state()
+		advances += 1
+	if catalog._category_index != 1 or catalog._errors.size() != 0:
+		return false
+	if catalog._category_resources.size() != 1 or catalog._category_counts["Terrain"] != 2:
+		return false
+	return catalog._category_resources[0].identities == [
+		"res://tool-scope/alpha.png",
+		"res://tool-scope/zeta.png",
+	]

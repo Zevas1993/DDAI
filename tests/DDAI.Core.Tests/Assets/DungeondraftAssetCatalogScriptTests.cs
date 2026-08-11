@@ -52,6 +52,12 @@ public sealed class DungeondraftAssetCatalogScriptTests
             }
 
             var productionScript = ReadCatalogScript();
+            const string toolScriptDeclaration = "var script_class = \"tool\"\n";
+            Assert.Contains(toolScriptDeclaration, productionScript, StringComparison.Ordinal);
+            productionScript = productionScript.Replace(
+                toolScriptDeclaration,
+                toolScriptDeclaration + "var Script = null\n",
+                StringComparison.Ordinal);
             if (Environment.GetEnvironmentVariable("DDAI_GODOT_CATALOG_TEST_MUTATION") == "array-only")
             {
                 const string fixedPredicate = "typeof(listed) != TYPE_ARRAY and typeof(listed) != TYPE_STRING_ARRAY";
@@ -101,6 +107,7 @@ public sealed class DungeondraftAssetCatalogScriptTests
             Assert.Contains("DDAI_TYPED_ARRAY_ENUMERATION:True", output, StringComparison.Ordinal);
             Assert.Contains("DDAI_WRONG_TYPE_FAILS_CLOSED:True", output, StringComparison.Ordinal);
             Assert.Contains("DDAI_ENUMERATION_DIAGNOSTIC_CLOSED_WORLD:True", output, StringComparison.Ordinal);
+            Assert.Contains("DDAI_TOOL_SCOPE_LIVE_WIRING:True", output, StringComparison.Ordinal);
         }
         finally
         {

@@ -93,6 +93,10 @@ class LiveRuntimeAdapter:
 	var _helper_file = null
 	var _helper_hash = null
 	var _helper_expected_hash = ""
+	var _asset_list_provider = null
+
+	func _init(asset_list_provider):
+		_asset_list_provider = asset_list_provider
 
 	func read_runtime_receipt():
 		var newest = null
@@ -213,7 +217,7 @@ class LiveRuntimeAdapter:
 		return true
 
 	func get_asset_list(category):
-		return Script.GetAssetList(category)
+		return _asset_list_provider.call_func(category)
 
 	func get_pack_metadata(resource_identity):
 		var owner = null
@@ -245,8 +249,12 @@ class LiveRuntimeAdapter:
 # Called by Dungeondraft after the map and its drawing assets have loaded.
 func start():
 	if _runtime_adapter == null:
-		_runtime_adapter = LiveRuntimeAdapter.new()
+		_runtime_adapter = LiveRuntimeAdapter.new(funcref(self, "_get_live_asset_list"))
 	_ensure_catalog_directories()
+
+
+func _get_live_asset_list(category):
+	return Script.GetAssetList(category)
 
 
 # Every update performs at most eight lightweight entry operations or one logical file publication.
