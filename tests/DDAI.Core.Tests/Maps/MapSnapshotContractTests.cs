@@ -80,6 +80,27 @@ public sealed class MapSnapshotContractTests
     }
 
     [Fact]
+    public void SnapshotPage_AcceptsInternalObjectFingerprintButOmitsItAfterSanitization()
+    {
+        var fingerprint = new string('c', 64);
+        var internalPage = ValidPage() with
+        {
+            Items = [new MapSnapshotItem(9, "object", new MapSnapshotBounds(1, 2, 3, 4), 3, null, fingerprint)],
+        };
+
+        var wire = MapSnapshotJson.SerializePage(internalPage);
+        var parsed = MapSnapshotJson.DeserializePage(wire);
+        var publicPage = parsed with
+        {
+            Items = [parsed.Items[0] with { AssetRef = "sha256:" + new string('d', 64), ResourceFingerprint = null }],
+        };
+
+        Assert.Equal(fingerprint, parsed.Items[0].ResourceFingerprint);
+        Assert.Contains("resource_fingerprint", wire, StringComparison.Ordinal);
+        Assert.DoesNotContain("resource_fingerprint", MapSnapshotJson.SerializePage(publicPage), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void SnapshotPage_RejectsUnknownMissingDuplicateAndSemanticallyInvalidContent()
     {
         var valid = JsonNode.Parse(MapSnapshotJson.SerializePage(ValidPage()))!.AsObject();
@@ -109,6 +130,10 @@ public sealed class MapSnapshotContractTests
         var duplicateNode = valid.DeepClone().AsObject();
         duplicateNode["items"]!.AsArray().Add(duplicateNode["items"]![0]!.DeepClone());
         Assert.Throws<JsonException>(() => MapSnapshotJson.DeserializePage(duplicateNode.ToJsonString()));
+
+        var primitiveItem = valid.DeepClone().AsObject();
+        primitiveItem["items"]!.AsArray()[0] = "not-an-object";
+        Assert.Throws<JsonException>(() => MapSnapshotJson.DeserializePage(primitiveItem.ToJsonString()));
     }
 
     [Fact]
@@ -194,13 +219,15 @@ public sealed class MapSnapshotContractTests
             FunctionBody(script, "_inspection_item");
 
         Assert.Contains("\"inspect_map\"", script, StringComparison.Ordinal);
-        foreach (var documentedPath in new[] { "level.Walls", "level.Pathways", "level.Roofs", "level.PatternShapes" })
+        foreach (var documentedPath in new[] { "level.Walls", "level.Pathways", "level.Roofs", "level.PatternShapes", "level.Objects" })
         {
             Assert.Contains(documentedPath, inspection, StringComparison.Ordinal);
         }
 
         Assert.Contains("GetNodeID()", inspection, StringComparison.Ordinal);
         Assert.Contains("GlobalRect", inspection, StringComparison.Ordinal);
+        Assert.Contains("node.Rect", inspection, StringComparison.Ordinal);
+        Assert.Contains("node.Sprite.texture.resource_path", inspection, StringComparison.Ordinal);
         Assert.Contains("unsupported_kinds", inspection, StringComparison.Ordinal);
         foreach (var forbidden in new[] { "get_property_list", "find_node", "get_node(", "get_tree(", "NodeLookup", ".Data", "Directory.new", "File.new", ".Save(" })
         {
@@ -360,8 +387,9 @@ public sealed class MapSnapshotContractTests
                          "DDAI_INSPECTION_STALE_CURSOR:True",
                          "DDAI_INSPECTION_BOUNDS_AND_CAP:True",
                          "DDAI_INSPECTION_CURSOR_VECTOR:True",
-                         "DDAI_INSPECTION_MAP_IDENTITY:True",
-                         "DDAI_INSPECTION_READ_ONLY:True",
+                          "DDAI_INSPECTION_MAP_IDENTITY:True",
+                          "DDAI_INSPECTION_OBJECT_CORRELATION:True",
+                          "DDAI_INSPECTION_READ_ONLY:True",
                      })
             {
                 Assert.Contains(receipt, output, StringComparison.Ordinal);

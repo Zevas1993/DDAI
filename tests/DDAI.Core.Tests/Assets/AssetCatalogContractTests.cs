@@ -183,6 +183,73 @@ public sealed class AssetCatalogContractTests
     }
 
     [Fact]
+    public void SerializeChunk_RejectsNoncanonicalUnsafeDuplicateAndOversizedMetadata()
+    {
+        var invalidEntries = new[]
+        {
+            ValidEntry() with { SearchTerms = [" Chair "] },
+            ValidEntry() with { SearchTerms = ["chair", "chair"] },
+            ValidEntry() with { SearchTerms = ["../private"] },
+            ValidEntry() with { SearchTerms = ["chair\u200bhidden"] },
+            ValidEntry() with { SearchTerms = ["chair\u00a0hidden"] },
+            ValidEntry() with { SearchTerms = [new string('x', AssetCatalogJson.MaximumMetadataScalars + 1)] },
+            ValidEntry() with { SearchTerms = Enumerable.Range(0, AssetCatalogJson.MaximumSearchTermsPerEntry + 1).Select(index => $"term {index}").ToArray() },
+            ValidEntry() with { Tags = Enumerable.Range(0, AssetCatalogJson.MaximumTagsPerEntry + 1).Select(index => $"tag {index}").ToArray() },
+            ValidEntry() with { Tags = ["Furniture"] },
+        };
+
+        foreach (var entry in invalidEntries)
+        {
+            Assert.Throws<JsonException>(() => AssetCatalogJson.SerializeChunk([entry]));
+        }
+    }
+
+    [Fact]
+    public void SharedHostileMetadataCorpus_DefinesExactReaderAcceptance()
+    {
+        var corpusPath = Path.Combine(
+            FindRepositoryRoot(),
+            "tests", "DDAI.Core.Tests", "Assets", "GodotFixtures", "AssetCatalogEnumeration",
+            "metadata-hostile-corpus.json");
+        using var corpus = JsonDocument.Parse(File.ReadAllText(corpusPath));
+
+        foreach (var fixture in corpus.RootElement.EnumerateArray())
+        {
+            var raw = fixture.TryGetProperty("raw", out var rawElement)
+                ? rawElement.GetString()!
+                : new string(fixture.GetProperty("repeat").GetString()![0], fixture.GetProperty("count").GetInt32());
+            var expectedElement = fixture.GetProperty("expected");
+            if (expectedElement.ValueKind == JsonValueKind.Null)
+            {
+                Assert.Throws<JsonException>(() => AssetCatalogJson.SerializeChunk([ValidEntry() with { SearchTerms = [raw] }]));
+                continue;
+            }
+
+            var expected = expectedElement.GetString()!;
+            AssetCatalogJson.SerializeChunk([ValidEntry() with { SearchTerms = [expected] }]);
+            if (!string.Equals(raw, expected, StringComparison.Ordinal))
+            {
+                Assert.Throws<JsonException>(() => AssetCatalogJson.SerializeChunk([ValidEntry() with { SearchTerms = [raw] }]));
+            }
+        }
+    }
+
+    [Fact]
+    public void SerializeChunk_AcceptsCanonicalBoundedUnicodeMetadata()
+    {
+        var entry = ValidEntry() with
+        {
+            SearchTerms = ["ancient shrine", "café"],
+            Tags = ["ancient", "décor"],
+        };
+
+        var roundTrip = Assert.Single(AssetCatalogJson.DeserializeChunk(AssetCatalogJson.SerializeChunk([entry])));
+
+        Assert.Equal(entry.SearchTerms, roundTrip.SearchTerms);
+        Assert.Equal(entry.Tags, roundTrip.Tags);
+    }
+
+    [Fact]
     public void ExternalSerializerOptionMutation_CannotWeakenProductionWireBehavior()
     {
         var externalOptions = AssetCatalogJson.SerializerOptions;
@@ -247,4 +314,15 @@ public sealed class AssetCatalogContractTests
 
     private static string SerializeWithoutValidation(AssetCatalogManifest manifest) =>
         JsonSerializer.Serialize(manifest, AssetCatalogJson.SerializerOptions);
+
+    private static string FindRepositoryRoot()
+    {
+        var current = new DirectoryInfo(AppContext.BaseDirectory);
+        while (current is not null && !File.Exists(Path.Combine(current.FullName, "DDAI.slnx")))
+        {
+            current = current.Parent;
+        }
+
+        return current?.FullName ?? throw new DirectoryNotFoundException("Could not locate DDAI.slnx.");
+    }
 }

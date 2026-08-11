@@ -727,7 +727,7 @@ func _inspect_map_payload(payload):
 	var level = Global.World.GetLevelByID(current_level_id)
 	if level == null:
 		return {"ok": false, "error": _error("active_level_unavailable", "The current map level is unavailable.", "")}
-	if level.Walls == null or level.Pathways == null or level.Roofs == null or level.PatternShapes == null:
+	if level.Walls == null or level.Pathways == null or level.Roofs == null or level.PatternShapes == null or level.Objects == null:
 		return {"ok": false, "error": _error("active_level_unavailable", "A documented current-level inspection container is unavailable.", "")}
 
 	var region_result = _inspection_region(payload.region, int(Global.World.Width), int(Global.World.Height))
@@ -736,11 +736,11 @@ func _inspect_map_payload(payload):
 	var levels_result = _inspection_levels(current_level_id, level)
 	if not levels_result.ok:
 		return levels_result
-	var state = {"items": [], "node_ids": {}}
+	var state = {"items": [], "node_ids": {}, "object_correlation_unavailable": false}
 	var grid_size = float(Global.World.GridSize)
 	# This is a fixed allowlist of documented public containers on the current
 	# Level. It deliberately does not reflect over or recursively crawl the scene.
-	var fixed_container_count = level.Walls.get_child_count() + level.Pathways.get_child_count() + level.Roofs.get_child_count()
+	var fixed_container_count = level.Walls.get_child_count() + level.Pathways.get_child_count() + level.Roofs.get_child_count() + level.Objects.get_child_count()
 	if fixed_container_count < 0 or fixed_container_count > MAXIMUM_INSPECTION_STATE_ITEMS:
 		return {"ok": false, "error": _error("inspection_state_too_large", "The documented inspection state exceeds its item bound.", "")}
 	var pattern_shapes = level.PatternShapes.GetShapes()
@@ -760,7 +760,12 @@ func _inspect_map_payload(payload):
 	append_result = _append_inspection_container(pattern_shapes, "pattern_shape", state, current_level_id, grid_size)
 	if not append_result.ok:
 		return append_result
-	var unsupported_kinds = ["object", "portal", "light", "text", "material", "floor_shape"]
+	append_result = _append_inspection_container(level.Objects.get_children(), "object", state, current_level_id, grid_size)
+	if not append_result.ok:
+		return append_result
+	var unsupported_kinds = ["portal", "light", "text", "material", "floor_shape"]
+	if state.object_correlation_unavailable:
+		unsupported_kinds.append("object_asset_correlation")
 	var revision_result = _inspection_state_revision(
 		int(Global.World.Width),
 		int(Global.World.Height),
@@ -848,6 +853,8 @@ func _append_inspection_container(nodes, kind, state, level_id, grid_size):
 			return {"ok": false, "error": _error("inspection_state_invalid", "Native inspection node IDs must be unique.", "")}
 		state.node_ids[item.node_id] = true
 		state.items.append(item)
+		if item_result.get("correlation_unavailable", false):
+			state.object_correlation_unavailable = true
 	return {"ok": true}
 
 
@@ -863,6 +870,8 @@ func _inspection_item(node, kind, level_id, grid_size):
 		global_rect = node.GlobalRect
 	elif kind == "pattern_shape":
 		global_rect = node.GlobalRect
+	elif kind == "object":
+		global_rect = node.Rect
 	else:
 		return {"ok": false, "error": _error("inspection_state_invalid", "Inspection item kind is not supported.", "")}
 	if typeof(global_rect) != TYPE_RECT2 or not _inspection_rect_is_finite_positive(global_rect):
@@ -871,6 +880,13 @@ func _inspection_item(node, kind, level_id, grid_size):
 	if not _is_runtime_nonnegative_safe_integer(raw_node_id):
 		return {"ok": false, "error": _error("inspection_state_invalid", "A native inspection item has an invalid node ID.", "")}
 	var node_id = int(raw_node_id)
+	var resource_fingerprint = null
+	var correlation_unavailable = false
+	if kind == "object":
+		if node.Sprite == null or node.Sprite.texture == null or str(node.Sprite.texture.resource_path).length() == 0:
+			correlation_unavailable = true
+		else:
+			resource_fingerprint = str(node.Sprite.texture.resource_path).sha256_text()
 	var item = {
 		"node_id": node_id,
 		"kind": kind,
@@ -884,8 +900,9 @@ func _inspection_item(node, kind, level_id, grid_size):
 		# Public container/node contracts do not expose a canonical catalog ID.
 		# Never guess one or enumerate the filesystem; unresolved references are null.
 		"asset_ref": null,
+		"resource_fingerprint": resource_fingerprint,
 	}
-	return {"ok": true, "item": item}
+	return {"ok": true, "item": item, "correlation_unavailable": correlation_unavailable}
 
 
 func _inspection_rect_is_finite_positive(rect):
@@ -989,6 +1006,7 @@ func _inspection_state_revision(canvas_width, canvas_height, grid_size, levels, 
 		_inspection_hash_value(context, "item_height", item.bounds.height)
 		_inspection_hash_value(context, "item_level", item.level)
 		_inspection_hash_value(context, "item_asset_ref", item.asset_ref)
+		_inspection_hash_value(context, "item_resource_fingerprint", item.resource_fingerprint)
 	_inspection_hash_value(context, "unsupported_count", unsupported_kinds.size())
 	for unsupported_index in range(unsupported_kinds.size()):
 		_inspection_hash_value(context, "unsupported_index", unsupported_index)

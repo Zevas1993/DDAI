@@ -46,7 +46,7 @@ public sealed class DungeondraftAssetCatalogScriptTests
         Directory.CreateDirectory(temporaryRoot);
         try
         {
-            foreach (var fixtureName in new[] { "project.godot", "main.tscn", "main.gd", "global.gd" })
+            foreach (var fixtureName in new[] { "project.godot", "main.tscn", "main.gd", "global.gd", "metadata-hostile-corpus.json" })
             {
                 File.Copy(Path.Combine(fixtureRoot, fixtureName), Path.Combine(temporaryRoot, fixtureName));
             }
@@ -105,7 +105,10 @@ public sealed class DungeondraftAssetCatalogScriptTests
 
             var output = await outputTask;
             var error = await errorTask;
-            Assert.True(exited, "The pinned Godot behavior harness timed out.");
+            Assert.True(
+                exited,
+                $"The pinned Godot behavior harness timed out.{Environment.NewLine}" +
+                $"stdout:{Environment.NewLine}{output}{Environment.NewLine}stderr:{Environment.NewLine}{error}");
 
             Assert.True(
                 process.ExitCode == 0,
@@ -117,6 +120,11 @@ public sealed class DungeondraftAssetCatalogScriptTests
             Assert.Contains("DDAI_ENUMERATION_DIAGNOSTIC_CLOSED_WORLD:True", output, StringComparison.Ordinal);
             Assert.Contains("DDAI_TOOL_SCOPE_LIVE_WIRING:True", output, StringComparison.Ordinal);
             Assert.Contains("DDAI_SNAPSHOT_TIMESTAMP_FINALIZED_ONCE:True", output, StringComparison.Ordinal);
+            Assert.Contains("DDAI_LIBRARY_METADATA_INDEX:True", output, StringComparison.Ordinal);
+            Assert.Contains("DDAI_LIBRARY_METADATA_HOSTILE_FAILS_CLOSED:True", output, StringComparison.Ordinal);
+            Assert.Contains("DDAI_LIBRARY_METADATA_SHARED_CORPUS:True", output, StringComparison.Ordinal);
+            Assert.Contains("DDAI_PACK_KEYWORD_BOUNDS:True", output, StringComparison.Ordinal);
+            Assert.Contains("DDAI_LIBRARY_KEY_VALIDATION_INCREMENTAL:True", output, StringComparison.Ordinal);
         }
         finally
         {
@@ -151,7 +159,7 @@ public sealed class DungeondraftAssetCatalogScriptTests
     public void Script_StagesStrictOpaqueCandidateAndLeavesPublicPointerCommitToHelper()
     {
         var script = ReadCatalogScript();
-        var entryBuilder = FunctionBody(script, "_build_catalog_entry");
+        var entryBuilder = FunctionBody(script, "_build_catalog_entry_from_metadata");
         var publisher = FunctionBody(script, "_read_catalog_commit_response");
 
         foreach (var field in new[]

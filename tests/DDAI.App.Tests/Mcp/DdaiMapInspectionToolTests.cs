@@ -166,6 +166,38 @@ public sealed class DdaiMapInspectionToolTests
     }
 
     [Fact]
+    public async Task InspectMap_ResolvesUniqueObjectFingerprintAndNullsAmbiguousOrMissingWithoutLeakage()
+    {
+        var unique = await InvokeObjectCorrelationAsync(["resource/ritual-altar"], "resource/ritual-altar");
+        var sameFingerprintDifferentCategory = await InvokeObjectCorrelationAsync(
+            ["resource/shared-category", "resource/shared-category"],
+            "resource/shared-category",
+            ["Objects", "Walls"]);
+        var ambiguous = await InvokeObjectCorrelationAsync(["resource/shared", "resource/shared"], "resource/shared");
+        var missing = await InvokeObjectCorrelationAsync(["resource/known"], "resource/missing");
+        var absent = await InvokeObjectCorrelationAsync(["resource/known"], null);
+
+        using var uniqueJson = StructuredJson(unique.Result);
+        using var ambiguousJson = StructuredJson(ambiguous.Result);
+        using var missingJson = StructuredJson(missing.Result);
+        using var absentJson = StructuredJson(absent.Result);
+        Assert.Equal(unique.AssetRefs[0], uniqueJson.RootElement.GetProperty("items")[0].GetProperty("asset_ref").GetString());
+        using var crossCategoryJson = StructuredJson(sameFingerprintDifferentCategory.Result);
+        Assert.Equal(sameFingerprintDifferentCategory.AssetRefs[0], crossCategoryJson.RootElement.GetProperty("items")[0].GetProperty("asset_ref").GetString());
+        Assert.Equal(JsonValueKind.Null, ambiguousJson.RootElement.GetProperty("items")[0].GetProperty("asset_ref").ValueKind);
+        Assert.Equal(JsonValueKind.Null, missingJson.RootElement.GetProperty("items")[0].GetProperty("asset_ref").ValueKind);
+        Assert.Contains("object_asset_correlation", ambiguousJson.RootElement.GetProperty("unsupported_kinds").EnumerateArray().Select(item => item.GetString()));
+        Assert.Contains("object_asset_correlation", missingJson.RootElement.GetProperty("unsupported_kinds").EnumerateArray().Select(item => item.GetString()));
+        Assert.Contains("object_asset_correlation", absentJson.RootElement.GetProperty("unsupported_kinds").EnumerateArray().Select(item => item.GetString()));
+        foreach (var result in new[] { unique.Result, ambiguous.Result, missing.Result, absent.Result })
+        {
+            var text = Assert.IsType<TextContentBlock>(Assert.Single(result.Content)).Text;
+            Assert.DoesNotContain("resource_fingerprint", text, StringComparison.Ordinal);
+            Assert.DoesNotContain("resource/", text, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
     public async Task InspectMap_RejectsEmptyPageOutsideReturnedCanvasAndAcceptsExactBoundary()
     {
         var emptyPage = Page() with
@@ -322,6 +354,33 @@ public sealed class DdaiMapInspectionToolTests
         return result;
     }
 
+    private static async Task<(CallToolResult Result, IReadOnlyList<string> AssetRefs)> InvokeObjectCorrelationAsync(
+        string[] catalogIdentities,
+        string? observedIdentity,
+        string[]? catalogCategories = null)
+    {
+        using var sandbox = new InspectionSandbox();
+        var entries = sandbox.PublishObjectCatalog(73, catalogIdentities, catalogCategories);
+        var page = Page() with
+        {
+            Items = [new MapSnapshotItem(7, "object", new MapSnapshotBounds(1, 2, 3, 4), 3, null,
+                observedIdentity is null ? null : Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(observedIdentity))).ToLowerInvariant())],
+            UnsupportedKinds = ["portal", "light", "text", "material", "floor_shape"],
+        };
+        var bridge = Task.Run(() =>
+        {
+            var claim = WaitForClaim(sandbox.Mailbox);
+            sandbox.Mailbox.PublishResponse(claim, SuccessResponse(claim.Request, page));
+        });
+        var result = await DdaiMapTools.InspectMapAsync(
+            new MapInspectionQuery(Limit: 1),
+            sandbox.CreateService(),
+            new DdaiMcpRuntimeOptions(TimeSpan.FromSeconds(2)),
+            CancellationToken.None);
+        await bridge;
+        return (result, entries.Select(entry => entry.AssetRef).ToArray());
+    }
+
     private static MapSnapshotPage Page(string? assetRef = null) => new(
         new string('a', 64),
         new string('b', 64),
@@ -432,22 +491,41 @@ public sealed class DdaiMapInspectionToolTests
 
         public AssetCatalogEntry PublishAcceptedCatalog(long revision)
         {
+            return Assert.Single(PublishCatalog(revision,
+                new AssetCatalogEntry(
+                    AssetReference.Create("official-pack", "Walls", "resource/wall-stone"),
+                    "Walls",
+                    "Stone Wall",
+                    Hash("resource/wall-stone"),
+                    "official-pack",
+                    "Official Pack",
+                    ["stone"],
+                    ["fixture"],
+                    null,
+                    true,
+                    false)));
+        }
+
+        public IReadOnlyList<AssetCatalogEntry> PublishObjectCatalog(long revision, string[] identities, string[]? categories = null) =>
+            PublishCatalog(revision, identities.Select((identity, index) => new AssetCatalogEntry(
+                AssetReference.Create("official-pack-" + index, categories?[index] ?? "Objects", identity),
+                categories?[index] ?? "Objects",
+                "Object " + index,
+                Hash(identity),
+                "official-pack-" + index,
+                "Official Pack",
+                ["object " + index],
+                [],
+                null,
+                true,
+                false)).ToArray());
+
+        private IReadOnlyList<AssetCatalogEntry> PublishCatalog(long revision, params AssetCatalogEntry[] entries)
+        {
             var catalogRoot = Path.Combine(Root, "catalog");
             var snapshotRoot = Path.Combine(catalogRoot, "snapshots", "inspection-fixture");
             Directory.CreateDirectory(snapshotRoot);
-            var entry = new AssetCatalogEntry(
-                AssetReference.Create("official-pack", "Walls", "resource/wall-stone"),
-                "Walls",
-                "Stone Wall",
-                Hash("resource/wall-stone"),
-                "official-pack",
-                "Official Pack",
-                ["stone"],
-                ["fixture"],
-                null,
-                true,
-                false);
-            var chunkBytes = Encoding.UTF8.GetBytes(AssetCatalogJson.SerializeChunk([entry]));
+            var chunkBytes = Encoding.UTF8.GetBytes(AssetCatalogJson.SerializeChunk(entries));
             File.WriteAllBytes(Path.Combine(snapshotRoot, "assets-000.json"), chunkBytes);
             var manifest = new AssetCatalogManifest(
                 AssetCatalogManifest.CurrentSchemaVersion,
@@ -456,8 +534,8 @@ public sealed class DdaiMapInspectionToolTests
                 new string('0', 64),
                 DateTimeOffset.UtcNow,
                 true,
-                AssetCategory.All.ToDictionary(category => category, category => category == "Walls" ? 1 : 0, StringComparer.Ordinal),
-                [new AssetCatalogChunk("assets-000.json", Hash(chunkBytes), 1, chunkBytes.LongLength)],
+                AssetCategory.All.ToDictionary(category => category, category => entries.Count(entry => entry.Category == category), StringComparer.Ordinal),
+                [new AssetCatalogChunk("assets-000.json", Hash(chunkBytes), entries.Length, chunkBytes.LongLength)],
                 []);
             manifest = manifest with { CatalogFingerprint = AssetCatalogJson.ComputeCatalogFingerprint(manifest) };
             File.WriteAllText(Path.Combine(snapshotRoot, "manifest.json"), AssetCatalogJson.SerializeManifest(manifest));
@@ -469,7 +547,7 @@ public sealed class DdaiMapInspectionToolTests
                     session_id = "inspection-fixture-session",
                     catalog_revision = revision,
                 }));
-            return entry;
+            return entries;
         }
 
         public void Dispose() => Directory.Delete(Root, recursive: true);

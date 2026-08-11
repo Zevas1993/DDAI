@@ -36,12 +36,44 @@ class ToolScopedScriptApi:
 		])
 
 
+class FakeObjectLibraryPanel:
+	var searchEngine = {}
+
+	func _init(value):
+		searchEngine = value
+
+
+class FakeEditor:
+	var ObjectLibraryPanel = null
+
+	func _init(panel):
+		ObjectLibraryPanel = panel
+
+
 class ReadyHelperAdapter:
 	func begin_helper_verification():
 		return true
 
 	func advance_helper_verification():
 		return {"status": "ready"}
+
+	func get_library_metadata_sources():
+		return {"search_engine": {}, "tag_index_lookup": null}
+
+
+class LibraryMetadataAdapter:
+	var search_engine = {}
+	var tag_index_lookup = null
+
+	func _init(engine, tags):
+		search_engine = engine
+		tag_index_lookup = tags
+
+	func get_library_metadata_sources():
+		return {
+			"search_engine": search_engine,
+			"tag_index_lookup": tag_index_lookup,
+		}
 
 
 class ControlledWireClock:
@@ -58,12 +90,22 @@ func _ready():
 	var wrong_type = _test_wrong_type_fails_closed()
 	var tool_scope_wiring = _test_production_live_wiring_uses_tool_scope()
 	var snapshot_finalization = _test_snapshot_timestamp_finalizes_once()
+	var library_metadata = _test_library_metadata_index_is_bounded_and_exact()
+	var hostile_metadata = _test_hostile_library_metadata_fails_closed()
+	var shared_hostile_corpus = _test_shared_hostile_metadata_corpus()
+	var pack_keyword_bounds = _test_pack_keywords_remain_searchable_and_fail_closed_over_bound()
+	var key_validation_incremental = _test_library_key_validation_is_incremental()
 	print("DDAI_TYPED_ARRAY_ENUMERATION:", typed_array)
 	print("DDAI_WRONG_TYPE_FAILS_CLOSED:", wrong_type)
 	print("DDAI_ENUMERATION_DIAGNOSTIC_CLOSED_WORLD:", wrong_type)
 	print("DDAI_TOOL_SCOPE_LIVE_WIRING:", tool_scope_wiring)
 	print("DDAI_SNAPSHOT_TIMESTAMP_FINALIZED_ONCE:", snapshot_finalization)
-	get_tree().quit(0 if typed_array and wrong_type and tool_scope_wiring and snapshot_finalization else 1)
+	print("DDAI_LIBRARY_METADATA_INDEX:", library_metadata)
+	print("DDAI_LIBRARY_METADATA_HOSTILE_FAILS_CLOSED:", hostile_metadata)
+	print("DDAI_LIBRARY_METADATA_SHARED_CORPUS:", shared_hostile_corpus)
+	print("DDAI_PACK_KEYWORD_BOUNDS:", pack_keyword_bounds)
+	print("DDAI_LIBRARY_KEY_VALIDATION_INCREMENTAL:", key_validation_incremental)
+	get_tree().quit(0 if typed_array and wrong_type and tool_scope_wiring and snapshot_finalization and library_metadata and hostile_metadata and shared_hostile_corpus and pack_keyword_bounds and key_validation_incremental else 1)
 
 
 func _test_typed_array_enumeration():
@@ -140,7 +182,16 @@ func _test_wrong_type_fails_closed():
 func _test_production_live_wiring_uses_tool_scope():
 	var catalog = CatalogScript.new()
 	catalog.Script = ToolScopedScriptApi.new()
+	var library_texture = _texture("res://tool-scope/alpha.png")
+	Global.Editor = null
+	var unavailable_sources = catalog._get_live_library_metadata_sources()
+	if unavailable_sources.search_engine != null or unavailable_sources.tag_index_lookup != null:
+		return false
+	Global.Editor = FakeEditor.new(FakeObjectLibraryPanel.new({"semantic": [library_texture]}))
 	catalog.start()
+	var sources = catalog._runtime_adapter.get_library_metadata_sources()
+	if sources.search_engine.get("semantic", []) != [library_texture] or sources.tag_index_lookup != null:
+		return false
 	catalog._state = "enumerating"
 	for category in CatalogScript.CATEGORIES:
 		catalog._category_counts[category] = 0
@@ -168,7 +219,7 @@ func _test_snapshot_timestamp_finalizes_once():
 	catalog._state = "helper_verification"
 	catalog._advance_helper_verification_state()
 	catalog._advance_helper_verification_state()
-	if catalog._state != "enumerating":
+	if catalog._state != "indexing_library_metadata" or not _advance_metadata(catalog):
 		return false
 
 	clock.current = "2026-08-11T12:02:00.0000000+00:00"
@@ -209,3 +260,207 @@ func _test_snapshot_timestamp_finalizes_once():
 		catalog._commit_request_id == request_id and
 		catalog._commit_request_hash == request_hash and
 		clock.calls == 1)
+
+
+func _texture(identity):
+	var texture = ImageTexture.new()
+	texture.set_path(identity)
+	return texture
+
+
+func _advance_metadata(catalog):
+	var advances = 0
+	while catalog._state == "indexing_library_metadata" and advances < 128:
+		catalog._last_update_entry_operations = 0
+		catalog._advance_library_metadata_state()
+		if catalog._last_update_entry_operations > CatalogScript.MAX_ASSETS_PER_TICK:
+			return false
+		advances += 1
+	return catalog._state == "enumerating"
+
+
+func _build_metadata_entry(catalog, asset_ref, category, identity, fingerprint, pack_metadata, pack_id):
+	catalog._preview_work = {
+		"asset_ref": asset_ref,
+		"category": category,
+		"resource_identity": identity,
+		"resource_fingerprint": fingerprint,
+		"pack_metadata": pack_metadata,
+		"pack_id": pack_id,
+	}
+	catalog._state = "preview_metadata"
+	for _index in range(128):
+		catalog._last_update_entry_operations = 0
+		catalog._advance_preview_metadata_state()
+		if catalog._last_update_entry_operations > CatalogScript.MAX_ASSETS_PER_TICK:
+			return null
+		if catalog._state == "failed":
+			return null
+		if catalog._state == "preview_finalization":
+			return catalog._build_catalog_entry_from_metadata(null)
+	return null
+
+
+func _test_library_metadata_index_is_bounded_and_exact():
+	var chair = _texture("res://private/object-chair.png")
+	var altar = _texture("res://private/object-altar.png")
+	var catalog = CatalogScript.new()
+	catalog._runtime_adapter = LibraryMetadataAdapter.new({
+		"  Shrine  ": [altar],
+		"shrine": [altar, altar],
+		"Ancient": [altar],
+		"seating": [chair],
+	}, {"ancient": 0, "unused": 1})
+	catalog._state = "indexing_library_metadata"
+	if not _advance_metadata(catalog):
+		return false
+	var altar_terms = catalog._library_search_terms_by_resource.get(altar.resource_path, [])
+	var altar_tags = catalog._library_tags_by_resource.get(altar.resource_path, [])
+	var chair_terms = catalog._library_search_terms_by_resource.get(chair.resource_path, [])
+	var entry = _build_metadata_entry(catalog,
+		"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"Objects",
+		altar.resource_path,
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		{"pack_name": "Temple Pack", "keywords": "Religious; Ceremonial", "allow_third_party_use": true},
+		null)
+	var public_json = to_json(entry)
+	return (
+		entry.search_terms == ["ancient", "ceremonial", "object altar", "religious", "shrine", "temple pack"] and
+		entry.tags == ["ancient"] and
+		altar_terms == ["ancient", "shrine"] and
+		altar_tags == ["ancient"] and
+		chair_terms == ["seating"] and
+		catalog._errors.size() == 0 and
+		to_json(catalog._library_search_terms_by_resource).find("res://") >= 0 and
+		public_json.find("res://") < 0 and public_json.find("object-altar") < 0)
+
+
+func _test_hostile_library_metadata_fails_closed():
+	var secret = _texture("res://private/do-not-leak.png")
+	var null_search_key = {}
+	null_search_key[null] = [secret]
+	var null_tag_key = {}
+	null_tag_key[null] = 0
+	for fixture in [
+		{"engine": {"../secret": [secret]}, "tags": null},
+		{"engine": {"valid": "res://private/do-not-leak.png"}, "tags": null},
+		{"engine": {"valid": [null]}, "tags": null},
+		{"engine": {"valid": [secret]}, "tags": {"valid": "wrong"}},
+		{"engine": null_search_key, "tags": null},
+		{"engine": {"valid": [secret]}, "tags": null_tag_key},
+	]:
+		var catalog = CatalogScript.new()
+		catalog._runtime_adapter = LibraryMetadataAdapter.new(fixture.engine, fixture.tags)
+		catalog._state = "indexing_library_metadata"
+		for _index in range(16):
+			if catalog._state != "indexing_library_metadata":
+				break
+			catalog._advance_library_metadata_state()
+		if catalog._state != "failed" or catalog._errors.size() != 1:
+			return false
+		var encoded = to_json(catalog._errors)
+		if encoded.find("res://") >= 0 or encoded.find("do-not-leak") >= 0:
+			return false
+	return true
+
+
+func _test_shared_hostile_metadata_corpus():
+	var file = File.new()
+	if file.open("res://metadata-hostile-corpus.json", File.READ) != OK:
+		return false
+	var parsed = JSON.parse(file.get_as_text())
+	file.close()
+	if parsed.error != OK or typeof(parsed.result) != TYPE_ARRAY:
+		return false
+	var catalog = CatalogScript.new()
+	if catalog._canonical_library_term(char(0xd800)) != null:
+		return false
+	for fixture in parsed.result:
+		var raw = str(fixture.get("raw", ""))
+		if fixture.has("repeat"):
+			raw = _repeat_text(str(fixture.repeat), int(fixture.count))
+		if catalog._canonical_library_term(raw) != fixture.get("expected", null):
+			return false
+		if fixture.has("tag_index"):
+			var texture = _texture("res://private/tag-index.png")
+			var invalid_catalog = CatalogScript.new()
+			invalid_catalog._runtime_adapter = LibraryMetadataAdapter.new(
+				{str(fixture.expected): [texture]},
+				{str(fixture.expected): int(fixture.tag_index)})
+			invalid_catalog._state = "indexing_library_metadata"
+			for _index in range(16):
+				if invalid_catalog._state != "indexing_library_metadata":
+					break
+				invalid_catalog._advance_library_metadata_state()
+			if invalid_catalog._state != "failed":
+				return false
+	return true
+
+
+func _test_pack_keywords_remain_searchable_and_fail_closed_over_bound():
+	var identity = "res://private/saturated-keywords.png"
+	var catalog = CatalogScript.new()
+	var library_terms = []
+	for index in range(CatalogScript.MAX_LIBRARY_SEARCH_TERMS_PER_ASSET):
+		library_terms.append("library term " + str(index))
+	catalog._library_search_terms_by_resource[identity] = library_terms
+	var keywords = []
+	for index in range(8):
+		keywords.append("pack keyword " + str(index))
+	var entry = _build_metadata_entry(catalog,
+		"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"Objects",
+		identity,
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		{"pack_name": "Fixture Pack", "keywords": keywords, "allow_third_party_use": true},
+		null)
+	if entry == null or entry.search_terms.size() != CatalogScript.MAX_CATALOG_SEARCH_TERMS_PER_ASSET:
+		return false
+	for keyword in keywords:
+		if not entry.search_terms.has(keyword):
+			return false
+	if entry.tags.size() != 0:
+		return false
+	var oversized = keywords.duplicate()
+	oversized.append("pack keyword 8")
+	var invalid_catalog = CatalogScript.new()
+	var invalid_entry = _build_metadata_entry(invalid_catalog,
+		"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		"Objects",
+		"res://private/oversized-keywords.png",
+		"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		{"pack_name": null, "keywords": oversized, "allow_third_party_use": true},
+		null)
+	return invalid_entry == null and invalid_catalog._state == "failed"
+
+
+func _test_library_key_validation_is_incremental():
+	var search_engine = {}
+	var tag_index_lookup = {}
+	for index in range(CatalogScript.MAX_ASSETS_PER_TICK * 2 + 1):
+		var term = "incremental term " + str(index)
+		search_engine[term] = []
+		tag_index_lookup[term] = index
+	var catalog = CatalogScript.new()
+	catalog._runtime_adapter = LibraryMetadataAdapter.new(search_engine, tag_index_lookup)
+	catalog._state = "indexing_library_metadata"
+	catalog._advance_library_metadata_state()
+	if catalog._library_keys.size() != CatalogScript.MAX_ASSETS_PER_TICK * 2 + 1:
+		return false
+	catalog._last_update_entry_operations = 0
+	catalog._advance_library_metadata_state()
+	if catalog._last_update_entry_operations != CatalogScript.MAX_ASSETS_PER_TICK:
+		return false
+	if catalog._library_key_index != CatalogScript.MAX_ASSETS_PER_TICK:
+		return false
+	if catalog._library_metadata_phase != "validating_search_keys":
+		return false
+	return _advance_metadata(catalog)
+
+
+func _repeat_text(value, count):
+	var result = ""
+	for _index in range(count):
+		result += value
+	return result

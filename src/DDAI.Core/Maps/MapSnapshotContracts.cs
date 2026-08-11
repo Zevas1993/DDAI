@@ -35,7 +35,8 @@ public sealed record MapSnapshotItem(
     [property: JsonPropertyName("kind")] string Kind,
     [property: JsonPropertyName("bounds")] MapSnapshotBounds Bounds,
     [property: JsonPropertyName("level")] int Level,
-    [property: JsonPropertyName("asset_ref")] string? AssetRef);
+    [property: JsonPropertyName("asset_ref")] string? AssetRef,
+    [property: JsonPropertyName("resource_fingerprint"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ResourceFingerprint = null);
 
 public sealed record MapSnapshotPage(
     [property: JsonPropertyName("map_id")] string MapId,
@@ -56,10 +57,10 @@ public static class MapSnapshotJson
     private const int MaximumCursorOffset = 10_000;
 
     private static readonly HashSet<string> SupportedKinds =
-        new(["wall", "path", "roof", "pattern_shape"], StringComparer.Ordinal);
+        new(["wall", "path", "roof", "pattern_shape", "object"], StringComparer.Ordinal);
 
     private static readonly HashSet<string> UnsupportedKinds =
-        new(["object", "portal", "light", "text", "material", "floor_shape"], StringComparer.Ordinal);
+        new(["object", "portal", "light", "text", "material", "floor_shape", "object_asset_correlation"], StringComparer.Ordinal);
 
     private static readonly JsonSerializerOptions WireSerializerOptions = new()
     {
@@ -271,9 +272,24 @@ public static class MapSnapshotJson
         EnsureObjectShape(root.GetProperty("canvas"), "map canvas", ["width", "height"]);
 
         EnsureArrayObjects(root.GetProperty("levels"), "map snapshot level", ["id", "label", "current"]);
-        EnsureArrayObjects(root.GetProperty("items"), "map snapshot item", ["node_id", "kind", "bounds", "level", "asset_ref"]);
-        foreach (var item in root.GetProperty("items").EnumerateArray())
+        var items = root.GetProperty("items");
+        if (items.ValueKind != JsonValueKind.Array)
         {
+            throw new JsonException("Map snapshot item collection must be an array.");
+        }
+        foreach (var item in items.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object)
+            {
+                throw new JsonException("Map snapshot items must be objects.");
+            }
+
+            var itemFields = new List<string> { "node_id", "kind", "bounds", "level", "asset_ref" };
+            if (item.TryGetProperty("resource_fingerprint", out _))
+            {
+                itemFields.Add("resource_fingerprint");
+            }
+            EnsureObjectShape(item, "map snapshot item", itemFields);
             EnsureObjectShape(item.GetProperty("bounds"), "map snapshot bounds", ["x", "y", "width", "height"]);
         }
 
@@ -389,6 +405,15 @@ public static class MapSnapshotJson
             if (item.AssetRef is not null)
             {
                 RequireAssetReference(item.AssetRef);
+            }
+            if (item.ResourceFingerprint is not null)
+            {
+                if (!string.Equals(item.Kind, "object", StringComparison.Ordinal) || item.AssetRef is not null)
+                {
+                    throw new JsonException("Only an unresolved object may carry an internal resource fingerprint.");
+                }
+
+                RequireHash(item.ResourceFingerprint, "resource fingerprint");
             }
         }
 

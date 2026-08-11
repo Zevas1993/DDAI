@@ -176,6 +176,43 @@ public sealed class DdaiAssetToolTests
     }
 
     [Fact]
+    public void SearchAssets_FindsNonFilenameLibraryTermAndExactPublicTag()
+    {
+        var service = CreateService(Entry(
+            "semantic-match",
+            "Opaque Fixture",
+            searchTerms: ["sanctuary", "stone altar"],
+            tags: ["sacred"]));
+
+        using var result = StructuredJson(DdaiAssetTools.SearchAssets(
+            new AssetSearchQuery(Query: "sanctuary", Tags: ["sacred"]),
+            service));
+
+        Assert.Equal("semantic-match", result.RootElement.GetProperty("items")[0].GetProperty("asset_ref").GetString());
+        Assert.DoesNotContain("resource_fingerprint", result.RootElement.GetRawText(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SearchAssets_FindsPackKeywordAsSearchTermWithoutClaimingExactTagMembership()
+    {
+        var service = CreateService(Entry(
+            "pack-keyword-match",
+            "Opaque Fixture",
+            searchTerms: ["ceremonial"],
+            tags: []));
+
+        using var keywordResult = StructuredJson(DdaiAssetTools.SearchAssets(
+            new AssetSearchQuery(Query: "ceremonial"),
+            service));
+        using var tagResult = StructuredJson(DdaiAssetTools.SearchAssets(
+            new AssetSearchQuery(Tags: ["ceremonial"]),
+            service));
+
+        Assert.Equal("pack-keyword-match", keywordResult.RootElement.GetProperty("items")[0].GetProperty("asset_ref").GetString());
+        Assert.Empty(tagResult.RootElement.GetProperty("items").EnumerateArray());
+    }
+
+    [Fact]
     public void SearchAssets_PreservesStaleCatalogMetadata()
     {
         var result = DdaiAssetTools.SearchAssets(
@@ -392,6 +429,7 @@ public sealed class DdaiAssetToolTests
         string displayName,
         string category = "Objects",
         string? packId = "pack-a",
+        IReadOnlyList<string>? searchTerms = null,
         IReadOnlyList<string>? tags = null,
         string? previewHash = null,
         bool allowThirdPartyUse = true,
@@ -402,7 +440,7 @@ public sealed class DdaiAssetToolTests
         "resource-fingerprint",
         packId,
         "Pack",
-        [],
+        searchTerms ?? [],
         tags ?? [],
         previewHash,
         allowThirdPartyUse,

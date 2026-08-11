@@ -251,7 +251,7 @@ public sealed class PublishedAssetHelperSecurityTests : IClassFixture<PublishedE
     private static string StageCatalogCandidate(string mailbox, string sessionId, string assetHash)
     {
         var entry = new AssetCatalogEntry(
-            "sha256:" + assetHash, "Objects", "Fixture", assetHash, "pack", "Pack", ["Fixture"], [], null, true, false);
+            "sha256:" + assetHash, "Objects", "Fixture", assetHash, "pack", "Pack", ["fixture"], [], null, true, false);
         var chunkBytes = Encoding.UTF8.GetBytes(AssetCatalogJson.SerializeChunk([entry]));
         var counts = AssetCategory.All.ToDictionary(
             category => category,

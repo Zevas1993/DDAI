@@ -93,10 +93,47 @@ public sealed class DdaiMapInspectionService(
                     catalog);
             }
 
+            var correlationUnavailable = false;
+            var correlatedItems = page.Items.Select(item =>
+            {
+                if (item.ResourceFingerprint is null)
+                {
+                    if (string.Equals(item.Kind, "object", StringComparison.Ordinal) && item.AssetRef is null)
+                    {
+                        correlationUnavailable = true;
+                    }
+
+                    return item;
+                }
+
+                var matches = catalog?.Entries
+                    .Where(entry => string.Equals(entry.Category, "Objects", StringComparison.Ordinal) &&
+                        string.Equals(entry.ResourceFingerprint, item.ResourceFingerprint, StringComparison.Ordinal))
+                    .Take(2)
+                    .ToArray() ?? [];
+                if (matches.Length != 1)
+                {
+                    correlationUnavailable = true;
+                    return item with { AssetRef = null, ResourceFingerprint = null };
+                }
+
+                return item with { AssetRef = matches[0].AssetRef, ResourceFingerprint = null };
+            }).ToArray();
+            var unsupportedKinds = page.UnsupportedKinds.ToList();
+            if (correlationUnavailable && !unsupportedKinds.Contains("object_asset_correlation", StringComparer.Ordinal))
+            {
+                unsupportedKinds.Add("object_asset_correlation");
+            }
+            var publicPage = page with
+            {
+                Items = correlatedItems,
+                UnsupportedKinds = unsupportedKinds,
+            };
+
             return new DdaiMapInspectionResult(
                 true,
                 "inspect_map",
-                page,
+                publicPage,
                 catalog?.Manifest.CatalogRevision,
                 null);
         }

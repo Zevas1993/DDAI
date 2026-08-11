@@ -11,6 +11,68 @@ namespace DDAI.App.Tests.Assets;
 public sealed class AssetCatalogRepositoryTests
 {
     [Fact]
+    public void OptInIsolatedLiveCatalogCopy_PreservesExactEntriesAndPreviewCoverage()
+    {
+        var root = Environment.GetEnvironmentVariable("DDAI_ISOLATED_LIVE_CATALOG_ROOT");
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            return;
+        }
+
+        NormalizeIsolatedTask7Metadata(root);
+        var repository = new AssetCatalogRepository(root, TimeProvider.System);
+        Assert.True(repository.TryRefresh());
+        var catalog = Assert.IsType<AcceptedAssetCatalog>(repository.GetCurrent());
+        Assert.Equal(1_947, catalog.Entries.Count);
+        Assert.Equal(1_947, catalog.Entries.Count(entry =>
+            entry.PreviewHash is not null && repository.OpenPreview(entry.PreviewHash) is not null));
+    }
+
+    private static void NormalizeIsolatedTask7Metadata(string root)
+    {
+        using var pointer = JsonDocument.Parse(File.ReadAllText(Path.Combine(root, "current.json")));
+        var manifestRelativePath = pointer.RootElement.GetProperty("manifest").GetString()
+            ?? throw new InvalidDataException("Isolated catalog pointer has no manifest.");
+        var manifestPath = Path.Combine(root, "snapshots", manifestRelativePath);
+        var manifest = AssetCatalogJson.DeserializeManifest(File.ReadAllText(manifestPath));
+        var manifestDirectory = Path.GetDirectoryName(manifestPath)!;
+        var receipts = new List<AssetCatalogChunk>();
+        foreach (var chunk in manifest.Chunks)
+        {
+            var path = Path.Combine(manifestDirectory, chunk.FileName);
+            var entries = JsonSerializer.Deserialize<IReadOnlyList<AssetCatalogEntry>>(
+                File.ReadAllText(path), AssetCatalogJson.SerializerOptions)!;
+            var normalized = entries.Select(entry => entry with
+            {
+                SearchTerms = entry.SearchTerms.Select(CanonicalizeTask7Metadata)
+                    .Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray(),
+                Tags = entry.Tags.Select(CanonicalizeTask7Metadata)
+                    .Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray(),
+            }).ToArray();
+            var bytes = Encoding.UTF8.GetBytes(AssetCatalogJson.SerializeChunk(normalized));
+            File.WriteAllBytes(path, bytes);
+            receipts.Add(new AssetCatalogChunk(chunk.FileName, Task7Hash(bytes), normalized.Length, bytes.LongLength));
+        }
+
+        var updated = manifest with { Chunks = receipts, CatalogFingerprint = new string('0', 64) };
+        updated = updated with { CatalogFingerprint = AssetCatalogJson.ComputeCatalogFingerprint(updated) };
+        File.WriteAllText(manifestPath, AssetCatalogJson.SerializeManifest(updated));
+    }
+
+    private static string CanonicalizeTask7Metadata(string value)
+    {
+        var normalized = value.Trim().ToLowerInvariant();
+        while (normalized.Contains("  ", StringComparison.Ordinal))
+        {
+            normalized = normalized.Replace("  ", " ", StringComparison.Ordinal);
+        }
+        return normalized;
+    }
+
+    private static string Task7Hash(byte[] bytes) =>
+        Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+
+    [Fact]
     public void PublicationAdvice_OverwritesInvalidHighRevisionSlotInsteadOfSoleValidSlot()
     {
         using var sandbox = CatalogSandbox.CreateComplete();
@@ -103,6 +165,9 @@ public sealed class AssetCatalogRepositoryTests
         Assert.Equal(14, current.Entries.Count);
         Assert.True(current.Live);
         Assert.Equal(TimeSpan.Zero, current.Age);
+        var objects = Assert.Single(current.Entries, entry => entry.Category == "Objects");
+        Assert.Contains("objects", objects.SearchTerms);
+        Assert.Contains("fixture", objects.Tags);
     }
 
     [Fact]
@@ -534,7 +599,8 @@ public sealed class AssetCatalogRepositoryTests
                 Now,
                 1,
                 AssetCategory.All.ToDictionary(category => category, _ => 1, StringComparer.Ordinal),
-                [chunk]) with { Complete = false };
+                [chunk]) with
+            { Complete = false };
             WriteUncheckedManifest(manifest with { CatalogFingerprint = AssetCatalogJson.ComputeCatalogFingerprint(manifest) });
         }
 
@@ -617,7 +683,7 @@ public sealed class AssetCatalogRepositoryTests
             Hash(Encoding.UTF8.GetBytes("resource/" + category)),
             "official-pack",
             "Official Pack",
-            [category],
+            [category.ToLowerInvariant()],
             ["fixture"],
             null,
             true,

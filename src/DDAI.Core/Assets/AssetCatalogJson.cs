@@ -29,6 +29,9 @@ public static class AssetReference
 public static class AssetCatalogJson
 {
     public const int MaximumJsonBytes = 1024 * 1024;
+    public const int MaximumSearchTermsPerEntry = 64;
+    public const int MaximumTagsPerEntry = 64;
+    public const int MaximumMetadataScalars = 128;
 
     private static readonly JsonSerializerOptions WireSerializerOptions = new()
     {
@@ -347,8 +350,8 @@ public static class AssetCatalogJson
             RequireHash(entry.ResourceFingerprint, "resource fingerprint");
             RequireCanonicalPackId(entry.PackId);
             RequireOptionalNonBlank(entry.PackName, "pack name");
-            RequireStrings(entry.SearchTerms, "search terms");
-            RequireStrings(entry.Tags, "tags");
+            RequireCanonicalMetadata(entry.SearchTerms, MaximumSearchTermsPerEntry, "search terms");
+            RequireCanonicalMetadata(entry.Tags, MaximumTagsPerEntry, "tags");
             if (entry.PreviewHash is not null)
             {
                 RequireHash(entry.PreviewHash, "preview hash");
@@ -432,12 +435,75 @@ public static class AssetCatalogJson
         }
     }
 
-    private static void RequireStrings(IReadOnlyList<string>? values, string name)
+    private static void RequireCanonicalMetadata(IReadOnlyList<string>? values, int maximumCount, string name)
     {
-        if (values is null || values.Any(string.IsNullOrWhiteSpace))
+        if (values is null || values.Count > maximumCount)
         {
-            throw new JsonException($"{name} cannot be null or contain null, empty, or whitespace values.");
+            throw new JsonException($"{name} cannot be null or exceed {maximumCount} entries.");
         }
+
+        var previous = (string?)null;
+        foreach (var value in values)
+        {
+            if (!IsWellFormedUtf16(value) || value.Length == 0 || CountScalars(value) > MaximumMetadataScalars ||
+                ContainsControlledScalar(value) || IsPathLike(value) ||
+                !string.Equals(value, CanonicalizeMetadata(value), StringComparison.Ordinal) ||
+                previous is not null && StringComparer.Ordinal.Compare(previous, value) >= 0)
+            {
+                throw new JsonException($"{name} must contain unique, sorted, canonical, bounded, non-path-like Unicode values.");
+            }
+
+            previous = value;
+        }
+    }
+
+    private static string CanonicalizeMetadata(string value)
+    {
+        var builder = new StringBuilder(value.Length);
+        var pendingSpace = false;
+        foreach (var rune in value.Trim().EnumerateRunes())
+        {
+            if (rune.Value == ' ')
+            {
+                pendingSpace = builder.Length > 0;
+                continue;
+            }
+
+            if (pendingSpace) builder.Append(' ');
+            builder.Append(rune.ToString());
+            pendingSpace = false;
+        }
+
+        return builder.ToString().ToLowerInvariant();
+    }
+
+    private static int CountScalars(string value) => value.EnumerateRunes().Count();
+
+    private static bool IsPathLike(string value) =>
+        value is "." or ".." || value.IndexOfAny(['/', '\\', '<', '>', ':', '"', '|', '?', '*']) >= 0;
+
+    private static bool ContainsControlledScalar(string value) => value.EnumerateRunes().Any(rune =>
+        Rune.GetUnicodeCategory(rune) is UnicodeCategory.Control or UnicodeCategory.Format or
+            UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator or UnicodeCategory.Surrogate ||
+        Rune.IsWhiteSpace(rune) && rune.Value != ' ');
+
+    private static bool IsWellFormedUtf16(string? value)
+    {
+        if (value is null) return false;
+        for (var index = 0; index < value.Length; index++)
+        {
+            if (char.IsHighSurrogate(value[index]))
+            {
+                if (index + 1 >= value.Length || !char.IsLowSurrogate(value[index + 1])) return false;
+                index++;
+            }
+            else if (char.IsLowSurrogate(value[index]))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static void RequireExact(string? value, string expected, string name)

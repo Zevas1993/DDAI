@@ -61,6 +61,41 @@ class FakePatternShapes:
 		return shapes
 
 
+class FakeSprite:
+	var texture = null
+
+	func _init(value):
+		texture = value
+
+
+class FakeProp:
+	extends Node2D
+
+	var _node_id = 0
+	var _rect = Rect2()
+	var Sprite = null
+	var mutation_calls = 0
+	var Rect setget _set_rect, _get_rect
+
+	func _init(node_id, rect, texture):
+		_node_id = node_id
+		_rect = rect
+		Sprite = FakeSprite.new(texture)
+
+	func GetNodeID():
+		return _node_id
+
+	func _get_rect():
+		return _rect
+
+	func _set_rect(value):
+		mutation_calls += 1
+		_rect = value
+
+	func test_move(value):
+		_rect = value
+
+
 class FakeLevel:
 	var ID = 3
 	var Label = "Ground"
@@ -68,6 +103,7 @@ class FakeLevel:
 	var Pathways = FakeContainer.new()
 	var Roofs = FakeContainer.new()
 	var PatternShapes = FakePatternShapes.new()
+	var Objects = FakeContainer.new()
 	var mutation_calls = 0
 
 	func Save():
@@ -113,14 +149,16 @@ func _ready():
 	var bounds = _test_bounds_and_response_size_fail_closed()
 	var cursor_vector = _test_cross_runtime_cursor_vector()
 	var map_identity = _test_runtime_world_identity_prevents_map_id_collision()
+	var object_correlation = _test_documented_object_fingerprint_is_internal_and_read_only()
 	var read_only = _mutation_count() == 0
 	print("DDAI_INSPECTION_PAGINATION:", pagination)
 	print("DDAI_INSPECTION_STALE_CURSOR:", stale)
 	print("DDAI_INSPECTION_BOUNDS_AND_CAP:", bounds)
 	print("DDAI_INSPECTION_CURSOR_VECTOR:", cursor_vector)
 	print("DDAI_INSPECTION_MAP_IDENTITY:", map_identity)
+	print("DDAI_INSPECTION_OBJECT_CORRELATION:", object_correlation)
 	print("DDAI_INSPECTION_READ_ONLY:", read_only)
-	var exit_code = 0 if pagination and stale and bounds and cursor_vector and map_identity and read_only else 1
+	var exit_code = 0 if pagination and stale and bounds and cursor_vector and map_identity and object_correlation and read_only else 1
 	Global.World = null
 	for node in nodes:
 		if is_instance_valid(node) and node.get_parent() == null:
@@ -141,6 +179,7 @@ func _setup():
 	world.add_child(level.Pathways)
 	world.add_child(level.Roofs)
 	world.add_child(level.PatternShapes)
+	world.add_child(level.Objects)
 
 	for index in range(6):
 		nodes.append(FakeItem.new(index + 1, Rect2(index * 10, 0, 10, 10)))
@@ -153,6 +192,33 @@ func _setup():
 	pattern_layer.add_child(nodes[4])
 	pattern_layer.add_child(nodes[5])
 	level.PatternShapes.shapes = [nodes[4], nodes[5]]
+
+
+func _test_documented_object_fingerprint_is_internal_and_read_only():
+	var texture = ImageTexture.new()
+	texture.set_path("res://private/objects/ritual-altar.png")
+	var prop = FakeProp.new(7, Rect2(10, 20, 20, 10), texture)
+	nodes.append(prop)
+	level.Objects.add_child(prop)
+	var first = bridge._inspect_map_payload(_query(10))
+	if not first.ok:
+		return false
+	var object_item = null
+	for item in first.payload.items:
+		if item.node_id == 7:
+			object_item = item
+	if object_item == null or object_item.kind != "object" or object_item.asset_ref != null:
+		return false
+	if object_item.resource_fingerprint != texture.resource_path.sha256_text():
+		return false
+	var encoded = to_json(first.payload)
+	if encoded.find("res://") >= 0 or encoded.find("ritual-altar") >= 0 or first.payload.unsupported_kinds.has("object"):
+		return false
+	prop.test_move(Rect2(20, 20, 20, 10))
+	var moved = bridge._inspect_map_payload(_query(10))
+	prop.test_move(Rect2(10, 20, 20, 10))
+	level.Objects.remove_child(prop)
+	return moved.ok and moved.payload.map_revision != first.payload.map_revision
 
 
 func _query(limit, cursor = null, region = null):
@@ -278,6 +344,7 @@ func _test_runtime_world_identity_prevents_map_id_collision():
 	other_world.add_child(other_level.Pathways)
 	other_world.add_child(other_level.Roofs)
 	other_world.add_child(other_level.PatternShapes)
+	other_world.add_child(other_level.Objects)
 	Global.World = other_world
 	var second = bridge._inspect_map_payload(_query(1))
 	Global.World = world
@@ -298,6 +365,7 @@ func _mutation_count():
 	var total = world.mutation_calls + level.mutation_calls
 	total += level.Walls.mutation_calls + level.Pathways.mutation_calls
 	total += level.Roofs.mutation_calls + level.PatternShapes.mutation_calls
+	total += level.Objects.mutation_calls
 	for node in nodes:
 		total += node.mutation_calls
 	return total

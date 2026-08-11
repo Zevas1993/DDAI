@@ -314,7 +314,7 @@ public sealed class AssetCatalogCommitServiceTests
                 assetHash,
                 "pack",
                 "Pack",
-                ["Fixture"],
+                ["fixture"],
                 [],
                 null,
                 true,

@@ -16,6 +16,14 @@ const MAX_ERROR_RECORDS = 128
 const MAX_ERROR_CODE_BYTES = 64
 const MAX_ERROR_MESSAGE_BYTES = 512
 const MAX_NORMALIZATION_BYTES = 4096
+const MAX_LIBRARY_METADATA_KEYS = 8192
+const MAX_LIBRARY_TEXTURES_PER_KEY = 4096
+const MAX_LIBRARY_SEARCH_TERMS_PER_ASSET = 54
+const MAX_CATALOG_SEARCH_TERMS_PER_ASSET = 64
+const MAX_CATALOG_TAGS_PER_ASSET = 64
+const MAX_LIBRARY_TERM_SCALARS = 128
+const MAX_PACK_KEYWORDS_PER_ASSET = 8
+const MAX_PACK_KEYWORD_SOURCE_SCALARS = 1031
 const HELPER_RECEIPT_PATH = "user://ddai/private/asset-helper.json"
 const HELPER_HASH_BYTES_PER_TICK = 65536
 const HELPER_LAUNCH_INTERVAL_MSEC = 2000
@@ -86,6 +94,17 @@ var _chunk_phase = "building"
 var _manifest_text = ""
 var _last_update_entry_operations = 0
 var _last_update_file_publications = 0
+var _library_sources_loaded = false
+var _library_search_engine = {}
+var _library_tag_index_lookup = null
+var _library_keys = []
+var _library_key_index = 0
+var _library_texture_index = 0
+var _library_tag_keys = []
+var _library_tag_key_index = 0
+var _library_metadata_phase = "loading"
+var _library_search_terms_by_resource = {}
+var _library_tags_by_resource = {}
 
 
 class LiveRuntimeAdapter:
@@ -94,9 +113,11 @@ class LiveRuntimeAdapter:
 	var _helper_hash = null
 	var _helper_expected_hash = ""
 	var _asset_list_provider = null
+	var _library_metadata_provider = null
 
-	func _init(asset_list_provider):
+	func _init(asset_list_provider, library_metadata_provider):
 		_asset_list_provider = asset_list_provider
+		_library_metadata_provider = library_metadata_provider
 
 	func read_runtime_receipt():
 		var newest = null
@@ -219,13 +240,17 @@ class LiveRuntimeAdapter:
 	func get_asset_list(category):
 		return _asset_list_provider.call_func(category)
 
+	func get_library_metadata_sources():
+		return _library_metadata_provider.call_func()
+
 	func get_pack_metadata(resource_identity):
 		var owner = null
 		var owner_path_length = -1
 		for pack in Global.Header.AssetManifest:
 			var pack_path = str(pack.Path).replace("\\", "/")
 			var normalized_identity = resource_identity.replace("\\", "/")
-			if pack_path.length() > owner_path_length and normalized_identity.begins_with(pack_path):
+			var pack_boundary = pack_path if pack_path.ends_with("/") else pack_path + "/"
+			if pack_path.length() > owner_path_length and (normalized_identity == pack_path or normalized_identity.begins_with(pack_boundary)):
 				owner = pack
 				owner_path_length = pack_path.length()
 		if owner == null:
@@ -249,12 +274,28 @@ class LiveRuntimeAdapter:
 # Called by Dungeondraft after the map and its drawing assets have loaded.
 func start():
 	if _runtime_adapter == null:
-		_runtime_adapter = LiveRuntimeAdapter.new(funcref(self, "_get_live_asset_list"))
+		_runtime_adapter = LiveRuntimeAdapter.new(
+			funcref(self, "_get_live_asset_list"),
+			funcref(self, "_get_live_library_metadata_sources"))
 	_ensure_catalog_directories()
 
 
 func _get_live_asset_list(category):
 	return Script.GetAssetList(category)
+
+
+func _get_live_library_metadata_sources():
+	# ObjectLibraryPanel.searchEngine is the only documented read-only route to
+	# standard Library membership. The API docs do not publish a registered
+	# ObjectTool.Controls key for TagsPanel, so exact tag membership is not
+	# guessed or discovered by probing UI objects.
+	var search_engine = null
+	if Global.Editor != null and Global.Editor.ObjectLibraryPanel != null:
+		search_engine = Global.Editor.ObjectLibraryPanel.searchEngine
+	return {
+		"search_engine": search_engine,
+		"tag_index_lookup": null,
+	}
 
 
 # Every update performs at most eight lightweight entry operations or one logical file publication.
@@ -265,6 +306,8 @@ func update(_delta):
 		_advance_waiting_for_receipt_state()
 	elif _state == "helper_verification":
 		_advance_helper_verification_state()
+	elif _state == "indexing_library_metadata":
+		_advance_library_metadata_state()
 	elif _state == "enumerating":
 		_advance_enumerating_state()
 	elif _state == "previewing":
@@ -273,6 +316,8 @@ func update(_delta):
 		_advance_pack_normalization_state()
 	elif _state == "preview_publication":
 		_advance_preview_publication_state()
+	elif _state == "preview_metadata":
+		_advance_preview_metadata_state()
 	elif _state == "preview_finalization":
 		_advance_preview_finalization_state()
 	elif _state == "writing_chunks":
@@ -334,7 +379,117 @@ func _advance_helper_verification_state():
 	_catalog_revision = 0
 	for category in CATEGORIES:
 		_category_counts[category] = 0
-	_state = "enumerating"
+	_state = "indexing_library_metadata"
+
+
+func _advance_library_metadata_state():
+	if not _library_sources_loaded:
+		var sources = _runtime_adapter.get_library_metadata_sources()
+		if typeof(sources) != TYPE_DICTIONARY or sources.size() != 2 or not sources.has("search_engine") or not sources.has("tag_index_lookup"):
+			_fail_library_metadata("The documented Object Library metadata source is unavailable.")
+			return
+		if typeof(sources.search_engine) != TYPE_DICTIONARY or sources.search_engine.size() > MAX_LIBRARY_METADATA_KEYS:
+			_fail_library_metadata("The documented Object Library search index is invalid or exceeds its bound.")
+			return
+		if sources.tag_index_lookup != null and (typeof(sources.tag_index_lookup) != TYPE_DICTIONARY or sources.tag_index_lookup.size() > MAX_LIBRARY_METADATA_KEYS):
+			_fail_library_metadata("The documented Object Library tag index is invalid or exceeds its bound.")
+			return
+		if sources.search_engine.has(null) or (sources.tag_index_lookup != null and sources.tag_index_lookup.has(null)):
+			_fail_library_metadata("The documented Object Library metadata contains an invalid null key.")
+			return
+		_library_search_engine = sources.search_engine
+		_library_tag_index_lookup = sources.tag_index_lookup
+		_library_keys = _library_search_engine.keys()
+		_library_tag_keys = [] if _library_tag_index_lookup == null else _library_tag_index_lookup.keys()
+		_library_metadata_phase = "validating_search_keys"
+		_library_sources_loaded = true
+		return
+
+	var processed = 0
+	if _library_metadata_phase == "validating_search_keys":
+		while processed < MAX_ASSETS_PER_TICK and _library_key_index < _library_keys.size():
+			if typeof(_library_keys[_library_key_index]) != TYPE_STRING:
+				_fail_library_metadata("The documented Object Library search index contains an invalid key.")
+				return
+			_library_key_index += 1
+			processed += 1
+			_last_update_entry_operations += 1
+		if _library_key_index < _library_keys.size():
+			return
+		_library_key_index = 0
+		_library_metadata_phase = "validating_tag_keys"
+		return
+	if _library_metadata_phase == "validating_tag_keys":
+		while processed < MAX_ASSETS_PER_TICK and _library_tag_key_index < _library_tag_keys.size():
+			var tag_key = _library_tag_keys[_library_tag_key_index]
+			if typeof(tag_key) != TYPE_STRING or typeof(_library_tag_index_lookup[tag_key]) != TYPE_INT:
+				_fail_library_metadata("The documented Object Library tag index contains an invalid entry.")
+				return
+			var tag_index = int(_library_tag_index_lookup[tag_key])
+			if tag_index < 0 or tag_index >= MAX_LIBRARY_METADATA_KEYS:
+				_fail_library_metadata("The documented Object Library tag index contains an out-of-range entry.")
+				return
+			if _canonical_library_term(tag_key) != tag_key:
+				_fail_library_metadata("The documented Object Library tag index contains an unsafe key.")
+				return
+			_library_tag_key_index += 1
+			processed += 1
+			_last_update_entry_operations += 1
+		if _library_tag_key_index < _library_tag_keys.size():
+			return
+		_library_metadata_phase = "indexing"
+		return
+	while processed < MAX_ASSETS_PER_TICK and _library_key_index < _library_keys.size():
+		var raw_key = _library_keys[_library_key_index]
+		var term = _canonical_library_term(raw_key)
+		if term == null:
+			_fail_library_metadata("The documented Object Library search index contains an unsafe key.")
+			return
+		var textures = _library_search_engine[raw_key]
+		if typeof(textures) != TYPE_ARRAY or textures.size() > MAX_LIBRARY_TEXTURES_PER_KEY:
+			_fail_library_metadata("The documented Object Library search index contains an invalid texture collection.")
+			return
+		if _library_texture_index >= textures.size():
+			_library_key_index += 1
+			_library_texture_index = 0
+			processed += 1
+			_last_update_entry_operations += 1
+			continue
+		var texture = textures[_library_texture_index]
+		_library_texture_index += 1
+		processed += 1
+		_last_update_entry_operations += 1
+		if texture == null or not (texture is Texture):
+			_fail_library_metadata("The documented Object Library search index contains an invalid texture.")
+			return
+		var resource_identity = str(texture.resource_path)
+		if resource_identity.length() == 0:
+			_fail_library_metadata("The documented Object Library search index contains an unidentified texture.")
+			return
+		var terms = _library_search_terms_by_resource.get(resource_identity, [])
+		var term_insertion_index = terms.bsearch(term)
+		if term_insertion_index >= terms.size() or terms[term_insertion_index] != term:
+			if terms.size() >= MAX_LIBRARY_SEARCH_TERMS_PER_ASSET:
+				_fail_library_metadata("The documented Object Library search terms exceed the per-asset bound.")
+				return
+			terms.insert(term_insertion_index, term)
+			_library_search_terms_by_resource[resource_identity] = terms
+		if _library_tag_index_lookup != null and _library_tag_index_lookup.has(term):
+			var tags = _library_tags_by_resource.get(resource_identity, [])
+			var tag_insertion_index = tags.bsearch(term)
+			if tag_insertion_index >= tags.size() or tags[tag_insertion_index] != term:
+				if tags.size() >= MAX_CATALOG_TAGS_PER_ASSET:
+					_fail_library_metadata("The documented Object Library tags exceed the per-asset bound.")
+					return
+				tags.insert(tag_insertion_index, term)
+				_library_tags_by_resource[resource_identity] = tags
+	if _library_key_index >= _library_keys.size():
+		_state = "enumerating"
+
+
+func _fail_library_metadata(message):
+	_record_error("library_metadata_invalid", message, "Objects")
+	_state = "failed"
 
 
 func _reset_helper_launch_window():
@@ -435,7 +590,56 @@ func _advance_preview_publication_state():
 	if preview.ok and preview.needs_write:
 		if _write_bytes_immutable(preview.path, preview.png) != "created":
 			_preview_work.preview = {"ok": false, "message": "The bounded preview could not be published."}
-	_state = "preview_finalization"
+	_state = "preview_metadata"
+
+
+func _advance_preview_metadata_state():
+	if not _preview_work.has("metadata_phase"):
+		var pack_keywords = _normalized_tags(_preview_work.pack_metadata.keywords)
+		if pack_keywords == null:
+			_record_error("catalog_metadata_invalid", "The documented asset pack keywords exceed their safe bound or contain an unsafe value.", _preview_work.category)
+			_state = "failed"
+			_preview_work = null
+			return
+		_preview_work["display_name"] = _display_name(_preview_work.resource_identity, _preview_work.category)
+		_preview_work["search_terms"] = []
+		_preview_work["library_terms"] = _library_search_terms_by_resource.get(_preview_work.resource_identity, [])
+		_preview_work["library_term_index"] = 0
+		_preview_work["pack_keywords"] = pack_keywords
+		_preview_work["pack_keyword_index"] = 0
+		_preview_work["metadata_phase"] = "display"
+		_last_update_entry_operations = pack_keywords.size()
+		return
+	var processed = 0
+	while processed < MAX_ASSETS_PER_TICK:
+		if _preview_work.metadata_phase == "display":
+			_append_unique_library_term(_preview_work.search_terms, _preview_work.display_name)
+			_preview_work.metadata_phase = "library"
+		elif _preview_work.metadata_phase == "library":
+			if _preview_work.library_term_index >= _preview_work.library_terms.size():
+				_preview_work.metadata_phase = "pack_name"
+				continue
+			_append_unique_library_term(
+				_preview_work.search_terms,
+				_preview_work.library_terms[_preview_work.library_term_index])
+			_preview_work.library_term_index += 1
+		elif _preview_work.metadata_phase == "pack_name":
+			if _preview_work.pack_metadata.pack_name != null:
+				_append_unique_library_term(_preview_work.search_terms, _preview_work.pack_metadata.pack_name)
+			_preview_work.metadata_phase = "pack_keywords"
+		elif _preview_work.metadata_phase == "pack_keywords":
+			if _preview_work.pack_keyword_index >= _preview_work.pack_keywords.size():
+				_preview_work.metadata_phase = "complete"
+				continue
+			_append_unique_library_term(
+				_preview_work.search_terms,
+				_preview_work.pack_keywords[_preview_work.pack_keyword_index])
+			_preview_work.pack_keyword_index += 1
+		else:
+			_state = "preview_finalization"
+			return
+		processed += 1
+		_last_update_entry_operations += 1
 
 
 func _advance_preview_finalization_state():
@@ -450,14 +654,7 @@ func _advance_preview_finalization_state():
 		var error = _catalog_error("preview_not_available", "Preview unavailable for opaque asset " + asset_ref + ": " + preview.message, category)
 		_record_error(error.code, error.message, error.category)
 		_preview_results[asset_ref] = {"ok": false, "error": error}
-	var entry = _build_catalog_entry(
-		asset_ref,
-		category,
-		_preview_work.resource_identity,
-		_preview_work.resource_fingerprint,
-		_preview_work.pack_metadata,
-		_preview_work.pack_id,
-		preview_hash)
+	var entry = _build_catalog_entry_from_metadata(preview_hash)
 	_entries.append(entry)
 	_resource_lookup[asset_ref] = _preview_work.resource_identity
 	_asset_index += 1
@@ -466,30 +663,65 @@ func _advance_preview_finalization_state():
 	_state = "previewing"
 
 
-func _build_catalog_entry(asset_ref, category, resource_identity, resource_fingerprint, pack_metadata, pack_id, preview_hash):
-	var display_name = _display_name(resource_identity, category)
-	var tags = _normalized_tags(pack_metadata.keywords)
-	var search_terms = [display_name]
-	if pack_metadata.pack_name != null:
-		var bounded_pack_name = _bounded_nonblank_text(pack_metadata.pack_name, 256)
-		if bounded_pack_name != null:
-			search_terms.append(bounded_pack_name)
-	for tag in tags:
-		if not search_terms.has(tag):
-			search_terms.append(tag)
+func _build_catalog_entry_from_metadata(preview_hash):
 	return {
-		"asset_ref": asset_ref,
-		"category": category,
-		"display_name": display_name,
-		"resource_fingerprint": resource_fingerprint,
-		"pack_id": pack_id,
-		"pack_name": _bounded_nonblank_text(pack_metadata.pack_name, 256),
-		"search_terms": search_terms,
-		"tags": tags,
+		"asset_ref": _preview_work.asset_ref,
+		"category": _preview_work.category,
+		"display_name": _preview_work.display_name,
+		"resource_fingerprint": _preview_work.resource_fingerprint,
+		"pack_id": _preview_work.pack_id,
+		"pack_name": _bounded_nonblank_text(_preview_work.pack_metadata.pack_name, 256),
+		"search_terms": _preview_work.search_terms,
+		"tags": _library_tags_by_resource.get(_preview_work.resource_identity, []),
 		"preview_hash": preview_hash,
-		"allow_third_party_use": bool(pack_metadata.allow_third_party_use),
+		"allow_third_party_use": bool(_preview_work.pack_metadata.allow_third_party_use),
 		"generated": false,
 	}
+
+
+func _append_unique_library_term(values, raw_value):
+	var normalized = _canonical_library_term(raw_value)
+	if normalized == null or values.size() >= MAX_CATALOG_SEARCH_TERMS_PER_ASSET:
+		return
+	var insertion_index = values.bsearch(normalized)
+	if insertion_index >= values.size() or values[insertion_index] != normalized:
+		values.insert(insertion_index, normalized)
+
+
+func _canonical_library_term(raw_value):
+	if typeof(raw_value) != TYPE_STRING:
+		return null
+	var value = raw_value.strip_edges().to_lower()
+	while value.find("  ") >= 0:
+		value = value.replace("  ", " ")
+	if value.length() == 0 or value.length() > MAX_LIBRARY_TERM_SCALARS or value == "." or value == "..":
+		return null
+	for forbidden in ["/", "\\", "<", ">", ":", "\"", "|", "?", "*"]:
+		if value.find(forbidden) >= 0:
+			return null
+	for index in range(value.length()):
+		var code = value.ord_at(index)
+		if _is_controlled_unicode_scalar(code) or _is_non_ascii_whitespace(code):
+			return null
+	return value
+
+
+func _is_non_ascii_whitespace(code):
+	return code == 160 or code == 5760 or (code >= 8192 and code <= 8202) or code == 8239 or code == 8287 or code == 12288
+
+
+func _is_controlled_unicode_scalar(code):
+	return (
+		code < 32 or (code >= 127 and code <= 159) or code == 173 or
+		(code >= 1536 and code <= 1541) or code == 1564 or code == 1757 or code == 1807 or
+		(code >= 2192 and code <= 2193) or code == 2274 or code == 6158 or
+		(code >= 8203 and code <= 8207) or (code >= 8232 and code <= 8238) or
+		(code >= 8288 and code <= 8292) or (code >= 8294 and code <= 8303) or
+		(code >= 55296 and code <= 57343) or
+		code == 65279 or (code >= 65529 and code <= 65531) or
+		code == 69821 or code == 69837 or (code >= 78896 and code <= 78911) or
+		(code >= 113824 and code <= 113827) or (code >= 119155 and code <= 119162) or
+		code == 917505 or (code >= 917536 and code <= 917631))
 
 
 func _advance_writing_chunks_state():
@@ -903,20 +1135,33 @@ func _pack_id_for_hash(pack_id):
 func _normalized_tags(raw_keywords):
 	var candidates = []
 	if typeof(raw_keywords) == TYPE_ARRAY or typeof(raw_keywords) == TYPE_STRING_ARRAY:
+		if raw_keywords.size() > MAX_PACK_KEYWORDS_PER_ASSET:
+			return null
 		candidates = raw_keywords
+	elif typeof(raw_keywords) == TYPE_STRING:
+		if raw_keywords.length() > MAX_PACK_KEYWORD_SOURCE_SCALARS:
+			return null
+		if raw_keywords.strip_edges().length() == 0:
+			return []
+		candidates = raw_keywords.replace(";", ",").split(",")
+		if candidates.size() > MAX_PACK_KEYWORDS_PER_ASSET:
+			return null
 	elif raw_keywords != null:
-		candidates = str(raw_keywords).replace(";", ",").split(",")
-	var tags = []
+		return null
+	var terms = []
 	var seen = {}
 	for candidate in candidates:
-		if tags.size() >= 64:
-			break
-		var tag = str(candidate).strip_edges().substr(0, 128)
-		if tag.length() == 0 or seen.has(tag):
+		var term = _canonical_library_term(candidate)
+		if term == null:
+			if typeof(candidate) == TYPE_STRING and candidate.strip_edges().length() == 0:
+				continue
+			return null
+		if seen.has(term):
 			continue
-		seen[tag] = true
-		tags.append(tag)
-	return tags
+		seen[term] = true
+		terms.append(term)
+	terms.sort()
+	return terms
 
 
 func _display_name(resource_identity, category):

@@ -1,0 +1,14 @@
+[
+  { "name": "canonical", "raw": "shrine", "expected": "shrine" },
+  { "name": "trim-and-lower", "raw": "  SHRINE  ", "expected": "shrine" },
+  { "name": "collapse-ascii-spaces", "raw": "stone   altar", "expected": "stone altar" },
+  { "name": "path-traversal", "raw": "../secret", "expected": null },
+  { "name": "zero-width-format", "raw": "stone\u200baltar", "expected": null },
+  { "name": "word-joiner-format", "raw": "stone\u2060altar", "expected": null },
+  { "name": "nonbreaking-whitespace", "raw": "stone\u00a0altar", "expected": null },
+  { "name": "line-separator", "raw": "stone\u2028altar", "expected": null },
+  { "name": "ascii-control", "raw": "stone\u0001altar", "expected": null },
+  { "name": "scalar-overflow", "repeat": "a", "count": 129, "expected": null },
+  { "name": "negative-tag-index", "raw": "ancient", "expected": "ancient", "tag_index": -1 },
+  { "name": "oversized-tag-index", "raw": "ancient", "expected": "ancient", "tag_index": 8192 }
+]
