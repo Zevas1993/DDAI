@@ -3,6 +3,7 @@ using System.Text.Json;
 using DDAI.App.Assets;
 using DDAI.Core.Mailbox;
 using DDAI.Core.MapPlans;
+using DDAI.App.Mcp;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -23,8 +24,12 @@ public static class McpStdioServer
         builder.Services.AddSingleton(new AssetPackNormalizationService(options.MailboxRoot));
         builder.Services.AddHostedService<AssetPackNormalizationWorker>();
         builder.Services.AddSingleton(timeProvider);
+        builder.Services.AddSingleton(serviceProvider => new AssetCatalogRepository(
+            Path.Combine(options.MailboxRoot, "catalog"),
+            serviceProvider.GetRequiredService<TimeProvider>()));
         builder.Services.AddSingleton<DdaiStatusService>();
         builder.Services.AddSingleton<DdaiPlanService>();
+        builder.Services.AddSingleton<DdaiCapabilityService>();
         builder.Services.AddSingleton(new DdaiMcpRuntimeOptions(options.Timeout));
         builder.Services
             .AddMcpServer(server => server.ServerInfo = new Implementation
@@ -34,7 +39,8 @@ public static class McpStdioServer
                 Description = "Local Dungeondraft AI connector",
             })
             .WithStdioServerTransport()
-            .WithTools<DdaiTools>();
+            .WithTools<DdaiTools>()
+            .WithTools<DdaiCapabilityTools>();
 
         await builder.Build().RunAsync(cancellationToken);
     }
