@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using DDAI.Core.Assets;
 using Microsoft.Win32.SafeHandles;
 
@@ -48,20 +49,56 @@ public sealed class AssetCatalogRepository
     public const int MaximumPreviewBytes = 262_144;
     public static readonly TimeSpan MaximumLiveAge = TimeSpan.FromSeconds(45);
 
+    private const int MaximumGeneratedManifestBytes = 65_536;
+    private static readonly UTF8Encoding StrictUtf8 = new(false, true);
+    private static readonly JsonSerializerOptions GeneratedManifestJsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
+    };
+
     private readonly string catalogRoot;
     private readonly string snapshotsRoot;
     private readonly string previewsRoot;
+    private readonly string? generatedDataRoot;
+    private readonly string? generatedRoot;
+    private readonly string? generatedManifestRoot;
     private readonly TimeProvider timeProvider;
     private AcceptedAssetCatalog? current;
 
     public AssetCatalogRepository(string catalogRoot, TimeProvider timeProvider)
+        : this(catalogRoot, null, timeProvider, hasGeneratedAssetRoot: false)
+    {
+    }
+
+    public AssetCatalogRepository(string catalogRoot, string generatedAssetDataRoot, TimeProvider timeProvider)
+        : this(catalogRoot, generatedAssetDataRoot, timeProvider, hasGeneratedAssetRoot: true)
+    {
+    }
+
+    private AssetCatalogRepository(
+        string catalogRoot,
+        string? generatedAssetDataRoot,
+        TimeProvider timeProvider,
+        bool hasGeneratedAssetRoot)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(catalogRoot);
         ArgumentNullException.ThrowIfNull(timeProvider);
+        if (hasGeneratedAssetRoot &&
+            (string.IsNullOrWhiteSpace(generatedAssetDataRoot) || !Path.IsPathFullyQualified(generatedAssetDataRoot)))
+        {
+            throw new InvalidDataException("The generated asset data root must be absolute.");
+        }
 
         this.catalogRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(catalogRoot));
         snapshotsRoot = Path.Combine(this.catalogRoot, "snapshots");
         previewsRoot = Path.Combine(this.catalogRoot, "previews");
+        if (hasGeneratedAssetRoot)
+        {
+            this.generatedDataRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(generatedAssetDataRoot!));
+            generatedRoot = Path.Combine(this.generatedDataRoot, "generated-assets");
+            generatedManifestRoot = Path.Combine(generatedRoot, "manifest");
+        }
         this.timeProvider = timeProvider;
     }
 
@@ -89,6 +126,47 @@ public sealed class AssetCatalogRepository
     }
 
     public AcceptedAssetCatalog? GetCurrent() => Volatile.Read(ref current);
+
+    public IReadOnlyList<AssetCatalogEntry> GetStagedGeneratedEntries()
+    {
+        if (generatedDataRoot is null || generatedRoot is null || generatedManifestRoot is null)
+        {
+            return [];
+        }
+
+        try
+        {
+            RequireExistingOrdinaryDirectory(generatedDataRoot, "Generated asset data root");
+            RequireExistingOrdinaryDirectory(generatedRoot, "Generated asset root");
+            RequireExistingOrdinaryDirectory(generatedManifestRoot, "Generated asset manifest directory");
+            var entries = new List<AssetCatalogEntry>();
+            var assetReferences = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var manifestPath in Directory.EnumerateFiles(
+                         generatedManifestRoot,
+                         "*.json",
+                         SearchOption.TopDirectoryOnly).OrderBy(Path.GetFileName, StringComparer.Ordinal))
+            {
+                try
+                {
+                    var entry = ReadStagedGeneratedEntry(manifestPath);
+                    if (assetReferences.Add(entry.AssetRef))
+                    {
+                        entries.Add(entry);
+                    }
+                }
+                catch (Exception exception) when (IsRecoverableCatalogFailure(exception))
+                {
+                    // A malformed staged record never weakens or invalidates the accepted live snapshot.
+                }
+            }
+
+            return entries.ToImmutableArray();
+        }
+        catch (Exception exception) when (IsRecoverableCatalogFailure(exception))
+        {
+            return [];
+        }
+    }
 
     public byte[]? OpenPreview(string previewHash)
     {
@@ -348,6 +426,95 @@ public sealed class AssetCatalogRepository
         SearchTerms = entry.SearchTerms.ToImmutableArray(),
         Tags = entry.Tags.ToImmutableArray(),
     };
+
+    private AssetCatalogEntry ReadStagedGeneratedEntry(string manifestPath)
+    {
+        if (generatedManifestRoot is null)
+        {
+            throw new InvalidOperationException("The generated manifest root is unavailable.");
+        }
+
+        RequireBeneath(generatedManifestRoot, manifestPath);
+        RequireOrdinaryPath(generatedManifestRoot, manifestPath);
+        var json = StrictUtf8.GetString(ReadBoundedFile(manifestPath, MaximumGeneratedManifestBytes));
+        ValidateGeneratedManifestWireShape(json);
+        var manifest = JsonSerializer.Deserialize<GeneratedAssetManifest>(json, GeneratedManifestJsonOptions)
+            ?? throw new JsonException("A generated asset manifest cannot be JSON null.");
+        if (manifest.SchemaVersion != 1 ||
+            !IsCanonicalHash(manifest.GeneratedAssetId) ||
+            !IsCanonicalHash(manifest.ContentHash) ||
+            !IsCanonicalHash(manifest.PreviewHash) ||
+            manifest.Width is < 1 or > GeneratedAssetStore.MaximumEdge ||
+            manifest.Height is < 1 or > GeneratedAssetStore.MaximumEdge ||
+            manifest.GridWidth is < 1 or > GeneratedAssetStore.MaximumEdge ||
+            manifest.GridHeight is < 1 or > GeneratedAssetStore.MaximumEdge ||
+            !AssetCategory.IsCanonical(manifest.Category) ||
+            string.IsNullOrWhiteSpace(manifest.Name) ||
+            manifest.Tags is null ||
+            manifest.Tags.Count > 32 ||
+            manifest.Tags.Any(string.IsNullOrWhiteSpace) ||
+            !string.Equals(manifest.ActivationState, "staged", StringComparison.Ordinal) ||
+            !string.Equals(Path.GetFileName(manifestPath), manifest.GeneratedAssetId + ".json", StringComparison.Ordinal))
+        {
+            throw new InvalidDataException("A generated asset manifest is invalid.");
+        }
+
+        return new AssetCatalogEntry(
+            "sha256:" + manifest.GeneratedAssetId,
+            manifest.Category,
+            manifest.Name,
+            manifest.ContentHash,
+            "ddai-generated",
+            "DDAI Generated Assets",
+            [],
+            manifest.Tags.ToImmutableArray(),
+            manifest.PreviewHash,
+            true,
+            true);
+    }
+
+    private static void ValidateGeneratedManifestWireShape(string json)
+    {
+        using var document = JsonDocument.Parse(json, new JsonDocumentOptions
+        {
+            AllowTrailingCommas = false,
+            CommentHandling = JsonCommentHandling.Disallow,
+            MaxDepth = 8,
+        });
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            throw new JsonException("A generated asset manifest must be a JSON object.");
+        }
+
+        var expected = new HashSet<string>(
+            [
+                "schema_version",
+                "generated_asset_id",
+                "content_hash",
+                "preview_hash",
+                "width",
+                "height",
+                "category",
+                "name",
+                "tags",
+                "grid_width",
+                "grid_height",
+                "activation_state",
+            ],
+            StringComparer.Ordinal);
+        foreach (var property in document.RootElement.EnumerateObject())
+        {
+            if (!expected.Remove(property.Name))
+            {
+                throw new JsonException("A generated asset manifest has duplicate or unsupported properties.");
+            }
+        }
+
+        if (expected.Count != 0)
+        {
+            throw new JsonException("A generated asset manifest is missing required properties.");
+        }
+    }
 
     private static string ReadBoundedText(string path, int maximumBytes) =>
         Encoding.UTF8.GetString(ReadBoundedFile(path, maximumBytes));
@@ -822,6 +989,20 @@ public sealed class AssetCatalogRepository
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagOpenReparsePoint = 0x00200000;
+
+    private sealed record GeneratedAssetManifest(
+        int SchemaVersion,
+        string GeneratedAssetId,
+        string ContentHash,
+        string PreviewHash,
+        int Width,
+        int Height,
+        string Category,
+        string Name,
+        IReadOnlyList<string> Tags,
+        int GridWidth,
+        int GridHeight,
+        string ActivationState);
 
     private readonly record struct PngHeader(
         int Width,

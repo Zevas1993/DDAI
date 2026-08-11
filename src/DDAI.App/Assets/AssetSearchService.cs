@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using DDAI.Core.Assets;
 
@@ -12,10 +13,40 @@ public sealed record AssetSearchQuery(
     bool? PreviewRequired = null,
     IReadOnlyList<string>? Tags = null,
     int? Limit = null,
-    string? Cursor = null);
+    string? Cursor = null,
+    bool IncludeStagedGenerated = false);
+
+public sealed record AssetSearchItem(
+    string AssetRef,
+    string Category,
+    string DisplayName,
+    string ResourceFingerprint,
+    string? PackId,
+    string? PackName,
+    IReadOnlyList<string> SearchTerms,
+    IReadOnlyList<string> Tags,
+    string? PreviewHash,
+    bool AllowThirdPartyUse,
+    bool Generated,
+    bool Placeable)
+{
+    internal static AssetSearchItem Create(AssetCatalogEntry entry, bool placeable) => new(
+        entry.AssetRef,
+        entry.Category,
+        entry.DisplayName,
+        entry.ResourceFingerprint,
+        entry.PackId,
+        entry.PackName,
+        entry.SearchTerms,
+        entry.Tags,
+        entry.PreviewHash,
+        entry.AllowThirdPartyUse,
+        entry.Generated,
+        placeable);
+}
 
 public sealed record AssetSearchResult(
-    IReadOnlyList<AssetCatalogEntry> Items,
+    IReadOnlyList<AssetSearchItem> Items,
     string? NextCursor,
     long CatalogRevision,
     string CatalogFingerprint,
@@ -31,17 +62,27 @@ public sealed class AssetSearchService
 
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private readonly Func<AcceptedAssetCatalog?> getCurrent;
+    private readonly Func<IReadOnlyList<AssetCatalogEntry>> getStagedGeneratedEntries;
 
     public AssetSearchService(AssetCatalogRepository catalogRepository)
     {
         ArgumentNullException.ThrowIfNull(catalogRepository);
         getCurrent = catalogRepository.GetCurrent;
+        getStagedGeneratedEntries = catalogRepository.GetStagedGeneratedEntries;
     }
 
-    internal AssetSearchService(Func<AcceptedAssetCatalog?> getCurrent)
+    internal AssetSearchService(Func<AcceptedAssetCatalog?> getCurrent) : this(getCurrent, () => [])
+    {
+    }
+
+    internal AssetSearchService(
+        Func<AcceptedAssetCatalog?> getCurrent,
+        Func<IReadOnlyList<AssetCatalogEntry>> getStagedGeneratedEntries)
     {
         ArgumentNullException.ThrowIfNull(getCurrent);
+        ArgumentNullException.ThrowIfNull(getStagedGeneratedEntries);
         this.getCurrent = getCurrent;
+        this.getStagedGeneratedEntries = getStagedGeneratedEntries;
     }
 
     public AssetSearchResult Search(AssetSearchQuery query)
@@ -51,26 +92,54 @@ public sealed class AssetSearchService
         var catalog = getCurrent()
             ?? throw new InvalidOperationException("The asset catalog is unavailable.");
         var criteria = SearchCriteria.Create(query);
-        var entries = catalog.Entries
-            .Where(criteria.MatchesFilters)
-            .Where(criteria.MatchesQuery)
-            .OrderBy(entry => criteria.Rank(entry))
-            .ThenBy(entry => entry.AssetRef, StringComparer.Ordinal)
+        var candidates = catalog.Entries
+            .Select(entry => new SearchCandidate(entry, true))
+            .ToList();
+        if (query.IncludeStagedGenerated)
+        {
+            var liveReferences = candidates.Select(candidate => candidate.Entry.AssetRef).ToHashSet(StringComparer.Ordinal);
+            candidates.AddRange(getStagedGeneratedEntries()
+                .Where(entry => !liveReferences.Contains(entry.AssetRef))
+                .Select(entry => new SearchCandidate(entry, false)));
+        }
+
+        var entries = candidates
+            .Where(candidate => criteria.MatchesFilters(candidate.Entry))
+            .Where(candidate => criteria.MatchesQuery(candidate.Entry))
+            .OrderBy(candidate => criteria.Rank(candidate.Entry))
+            .ThenBy(candidate => candidate.Entry.AssetRef, StringComparer.Ordinal)
             .ToArray();
-        var offset = DecodeCursor(query.Cursor, catalog.Manifest.CatalogFingerprint, entries.Length);
+        var cursorFingerprint = CursorFingerprint(catalog.Manifest.CatalogFingerprint, candidates);
+        var offset = DecodeCursor(query.Cursor, cursorFingerprint, entries.Length);
         var page = entries.Skip(offset).Take(criteria.Limit).ToArray();
         var nextOffset = checked(offset + page.Length);
         var nextCursor = nextOffset < entries.Length
-            ? EncodeCursor(catalog.Manifest.CatalogFingerprint, nextOffset)
+            ? EncodeCursor(cursorFingerprint, nextOffset)
             : null;
 
         return new AssetSearchResult(
-            page,
+            page.Select(candidate => AssetSearchItem.Create(candidate.Entry, candidate.Placeable)).ToArray(),
             nextCursor,
             catalog.Manifest.CatalogRevision,
             catalog.Manifest.CatalogFingerprint,
             catalog.Live,
             catalog.Manifest.SnapshotAt);
+    }
+
+    private static string CursorFingerprint(string catalogFingerprint, IReadOnlyList<SearchCandidate> candidates)
+    {
+        var stagedReferences = candidates
+            .Where(candidate => !candidate.Placeable)
+            .Select(candidate => candidate.Entry.AssetRef)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (stagedReferences.Length == 0)
+        {
+            return catalogFingerprint;
+        }
+
+        var payload = string.Join('\n', ["staged-overlay-v1", catalogFingerprint, .. stagedReferences]);
+        return Convert.ToHexString(SHA256.HashData(StrictUtf8.GetBytes(payload))).ToLowerInvariant();
     }
 
     private static int DecodeCursor(string? cursor, string fingerprint, int entryCount)
@@ -266,4 +335,6 @@ public sealed class AssetSearchService
 
     private static IReadOnlyList<string> Tokenize(string? value) =>
         Normalize(value).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+    private sealed record SearchCandidate(AssetCatalogEntry Entry, bool Placeable);
 }
