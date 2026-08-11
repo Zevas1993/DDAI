@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Text.Json;
 using System.Globalization;
 using DDAI.App.Assets;
@@ -48,6 +49,7 @@ public sealed class DdaiCapabilityService(
     private static readonly string[] PngFormat = ["png"];
     private static readonly TimeSpan MaximumReceiptAge = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan MaximumReceiptFutureSkew = TimeSpan.FromSeconds(5);
+    private const int MaximumHeartbeatBytes = 4_096;
 
     public DdaiCapabilities GetCapabilities()
     {
@@ -126,14 +128,63 @@ public sealed class DdaiCapabilityService(
             }
         }
 
-        return latest;
+        return latest is not null && !latest.Fresh && HasFreshMatchingHeartbeat(latest.SessionId)
+            ? latest with { Fresh = true }
+            : latest;
+    }
+
+    private bool HasFreshMatchingHeartbeat(string expectedSessionId)
+    {
+        var directory = Path.Combine(mailbox.RootDirectory, "runtime-heartbeats");
+        var now = timeProvider.GetUtcNow();
+        for (var slot = 0; slot < 8; slot++)
+        {
+            var heartbeat = TryReadHeartbeat(Path.Combine(directory, $"heartbeat-slot-{slot}.json"));
+            if (heartbeat is not null &&
+                heartbeat.SessionId == expectedSessionId &&
+                heartbeat.ModVersion == ExpectedModVersion &&
+                heartbeat.Timestamp >= now - MaximumReceiptAge &&
+                heartbeat.Timestamp <= now + MaximumReceiptFutureSkew)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private RuntimeHeartbeat? TryReadHeartbeat(string path)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(ReadBoundedReceipt(path, MaximumHeartbeatBytes));
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object || root.EnumerateObject().Count() != 4 ||
+                !TryGetString(root, "schema_version", out var schemaVersion) || schemaVersion != "1.0" ||
+                !TryGetString(root, "session_id", out var sessionId) || string.IsNullOrWhiteSpace(sessionId) ||
+                !TryGetString(root, "mod_version", out var modVersion) ||
+                !root.TryGetProperty("timestamp", out var timestampProperty) ||
+                timestampProperty.ValueKind != JsonValueKind.String)
+            {
+                return null;
+            }
+
+            var timestamp = JsonSerializer.Deserialize<DateTimeOffset>(
+                timestampProperty.GetRawText(),
+                MailboxWireJson.Options);
+            return new RuntimeHeartbeat(sessionId, modVersion, timestamp);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException or ArgumentException or NotSupportedException or OverflowException or Win32Exception)
+        {
+            return null;
+        }
     }
 
     private RuntimeReceipt? TryReadReceipt(string path)
     {
         try
         {
-            using var document = JsonDocument.Parse(ReadBoundedReceipt(path));
+            using var document = JsonDocument.Parse(ReadBoundedReceipt(path, checked((int)AtomicMailbox.MaximumMessageBytes)));
             var root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object ||
                 !TryGetString(root, "schema_version", out var schemaVersion) || schemaVersion != "1.0" ||
@@ -157,40 +208,14 @@ public sealed class DdaiCapabilityService(
                 supportedCommands,
                 sessionId);
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException or ArgumentException or NotSupportedException or OverflowException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException or ArgumentException or NotSupportedException or OverflowException or Win32Exception)
         {
             return null;
         }
     }
 
-    private static byte[] ReadBoundedReceipt(string path)
-    {
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan);
-        if (stream.Length > AtomicMailbox.MaximumMessageBytes)
-        {
-            throw new InvalidDataException("Runtime receipts must not exceed 1 MiB.");
-        }
-
-        var bytes = new byte[checked((int)stream.Length)];
-        var offset = 0;
-        while (offset < bytes.Length)
-        {
-            var count = stream.Read(bytes, offset, bytes.Length - offset);
-            if (count == 0)
-            {
-                throw new InvalidDataException("Runtime receipt ended before its advertised length.");
-            }
-
-            offset += count;
-        }
-
-        if (stream.ReadByte() != -1)
-        {
-            throw new InvalidDataException("Runtime receipt grew beyond its bounded length while being read.");
-        }
-
-        return bytes;
-    }
+    private byte[] ReadBoundedReceipt(string path, int maximumBytes) =>
+        new SafeLocalFileSystem(mailbox.RootDirectory).ReadBounded(path, maximumBytes);
 
     private static bool RuntimeReceiptIsNewer(RuntimeReceipt candidate, RuntimeReceipt current)
     {
@@ -267,4 +292,9 @@ public sealed class DdaiCapabilityService(
         bool MatchesExpectedVersion,
         IReadOnlyList<string> SupportedCommands,
         string SessionId);
+
+    private sealed record RuntimeHeartbeat(
+        string SessionId,
+        string ModVersion,
+        DateTimeOffset Timestamp);
 }

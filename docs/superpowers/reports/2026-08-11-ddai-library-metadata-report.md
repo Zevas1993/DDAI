@@ -63,3 +63,30 @@ Genuine object-correlation RED reported `DDAI_INSPECTION_OBJECT_CORRELATION:Fals
 ## Remaining live acceptance
 
 Only after independent review is clean may the controller request the normal user-close/install/reopen sequence. Required live proof remains a new session, catalog revision and fingerprint; exact category/entry/chunk/error totals; counts with multiple search terms and exact tags; representative opaque non-filename queries; all preview opens; placed-object correlation; responsiveness; and no crash. Until then, this change is automated/headless evidence only.
+
+## Live acceptance and follow-up fixes — 2026-08-11
+
+Live certification was completed on a disposable blank 40 by 30 map. The first instrumented run proved the catalog was not merely slow: it failed after loading 538 documented Library keys and processing 801 key-to-texture associations because one real Library search key could not be represented by the connector's canonical public metadata format. The corrected producer omits only that unusable synonym, emits the bounded `library_metadata_term_ignored` diagnostic without the term or resource path, and retains fail-closed behavior for malformed collections, textures, tag indexes, and wire records.
+
+The existing catalog tool now publishes an eight-slot, 4,096-byte maximum private progress receipt. It contains only schema/session, phase, bounded counters, and bounded diagnostics; exact Godot 3.5.3 coverage proves that Library terms, `res://` identities, and filenames are absent. The production reader accepts this receipt as liveness evidence only when it is strict-schema, `published`, at most 30 seconds old, exact-session matched to the accepted manifest, and exact-entry-count matched. Malformed slots are isolated, while mismatched, stale, failed, future, or unbounded receipts cannot promote a cached snapshot.
+
+The same exact-session rule now renews the one-time runtime-start receipt from the bridge's existing rotating heartbeat slots. This prevents `ddai_get_capabilities` from reporting a live, responsive Dungeondraft process as stale merely because it has been open longer than 30 seconds.
+
+Independent review then exposed four strictness gaps. The repaired producer validates an unsafe term's collection, every texture, and resource identity incrementally before omitting only term insertion. The reader now requires all 20 unique receipt fields, rejects duplicates and missing fields, and enforces terminal counter/error correlations. Catalog liveness stores the producer timestamp rather than a latched boolean, so it expires dynamically. Runtime startup and heartbeat receipts now use the existing handle-validated, reparse-resistant local filesystem reader, with heartbeat files capped at 4,096 bytes. A final live RED also exposed the producer retaining its last raw-enumeration index after clearing the array; the producer now resets that terminal index to zero and the exact Godot fixture locks the invariant.
+
+Live evidence:
+
+- Dungeondraft PID `55444` remained responsive with the disposable `Tabula Rasa` map open.
+- Catalog session: `1786484372-209555`.
+- Catalog revision: `1786484714855`.
+- Producer totals: 538 Library keys, 6,094 validated associations, 14/14 categories, 1,947/1,947 entries, one safely ignored synonym, no other error. The four-association increase proves the ignored term's textures were validated rather than bypassed.
+- The production repository accepted an isolated copy and opened 1,947/1,947 hash-bound previews; the live `current.json` hash remained unchanged during that verification.
+- Installed MCP acceptance negotiated protocol `2025-11-25`, listed all eight canonical tools, reported `runtime_state: live` and `catalog_state: live`, certified status/apply, returned a live `Objects` search result (`log 01`), and returned its 44,665-byte `image/png` preview.
+- Live `ddai_inspect_map` returned a stable map ID and SHA-256 map revision, canvas 40 by 30, one level, zero items, no cursor, and no mutation.
+- Final self-contained executable: 86,890,170 bytes; SHA-256 `AAFB1AF2150126EB07E44FBF3B621F78E6A3E5AAA44BACF9EA59D318CA3F1A6C`. The installed executable hash matched exactly.
+- Final source/installed `ddai_asset_catalog.gd` SHA-256: `6170ED52CC6E7671BFF95A89CA16DF8616B185C6E91541F03B0FA51A102E5B3D`.
+- Running-app setup correctly returned exit 2 / `activation_pending_dungeondraft_running`, changed neither Claude nor Gemini configuration, and left Dungeondraft responsive; the owned executable update was installed and hash verified.
+- Final serialized Release tests: App 322/322 plus Core 329/329, 651/651 total. Release build: zero warnings and zero errors. Changed-file formatting, diff checks, listener scan, and vulnerable-package audit were clean.
+- Post-hardening installed MCP acceptance negotiated protocol `2025-11-25`, listed the exact eight tools, reported runtime/catalog/status live, searched `Objects` for `log 01`, decoded its 44,665-byte PNG preview, and inspected the responsive blank 40 by 30 map. The MCP server exited cleanly with stdout containing only JSON-RPC frames.
+
+Remaining product work is the separately planned universal map-plan executor coverage. Status still intentionally leaves undocumented version/active-mod/current-level fields unavailable; live map identity, revision, canvas, levels, and items are supplied by `ddai_inspect_map` instead.

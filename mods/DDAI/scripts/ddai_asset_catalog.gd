@@ -24,6 +24,9 @@ const MAX_CATALOG_TAGS_PER_ASSET = 64
 const MAX_LIBRARY_TERM_SCALARS = 128
 const MAX_PACK_KEYWORDS_PER_ASSET = 8
 const MAX_PACK_KEYWORD_SOURCE_SCALARS = 1031
+const MAX_PROGRESS_RECEIPT_BYTES = 4096
+const PROGRESS_RECEIPT_INTERVAL_MSEC = 1000
+const PROGRESS_RECEIPT_SLOT_COUNT = 8
 const HELPER_RECEIPT_PATH = "user://ddai/private/asset-helper.json"
 const HELPER_HASH_BYTES_PER_TICK = 65536
 const HELPER_LAUNCH_INTERVAL_MSEC = 2000
@@ -105,6 +108,11 @@ var _library_tag_key_index = 0
 var _library_metadata_phase = "loading"
 var _library_search_terms_by_resource = {}
 var _library_tags_by_resource = {}
+var _library_associations_processed = 0
+var _enumerated_asset_count = 0
+var _progress_receipt_slot = 0
+var _progress_last_publish_msec = -PROGRESS_RECEIPT_INTERVAL_MSEC
+var _progress_last_signature = ""
 
 
 class LiveRuntimeAdapter:
@@ -302,6 +310,9 @@ func _get_live_library_metadata_sources():
 func update(_delta):
 	_last_update_entry_operations = 0
 	_last_update_file_publications = 0
+	if _progress_receipt_is_due():
+		_publish_progress_receipt()
+		return
 	if _state == "waiting_for_receipt":
 		_advance_waiting_for_receipt_state()
 	elif _state == "helper_verification":
@@ -441,14 +452,16 @@ func _advance_library_metadata_state():
 		return
 	while processed < MAX_ASSETS_PER_TICK and _library_key_index < _library_keys.size():
 		var raw_key = _library_keys[_library_key_index]
-		var term = _canonical_library_term(raw_key)
-		if term == null:
-			_fail_library_metadata("The documented Object Library search index contains an unsafe key.")
-			return
 		var textures = _library_search_engine[raw_key]
 		if typeof(textures) != TYPE_ARRAY or textures.size() > MAX_LIBRARY_TEXTURES_PER_KEY:
 			_fail_library_metadata("The documented Object Library search index contains an invalid texture collection.")
 			return
+		var term = _canonical_library_term(raw_key)
+		if term == null and _library_texture_index == 0:
+			_record_error(
+				"library_metadata_term_ignored",
+				"A documented Object Library search term could not be represented safely and was omitted.",
+				"Objects")
 		if _library_texture_index >= textures.size():
 			_library_key_index += 1
 			_library_texture_index = 0
@@ -457,6 +470,7 @@ func _advance_library_metadata_state():
 			continue
 		var texture = textures[_library_texture_index]
 		_library_texture_index += 1
+		_library_associations_processed += 1
 		processed += 1
 		_last_update_entry_operations += 1
 		if texture == null or not (texture is Texture):
@@ -466,6 +480,8 @@ func _advance_library_metadata_state():
 		if resource_identity.length() == 0:
 			_fail_library_metadata("The documented Object Library search index contains an unidentified texture.")
 			return
+		if term == null:
+			continue
 		var terms = _library_search_terms_by_resource.get(resource_identity, [])
 		var term_insertion_index = terms.bsearch(term)
 		if term_insertion_index >= terms.size() or terms[term_insertion_index] != term:
@@ -545,9 +561,11 @@ func _advance_enumerating_state():
 		return
 	_category_resources.append({"category": category, "identities": _enumeration_sorted})
 	_category_counts[category] = _enumeration_sorted.size()
+	_enumerated_asset_count += _enumeration_sorted.size()
 	_category_index += 1
 	_enumeration_loaded = false
 	_enumeration_raw = []
+	_enumeration_raw_index = 0
 	_enumeration_sorted = []
 	_enumeration_seen = {}
 
@@ -1250,6 +1268,57 @@ func _write_bytes_immutable_bound(path, bytes, expected_hash, expected_byte_coun
 	return "valid" if _write_bytes_immutable(path, bytes) == "created" else "write_failed"
 
 
+func _progress_receipt_is_due():
+	if not _is_safe_segment(_session_id):
+		return false
+	var signature = _state + "\n" + _progress_phase()
+	return signature != _progress_last_signature or OS.get_ticks_msec() - _progress_last_publish_msec >= PROGRESS_RECEIPT_INTERVAL_MSEC
+
+
+func _progress_phase():
+	return _library_metadata_phase if _state == "indexing_library_metadata" else _state
+
+
+func _publish_progress_receipt():
+	var last_error = null if _errors.size() == 0 else _errors[_errors.size() - 1]
+	var receipt = {
+		"schema_version": CATALOG_SCHEMA_VERSION,
+		"session_id": _session_id,
+		"timestamp": _utc_wire_timestamp(),
+		"state": _state,
+		"phase": _progress_phase(),
+		"library_key_count": _library_keys.size(),
+		"library_key_index": _library_key_index,
+		"library_texture_index": _library_texture_index,
+		"library_associations_processed": _library_associations_processed,
+		"category_index": _category_index,
+		"category_count": CATEGORIES.size(),
+		"enumeration_raw_count": _enumeration_raw.size(),
+		"enumeration_raw_index": _enumeration_raw_index,
+		"enumerated_asset_count": _enumerated_asset_count,
+		"asset_category_index": _asset_category_index,
+		"asset_index": _asset_index,
+		"entry_count": _entries.size(),
+		"error_count": _errors.size() + _suppressed_error_count,
+		"last_error_code": null if last_error == null else last_error.code,
+		"last_error_message": null if last_error == null else last_error.message,
+	}
+	var bytes = to_json(receipt).to_utf8()
+	_progress_last_publish_msec = OS.get_ticks_msec()
+	_progress_last_signature = _state + "\n" + _progress_phase()
+	if bytes.size() > MAX_PROGRESS_RECEIPT_BYTES:
+		return false
+	var directory = Directory.new()
+	var path = _progress_receipt_root() + "/progress-slot-" + str(_progress_receipt_slot) + ".json"
+	directory.make_dir_recursive(path.get_base_dir())
+	directory.remove(path)
+	var result = _write_bytes_immutable(path, bytes)
+	if result == "created":
+		_progress_receipt_slot = (_progress_receipt_slot + 1) % PROGRESS_RECEIPT_SLOT_COUNT
+		return true
+	return false
+
+
 func _read_bounded_bytes(path, maximum_bytes):
 	var file = File.new()
 	if not file.file_exists(path) or file.open(path, File.READ) != OK:
@@ -1274,6 +1343,10 @@ func _previews_root():
 
 func _pack_normalization_root():
 	return catalog_root.get_base_dir() + "/private/pack-normalization"
+
+
+func _progress_receipt_root():
+	return catalog_root.get_base_dir() + "/private/asset-catalog-progress"
 
 
 func _catalog_commit_root():

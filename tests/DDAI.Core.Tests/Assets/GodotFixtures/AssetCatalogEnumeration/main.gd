@@ -95,6 +95,7 @@ func _ready():
 	var shared_hostile_corpus = _test_shared_hostile_metadata_corpus()
 	var pack_keyword_bounds = _test_pack_keywords_remain_searchable_and_fail_closed_over_bound()
 	var key_validation_incremental = _test_library_key_validation_is_incremental()
+	var progress_receipt = _test_progress_receipt_is_bounded_and_private()
 	print("DDAI_TYPED_ARRAY_ENUMERATION:", typed_array)
 	print("DDAI_WRONG_TYPE_FAILS_CLOSED:", wrong_type)
 	print("DDAI_ENUMERATION_DIAGNOSTIC_CLOSED_WORLD:", wrong_type)
@@ -105,7 +106,8 @@ func _ready():
 	print("DDAI_LIBRARY_METADATA_SHARED_CORPUS:", shared_hostile_corpus)
 	print("DDAI_PACK_KEYWORD_BOUNDS:", pack_keyword_bounds)
 	print("DDAI_LIBRARY_KEY_VALIDATION_INCREMENTAL:", key_validation_incremental)
-	get_tree().quit(0 if typed_array and wrong_type and tool_scope_wiring and snapshot_finalization and library_metadata and hostile_metadata and shared_hostile_corpus and pack_keyword_bounds and key_validation_incremental else 1)
+	print("DDAI_CATALOG_PROGRESS_RECEIPT:", progress_receipt)
+	get_tree().quit(0 if typed_array and wrong_type and tool_scope_wiring and snapshot_finalization and library_metadata and hostile_metadata and shared_hostile_corpus and pack_keyword_bounds and key_validation_incremental and progress_receipt else 1)
 
 
 func _test_typed_array_enumeration():
@@ -338,12 +340,34 @@ func _test_library_metadata_index_is_bounded_and_exact():
 
 func _test_hostile_library_metadata_fails_closed():
 	var secret = _texture("res://private/do-not-leak.png")
+	for invalid_value in ["not-an-array", [null]]:
+		var unsafe_structural_catalog = CatalogScript.new()
+		unsafe_structural_catalog._runtime_adapter = LibraryMetadataAdapter.new({"../secret": invalid_value}, null)
+		unsafe_structural_catalog._state = "indexing_library_metadata"
+		for _index in range(16):
+			if unsafe_structural_catalog._state != "indexing_library_metadata":
+				break
+			unsafe_structural_catalog._advance_library_metadata_state()
+		if unsafe_structural_catalog._state != "failed":
+			return false
+	var unsafe_term_catalog = CatalogScript.new()
+	unsafe_term_catalog._runtime_adapter = LibraryMetadataAdapter.new({"../secret": [secret]}, null)
+	unsafe_term_catalog._state = "indexing_library_metadata"
+	for _index in range(16):
+		if unsafe_term_catalog._state != "indexing_library_metadata":
+			break
+		unsafe_term_catalog._advance_library_metadata_state()
+	if unsafe_term_catalog._state != "enumerating" or unsafe_term_catalog._errors.size() != 1:
+		return false
+	if unsafe_term_catalog._errors[0].code != "library_metadata_term_ignored":
+		return false
+	if to_json(unsafe_term_catalog._errors).find("res://") >= 0 or unsafe_term_catalog._library_search_terms_by_resource.size() != 0:
+		return false
 	var null_search_key = {}
 	null_search_key[null] = [secret]
 	var null_tag_key = {}
 	null_tag_key[null] = 0
 	for fixture in [
-		{"engine": {"../secret": [secret]}, "tags": null},
 		{"engine": {"valid": "res://private/do-not-leak.png"}, "tags": null},
 		{"engine": {"valid": [null]}, "tags": null},
 		{"engine": {"valid": [secret]}, "tags": {"valid": "wrong"}},
@@ -457,6 +481,72 @@ func _test_library_key_validation_is_incremental():
 	if catalog._library_metadata_phase != "validating_search_keys":
 		return false
 	return _advance_metadata(catalog)
+
+
+func _test_progress_receipt_is_bounded_and_private():
+	var terminal_catalog = CatalogScript.new()
+	terminal_catalog._category_index = CatalogScript.CATEGORIES.size() - 1
+	terminal_catalog._enumeration_loaded = true
+	terminal_catalog._enumeration_raw = ["res://terminal.png"]
+	terminal_catalog._enumeration_raw_index = 1
+	terminal_catalog._enumeration_sorted = ["res://terminal.png"]
+	terminal_catalog._advance_enumerating_state()
+	if terminal_catalog._enumeration_raw.size() != 0 or terminal_catalog._enumeration_raw_index != 0:
+		return false
+	var catalog = CatalogScript.new()
+	catalog.catalog_root = "res://progress-receipt/catalog"
+	catalog._session_id = "fixture-session"
+	catalog._state = "indexing_library_metadata"
+	catalog._library_metadata_phase = "indexing"
+	catalog._library_keys = ["private-term"]
+	catalog._library_key_index = 0
+	catalog._library_texture_index = 17
+	catalog._library_associations_processed = 17
+	catalog._category_index = 2
+	catalog._asset_category_index = 1
+	catalog._asset_index = 3
+	catalog._enumeration_raw = ["one", "two"]
+	catalog._enumeration_raw_index = 1
+	catalog._enumerated_asset_count = 5
+	catalog._entries = [{"private": "res://must-not-leak.png"}]
+	catalog._errors = [{"code": "library_metadata_invalid", "message": "bounded failure", "category": "Objects"}]
+	catalog._ensure_catalog_directories()
+	if not catalog._publish_progress_receipt():
+		return false
+	if catalog._last_update_entry_operations != 0 or catalog._last_update_file_publications != 1:
+		return false
+	var path = "res://progress-receipt/private/asset-catalog-progress/progress-slot-0.json"
+	var file = File.new()
+	if file.open(path, File.READ) != OK or file.get_len() > CatalogScript.MAX_PROGRESS_RECEIPT_BYTES:
+		return false
+	var text = file.get_as_text()
+	file.close()
+	var parsed = JSON.parse(text)
+	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY:
+		return false
+	var receipt = parsed.result
+	return (
+		receipt.keys().size() == 20 and
+		receipt.schema_version == CatalogScript.CATALOG_SCHEMA_VERSION and
+		receipt.session_id == "fixture-session" and
+		receipt.state == "indexing_library_metadata" and
+		receipt.phase == "indexing" and
+		receipt.library_key_count == 1 and
+		receipt.library_key_index == 0 and
+		receipt.library_texture_index == 17 and
+		receipt.library_associations_processed == 17 and
+		receipt.category_index == 2 and
+		receipt.category_count == CatalogScript.CATEGORIES.size() and
+		receipt.enumeration_raw_count == 2 and
+		receipt.enumeration_raw_index == 1 and
+		receipt.enumerated_asset_count == 5 and
+		receipt.asset_category_index == 1 and
+		receipt.asset_index == 3 and
+		receipt.entry_count == 1 and
+		receipt.error_count == 1 and
+		receipt.last_error_code == "library_metadata_invalid" and
+		receipt.last_error_message == "bounded failure" and
+		text.find("res://") < 0 and text.find("private-term") < 0 and text.find("must-not-leak") < 0)
 
 
 func _repeat_text(value, count):

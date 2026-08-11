@@ -125,6 +125,7 @@ public sealed class DungeondraftAssetCatalogScriptTests
             Assert.Contains("DDAI_LIBRARY_METADATA_SHARED_CORPUS:True", output, StringComparison.Ordinal);
             Assert.Contains("DDAI_PACK_KEYWORD_BOUNDS:True", output, StringComparison.Ordinal);
             Assert.Contains("DDAI_LIBRARY_KEY_VALIDATION_INCREMENTAL:True", output, StringComparison.Ordinal);
+            Assert.Contains("DDAI_CATALOG_PROGRESS_RECEIPT:True", output, StringComparison.Ordinal);
         }
         finally
         {

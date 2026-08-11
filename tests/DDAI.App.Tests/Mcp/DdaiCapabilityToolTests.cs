@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Reflection;
 using System.Text.Json;
 using DDAI.App.Mcp;
@@ -63,6 +64,62 @@ public sealed class DdaiCapabilityToolTests
         Assert.Equal("incompatible", mismatched.RuntimeState);
         Assert.All(mismatched.Operations, operation => Assert.False(operation.RuntimeCertified));
         Assert.All(mismatched.Operations, operation => Assert.Equal("runtime_version_mismatch", operation.Reason));
+    }
+
+    [Fact]
+    public void GetCapabilities_RenewsAnExactStartupReceiptOnlyFromFreshMatchingHeartbeat()
+    {
+        using var sandbox = new CapabilitySandbox();
+        sandbox.WriteReceipt(
+            sandbox.Now.AddMinutes(-10),
+            "0.2.1",
+            "1.2.0.1",
+            ["status", "apply_plan"],
+            sessionId: "active-session");
+        sandbox.WriteHeartbeat(sandbox.Now, "0.2.1", "active-session");
+
+        var live = sandbox.CreateService().GetCapabilities();
+
+        Assert.Equal("live", live.RuntimeState);
+        Assert.All(live.Operations, operation => Assert.True(operation.RuntimeCertified));
+
+        sandbox.WriteHeartbeat(sandbox.Now, "0.2.1", "different-session");
+        var mismatched = sandbox.CreateService().GetCapabilities();
+        Assert.Equal("stale", mismatched.RuntimeState);
+
+        sandbox.WriteHeartbeat(sandbox.Now.AddSeconds(-31), "0.2.1", "active-session");
+        var stale = sandbox.CreateService().GetCapabilities();
+        Assert.Equal("stale", stale.RuntimeState);
+    }
+
+    [Fact]
+    public void GetCapabilities_RejectsHeartbeatDirectoryJunction()
+    {
+        using var sandbox = new CapabilitySandbox();
+        sandbox.WriteReceipt(
+            sandbox.Now.AddMinutes(-10),
+            "0.2.1",
+            "1.2.0.1",
+            ["status", "apply_plan"],
+            sessionId: "active-session");
+        var external = Path.Combine(Path.GetTempPath(), "ddai-capability-external", Guid.NewGuid().ToString("N"));
+        var junction = Path.Combine(sandbox.Root, "runtime-heartbeats");
+        Directory.CreateDirectory(external);
+        try
+        {
+            CapabilitySandbox.WriteHeartbeatFile(external, sandbox.Now, "0.2.1", "active-session");
+            CreateDirectoryJunction(junction, external);
+
+            var capabilities = sandbox.CreateService().GetCapabilities();
+
+            Assert.Equal("stale", capabilities.RuntimeState);
+            Assert.All(capabilities.Operations, operation => Assert.False(operation.RuntimeCertified));
+        }
+        finally
+        {
+            if (Directory.Exists(junction)) Directory.Delete(junction);
+            if (Directory.Exists(external)) Directory.Delete(external, recursive: true);
+        }
     }
 
     [Fact]
@@ -160,7 +217,45 @@ public sealed class DdaiCapabilityToolTests
             }));
         }
 
+        public void WriteHeartbeat(DateTimeOffset timestamp, string modVersion, string sessionId, int slot = 0)
+        {
+            var directory = Path.Combine(Root, "runtime-heartbeats");
+            Directory.CreateDirectory(directory);
+            WriteHeartbeatFile(directory, timestamp, modVersion, sessionId, slot);
+        }
+
+        public static void WriteHeartbeatFile(
+            string directory,
+            DateTimeOffset timestamp,
+            string modVersion,
+            string sessionId,
+            int slot = 0)
+        {
+            File.WriteAllText(
+                Path.Combine(directory, $"heartbeat-slot-{slot}.json"),
+                JsonSerializer.Serialize(new
+                {
+                    schema_version = "1.0",
+                    session_id = sessionId,
+                    mod_version = modVersion,
+                    timestamp = timestamp.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture),
+                }));
+        }
+
         public void Dispose() => Directory.Delete(Root, recursive: true);
+    }
+
+    private static void CreateDirectoryJunction(string linkPath, string targetPath)
+    {
+        using var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = "cmd.exe",
+            Arguments = $"/c mklink /J \"{linkPath}\" \"{targetPath}\"",
+            CreateNoWindow = true,
+            UseShellExecute = false,
+        }) ?? throw new InvalidOperationException("cmd.exe could not create the junction fixture.");
+        process.WaitForExit();
+        Assert.True(process.ExitCode == 0 && Directory.Exists(linkPath), "The Windows junction fixture could not be created.");
     }
 
     private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider

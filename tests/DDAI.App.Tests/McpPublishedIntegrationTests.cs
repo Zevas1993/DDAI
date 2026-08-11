@@ -114,6 +114,25 @@ public sealed class McpPublishedIntegrationTests
     }
 
     [Fact]
+    public async Task Status_KeepsAnOlderCatalogLiveWhileItsExactPublisherReceiptIsFresh()
+    {
+        using var sandbox = new TestDirectory();
+        var now = DateTimeOffset.Parse("2026-08-10T20:00:00Z");
+        sandbox.PublishAcceptedAssetCatalog(snapshotAt: now - TimeSpan.FromMinutes(10));
+        sandbox.WriteCatalogProgressReceipt(now);
+
+        var result = await GetStatusResultAsync(
+            sandbox,
+            new FixedTimeProvider(now),
+            success: true,
+            JsonSerializer.SerializeToElement(new { state = "ready" }),
+            error: null);
+
+        Assert.Equal(600_000, result.CatalogCacheAgeMilliseconds);
+        Assert.True(result.CatalogLive);
+    }
+
+    [Fact]
     public async Task Status_LeavesAbsentAndMalformedOptionalEnrichmentUnpromoted()
     {
         using var absentSandbox = new TestDirectory();
@@ -1254,6 +1273,37 @@ public sealed class McpPublishedIntegrationTests
                     session_id = "1-1",
                     supported_commands = PublishedDiscoveryBridgeHarness.Capabilities,
                 }));
+        }
+
+        public void WriteCatalogProgressReceipt(DateTimeOffset timestamp)
+        {
+            var directory = Path.Combine(MailboxDirectory, "private", "asset-catalog-progress");
+            Directory.CreateDirectory(directory);
+            File.WriteAllText(
+                Path.Combine(directory, "progress-slot-0.json"),
+                JsonSerializer.Serialize(new
+                {
+                    schema_version = "1.0",
+                    session_id = "published-fixture",
+                    timestamp,
+                    state = "published",
+                    phase = "published",
+                    library_key_count = 1,
+                    library_key_index = 1,
+                    library_texture_index = 0,
+                    library_associations_processed = 1,
+                    category_index = AssetCategory.All.Count,
+                    category_count = AssetCategory.All.Count,
+                    enumeration_raw_count = 0,
+                    enumeration_raw_index = 0,
+                    enumerated_asset_count = 1,
+                    asset_category_index = AssetCategory.All.Count,
+                    asset_index = 0,
+                    entry_count = 1,
+                    error_count = 0,
+                    last_error_code = (string?)null,
+                    last_error_message = (string?)null,
+                }, MailboxWireJson.Options));
         }
 
         public void Dispose() => Directory.Delete(Root, recursive: true);

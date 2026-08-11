@@ -3,13 +3,86 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using DDAI.App.Assets;
 using DDAI.Core.Assets;
+using DDAI.Core.Mailbox;
 
 namespace DDAI.App.Tests.Assets;
 
 public sealed class AssetCatalogRepositoryTests
 {
+    [Fact]
+    public void AcceptedSnapshot_RemainsLiveOnlyForFreshMatchingPublishedProducerReceipt()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete(
+            CatalogSandbox.Now - AssetCatalogRepository.MaximumLiveAge - TimeSpan.FromSeconds(1));
+        sandbox.WriteProgressReceipt(sandbox.SessionId, CatalogSandbox.Now, "published");
+
+        var matching = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
+        Assert.True(matching.TryRefresh());
+        var accepted = Assert.IsType<AcceptedAssetCatalog>(matching.GetCurrent());
+        Assert.True(accepted.Live);
+
+        sandbox.TimeProvider.Now += AssetCatalogRepository.MaximumProducerHeartbeatAge + TimeSpan.FromSeconds(1);
+        Assert.False(accepted.Live);
+        sandbox.TimeProvider.Now = CatalogSandbox.Now;
+
+        File.WriteAllText(
+            Path.Combine(sandbox.MailboxRoot, "private", "asset-catalog-progress", "progress-slot-0.json"),
+            "{");
+        sandbox.WriteProgressReceipt(sandbox.SessionId, CatalogSandbox.Now, "published", slot: 1);
+        var recovered = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
+        Assert.True(recovered.TryRefresh());
+        Assert.True(Assert.IsType<AcceptedAssetCatalog>(recovered.GetCurrent()).Live);
+        File.Delete(Path.Combine(sandbox.MailboxRoot, "private", "asset-catalog-progress", "progress-slot-1.json"));
+
+        sandbox.WriteProgressReceipt("other-session", CatalogSandbox.Now, "published");
+        var mismatched = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
+        Assert.True(mismatched.TryRefresh());
+        Assert.False(Assert.IsType<AcceptedAssetCatalog>(mismatched.GetCurrent()).Live);
+
+        sandbox.WriteProgressReceipt(sandbox.SessionId, CatalogSandbox.Now - TimeSpan.FromSeconds(31), "published");
+        var stale = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
+        Assert.True(stale.TryRefresh());
+        Assert.False(Assert.IsType<AcceptedAssetCatalog>(stale.GetCurrent()).Live);
+
+        sandbox.WriteProgressReceipt(sandbox.SessionId, CatalogSandbox.Now, "failed");
+        var failed = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
+        Assert.True(failed.TryRefresh());
+        Assert.False(Assert.IsType<AcceptedAssetCatalog>(failed.GetCurrent()).Live);
+    }
+
+    [Fact]
+    public void AcceptedSnapshot_RejectsMissingDuplicateAndImpossibleProgressFields()
+    {
+        using var sandbox = CatalogSandbox.CreateComplete(
+            CatalogSandbox.Now - AssetCatalogRepository.MaximumLiveAge - TimeSpan.FromSeconds(1));
+
+        var missing = sandbox.CreateProgressReceipt(sandbox.SessionId, CatalogSandbox.Now, "published");
+        Assert.True(missing.Remove("library_texture_index"));
+        sandbox.WriteRawProgressReceipt(missing.ToJsonString(MailboxWireJson.Options));
+        var missingRepository = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
+        Assert.True(missingRepository.TryRefresh());
+        Assert.False(Assert.IsType<AcceptedAssetCatalog>(missingRepository.GetCurrent()).Live);
+
+        var duplicate = sandbox.CreateProgressReceipt(sandbox.SessionId, CatalogSandbox.Now, "published")
+            .ToJsonString(MailboxWireJson.Options);
+        sandbox.WriteRawProgressReceipt(duplicate[..^1] + ",\"entry_count\":14}");
+        var duplicateRepository = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
+        Assert.True(duplicateRepository.TryRefresh());
+        Assert.False(Assert.IsType<AcceptedAssetCatalog>(duplicateRepository.GetCurrent()).Live);
+
+        var impossible = sandbox.CreateProgressReceipt(sandbox.SessionId, CatalogSandbox.Now, "published");
+        impossible["enumeration_raw_index"] = int.MaxValue;
+        impossible["asset_index"] = 1;
+        impossible["error_count"] = int.MaxValue;
+        sandbox.WriteRawProgressReceipt(impossible.ToJsonString(MailboxWireJson.Options));
+        var impossibleRepository = new AssetCatalogRepository(sandbox.Root, sandbox.TimeProvider);
+        Assert.True(impossibleRepository.TryRefresh());
+        Assert.False(Assert.IsType<AcceptedAssetCatalog>(impossibleRepository.GetCurrent()).Live);
+    }
+
     [Fact]
     public void OptInIsolatedLiveCatalogCopy_PreservesExactEntriesAndPreviewCoverage()
     {
@@ -509,7 +582,7 @@ public sealed class AssetCatalogRepositoryTests
             PreviewsPath = Path.Combine(Root, "previews");
             Directory.CreateDirectory(SnapshotsPath);
             Directory.CreateDirectory(PreviewsPath);
-            TimeProvider = new FixedTimeProvider();
+            TimeProvider = new FixedTimeProvider(Now);
             PublishCompleteRevision(snapshotAt);
         }
 
@@ -524,6 +597,46 @@ public sealed class AssetCatalogRepositoryTests
         public string ChunkPath => Path.Combine(SnapshotPath, "assets-000.json");
         public string CurrentPath => Path.Combine(Root, "current.json");
         public string ManifestRelativePath => "snapshot-1/manifest.json";
+
+        public void WriteProgressReceipt(string sessionId, DateTimeOffset timestamp, string state, int slot = 0)
+        {
+            var directory = Path.Combine(MailboxRoot, "private", "asset-catalog-progress");
+            Directory.CreateDirectory(directory);
+            File.WriteAllText(
+                Path.Combine(directory, $"progress-slot-{slot}.json"),
+                CreateProgressReceipt(sessionId, timestamp, state).ToJsonString(MailboxWireJson.Options));
+        }
+
+        public JsonObject CreateProgressReceipt(string sessionId, DateTimeOffset timestamp, string state) => new()
+        {
+            ["schema_version"] = "1.0",
+            ["session_id"] = sessionId,
+            ["timestamp"] = JsonValue.Create(timestamp),
+            ["state"] = state,
+            ["phase"] = state,
+            ["library_key_count"] = 538,
+            ["library_key_index"] = 538,
+            ["library_texture_index"] = 0,
+            ["library_associations_processed"] = 6090,
+            ["category_index"] = 14,
+            ["category_count"] = 14,
+            ["enumeration_raw_count"] = 0,
+            ["enumeration_raw_index"] = 0,
+            ["enumerated_asset_count"] = 14,
+            ["asset_category_index"] = 14,
+            ["asset_index"] = 0,
+            ["entry_count"] = 14,
+            ["error_count"] = 0,
+            ["last_error_code"] = null,
+            ["last_error_message"] = null,
+        };
+
+        public void WriteRawProgressReceipt(string json, int slot = 0)
+        {
+            var directory = Path.Combine(MailboxRoot, "private", "asset-catalog-progress");
+            Directory.CreateDirectory(directory);
+            File.WriteAllText(Path.Combine(directory, $"progress-slot-{slot}.json"), json);
+        }
 
         public static CatalogSandbox CreateComplete(DateTimeOffset? snapshotAt = null) => new(snapshotAt ?? Now);
 
@@ -693,9 +806,11 @@ public sealed class AssetCatalogRepositoryTests
             Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
     }
 
-    private sealed class FixedTimeProvider : TimeProvider
+    private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
     {
-        public override DateTimeOffset GetUtcNow() => CatalogSandbox.Now;
+        public DateTimeOffset Now { get; set; } = now;
+
+        public override DateTimeOffset GetUtcNow() => Now;
     }
 
     private static void CreateDirectoryJunction(string linkPath, string targetPath)

@@ -6,7 +6,9 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using DDAI.Core.Assets;
+using DDAI.Core.Mailbox;
 using Microsoft.Win32.SafeHandles;
 
 [assembly: System.Runtime.CompilerServices.InternalsVisibleTo("DDAI.App.Tests")]
@@ -16,15 +18,18 @@ namespace DDAI.App.Assets;
 public sealed class AcceptedAssetCatalog
 {
     private readonly TimeProvider timeProvider;
+    private readonly DateTimeOffset? producerHeartbeatAt;
 
     internal AcceptedAssetCatalog(
         AssetCatalogManifest manifest,
         ImmutableArray<AssetCatalogEntry> entries,
-        TimeProvider timeProvider)
+        TimeProvider timeProvider,
+        DateTimeOffset? producerHeartbeatAt = null)
     {
         Manifest = manifest;
         Entries = entries;
         this.timeProvider = timeProvider;
+        this.producerHeartbeatAt = producerHeartbeatAt;
     }
 
     public AssetCatalogManifest Manifest { get; }
@@ -40,17 +45,60 @@ public sealed class AcceptedAssetCatalog
         }
     }
 
-    public bool Live => Age <= AssetCatalogRepository.MaximumLiveAge;
+    public bool Live
+    {
+        get
+        {
+            var now = timeProvider.GetUtcNow();
+            var age = now - Manifest.SnapshotAt;
+            return IsLiveAt(now, age < TimeSpan.Zero ? TimeSpan.Zero : age);
+        }
+    }
+
+    internal bool IsLiveAt(DateTimeOffset now, TimeSpan age) =>
+        age <= AssetCatalogRepository.MaximumLiveAge ||
+        producerHeartbeatAt is not null &&
+        producerHeartbeatAt >= now - AssetCatalogRepository.MaximumProducerHeartbeatAge &&
+        producerHeartbeatAt <= now + AssetCatalogRepository.MaximumProducerHeartbeatFutureSkew;
 }
 
 public sealed class AssetCatalogRepository
 {
     public const int MaximumPreviewBytes = 262_144;
+    public const int MaximumProgressReceiptBytes = 4_096;
     public static readonly TimeSpan MaximumLiveAge = TimeSpan.FromSeconds(45);
+    public static readonly TimeSpan MaximumProducerHeartbeatAge = TimeSpan.FromSeconds(30);
+    internal static readonly TimeSpan MaximumProducerHeartbeatFutureSkew = TimeSpan.FromSeconds(5);
+    private static readonly JsonSerializerOptions ProgressJsonOptions = CreateProgressJsonOptions();
+    private static readonly HashSet<string> ProgressReceiptProperties = new(StringComparer.Ordinal)
+    {
+        "schema_version",
+        "session_id",
+        "timestamp",
+        "state",
+        "phase",
+        "library_key_count",
+        "library_key_index",
+        "library_texture_index",
+        "library_associations_processed",
+        "category_index",
+        "category_count",
+        "enumeration_raw_count",
+        "enumeration_raw_index",
+        "enumerated_asset_count",
+        "asset_category_index",
+        "asset_index",
+        "entry_count",
+        "error_count",
+        "last_error_code",
+        "last_error_message",
+    };
 
     private readonly string catalogRoot;
     private readonly string snapshotsRoot;
     private readonly string previewsRoot;
+    private readonly string mailboxRoot;
+    private readonly string progressRoot;
     private readonly string? generatedDataRoot;
     private readonly string? generatedRoot;
     private readonly string? generatedManifestRoot;
@@ -82,8 +130,11 @@ public sealed class AssetCatalogRepository
         }
 
         this.catalogRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(catalogRoot));
+        mailboxRoot = Path.GetDirectoryName(this.catalogRoot)
+            ?? throw new InvalidDataException("The catalog root must have a mailbox parent.");
         snapshotsRoot = Path.Combine(this.catalogRoot, "snapshots");
         previewsRoot = Path.Combine(this.catalogRoot, "previews");
+        progressRoot = Path.Combine(mailboxRoot, "private", "asset-catalog-progress");
         if (hasGeneratedAssetRoot)
         {
             this.generatedDataRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(generatedAssetDataRoot!));
@@ -318,8 +369,146 @@ public sealed class AssetCatalogRepository
             }
         }
 
-        return new AcceptedAssetCatalog(FreezeManifest(manifest), entries.ToImmutableArray(), timeProvider);
+        var frozenManifest = FreezeManifest(manifest);
+        var frozenEntries = entries.ToImmutableArray();
+        return new AcceptedAssetCatalog(
+            frozenManifest,
+            frozenEntries,
+            timeProvider,
+            ReadProducerHeartbeatAt(frozenManifest.SessionId, frozenEntries.Length));
     }
+
+    private DateTimeOffset? ReadProducerHeartbeatAt(string expectedSessionId, int expectedEntryCount)
+    {
+        try
+        {
+            RequireExistingOrdinaryDirectory(mailboxRoot, "Mailbox root");
+            RequireExistingOrdinaryDirectory(progressRoot, "Asset catalog progress directory");
+            var now = timeProvider.GetUtcNow();
+            for (var slot = 0; slot < 8; slot++)
+            {
+                try
+                {
+                    var path = Path.Combine(progressRoot, $"progress-slot-{slot}.json");
+                    if (!File.Exists(path))
+                    {
+                        continue;
+                    }
+
+                    RequireOrdinaryPath(progressRoot, path);
+                    var receipt = DeserializeProgressReceipt(
+                        ReadBoundedFile(path, MaximumProgressReceiptBytes));
+                    if (receipt is not null && IsFreshMatchingPublishedReceipt(
+                            receipt,
+                            expectedSessionId,
+                            expectedEntryCount,
+                            now))
+                    {
+                        return receipt.Timestamp;
+                    }
+                }
+                catch (Exception exception) when (IsRecoverableCatalogFailure(exception))
+                {
+                }
+            }
+        }
+        catch (Exception exception) when (IsRecoverableCatalogFailure(exception))
+        {
+        }
+
+        return null;
+    }
+
+    private static bool IsFreshMatchingPublishedReceipt(
+        CatalogProducerProgressReceipt receipt,
+        string expectedSessionId,
+        int expectedEntryCount,
+        DateTimeOffset now)
+    {
+        return receipt.SchemaVersion == AssetCatalogManifest.CurrentSchemaVersion &&
+               string.Equals(receipt.SessionId, expectedSessionId, StringComparison.Ordinal) &&
+               receipt.State == "published" &&
+               receipt.Phase == "published" &&
+               receipt.Timestamp >= now - MaximumProducerHeartbeatAge &&
+               receipt.Timestamp <= now + MaximumProducerHeartbeatFutureSkew &&
+               receipt.LibraryKeyCount is >= 0 and <= 8_192 &&
+               receipt.LibraryKeyIndex == receipt.LibraryKeyCount &&
+               receipt.LibraryTextureIndex == 0 &&
+               receipt.LibraryAssociationsProcessed >= 0 &&
+               receipt.LibraryAssociationsProcessed <= (long)receipt.LibraryKeyCount * 4_096 &&
+               receipt.CategoryCount == AssetCategory.All.Count &&
+               receipt.CategoryIndex == receipt.CategoryCount &&
+               receipt.EnumerationRawCount == 0 &&
+               receipt.EnumerationRawIndex == 0 &&
+               receipt.EnumeratedAssetCount == expectedEntryCount &&
+               receipt.AssetCategoryIndex == receipt.CategoryCount &&
+               receipt.AssetIndex == 0 &&
+               receipt.EntryCount == expectedEntryCount &&
+               receipt.ErrorCount >= 0 &&
+               receipt.ErrorCount <= (long)receipt.LibraryKeyCount + 4L * expectedEntryCount + 32 &&
+               ((receipt.ErrorCount == 0 && receipt.LastErrorCode is null && receipt.LastErrorMessage is null) ||
+                (receipt.ErrorCount > 0 &&
+                 IsBoundedProgressText(receipt.LastErrorCode, 64) &&
+                 IsBoundedProgressText(receipt.LastErrorMessage, 512)));
+    }
+
+    private static CatalogProducerProgressReceipt? DeserializeProgressReceipt(byte[] bytes)
+    {
+        using var document = JsonDocument.Parse(bytes);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            throw new JsonException("Asset catalog progress receipt must be an object.");
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var property in document.RootElement.EnumerateObject())
+        {
+            if (!ProgressReceiptProperties.Contains(property.Name) || !seen.Add(property.Name))
+            {
+                throw new JsonException("Asset catalog progress receipt has an invalid property set.");
+            }
+        }
+
+        if (seen.Count != ProgressReceiptProperties.Count)
+        {
+            throw new JsonException("Asset catalog progress receipt is missing a required property.");
+        }
+
+        return JsonSerializer.Deserialize<CatalogProducerProgressReceipt>(bytes, ProgressJsonOptions);
+    }
+
+    private static bool IsBoundedProgressText(string? value, int maximumBytes) =>
+        !string.IsNullOrWhiteSpace(value) && Encoding.UTF8.GetByteCount(value) <= maximumBytes;
+
+    private static JsonSerializerOptions CreateProgressJsonOptions()
+    {
+        return new JsonSerializerOptions(MailboxWireJson.Options)
+        {
+            UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
+        };
+    }
+
+    private sealed record CatalogProducerProgressReceipt(
+        string SchemaVersion,
+        string SessionId,
+        DateTimeOffset Timestamp,
+        string State,
+        string Phase,
+        int LibraryKeyCount,
+        int LibraryKeyIndex,
+        int LibraryTextureIndex,
+        int LibraryAssociationsProcessed,
+        int CategoryIndex,
+        int CategoryCount,
+        int EnumerationRawCount,
+        int EnumerationRawIndex,
+        int EnumeratedAssetCount,
+        int AssetCategoryIndex,
+        int AssetIndex,
+        int EntryCount,
+        int ErrorCount,
+        string? LastErrorCode,
+        string? LastErrorMessage);
 
     private string ResolveSnapshotPath(string manifestRelativePath)
     {
