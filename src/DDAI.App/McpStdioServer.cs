@@ -42,6 +42,7 @@ public static class McpStdioServer
         });
         builder.Services.AddSingleton<DdaiStatusService>();
         builder.Services.AddSingleton<DdaiPlanService>();
+        builder.Services.AddSingleton<DdaiMapInspectionService>();
         builder.Services.AddSingleton<DdaiCapabilityService>();
         builder.Services.AddSingleton(new DdaiMcpRuntimeOptions(options.Timeout));
         builder.Services
@@ -54,7 +55,8 @@ public static class McpStdioServer
             .WithStdioServerTransport()
             .WithTools<DdaiTools>()
             .WithTools<DdaiCapabilityTools>()
-            .WithTools<DdaiAssetTools>();
+            .WithTools<DdaiAssetTools>()
+            .WithTools<DdaiMapTools>();
 
         await builder.Build().RunAsync(cancellationToken);
     }

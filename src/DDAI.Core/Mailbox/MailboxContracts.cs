@@ -1,5 +1,6 @@
 using System.Text.Json;
 using DDAI.Core.MapPlans;
+using DDAI.Core.Maps;
 
 namespace DDAI.Core.Mailbox;
 
@@ -37,6 +38,24 @@ public sealed record MailboxRequest
             Command = "apply_plan",
             Timestamp = timestamp,
             Payload = MapPlanJson.SerializeToElement(plan),
+        };
+    }
+
+    public static MailboxRequest CreateInspectMap(
+        string requestId,
+        MapInspectionQuery query,
+        DateTimeOffset timestamp)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(requestId);
+        MapSnapshotJson.ValidateQuery(query);
+
+        return new MailboxRequest
+        {
+            SchemaVersion = CurrentSchemaVersion,
+            RequestId = requestId,
+            Command = "inspect_map",
+            Timestamp = timestamp,
+            Payload = MapSnapshotJson.SerializeQueryToElement(query),
         };
     }
 }
