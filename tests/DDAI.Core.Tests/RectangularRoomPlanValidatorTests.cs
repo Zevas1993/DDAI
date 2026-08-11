@@ -165,7 +165,7 @@ public sealed class RectangularRoomPlanValidatorTests
 
     private static MapPlan ValidPlan() => new()
     {
-        SchemaVersion = MapPlan.CurrentSchemaVersion,
+        SchemaVersion = MapPlan.LegacySchemaVersion,
         RequestId = "room-job-001",
         BaseRevision = 0,
         Mode = MapOperationMode.Add,

@@ -8,6 +8,14 @@ public static class RectangularRoomPlanValidator
 
         var issues = new List<MapPlanValidationIssue>(MapPlanValidator.Validate(plan).Issues);
 
+        if (string.Equals(plan.SchemaVersion, MapPlan.CurrentSchemaVersion, StringComparison.Ordinal))
+        {
+            issues.Insert(0, new MapPlanValidationIssue(
+                "unsupported_schema_version",
+                "schema_version",
+                "Rectangular room plans require schema version 1.0."));
+        }
+
         if (plan.Mode != MapOperationMode.Add)
         {
             issues.Add(new MapPlanValidationIssue(

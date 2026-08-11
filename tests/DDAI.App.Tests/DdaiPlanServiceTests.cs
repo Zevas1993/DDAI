@@ -155,7 +155,7 @@ public sealed class DdaiPlanServiceTests
 
     private static MapPlan ValidPlan(string requestId) => new()
     {
-        SchemaVersion = MapPlan.CurrentSchemaVersion,
+        SchemaVersion = MapPlan.LegacySchemaVersion,
         RequestId = requestId,
         BaseRevision = 0,
         Mode = MapOperationMode.Add,

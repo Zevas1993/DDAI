@@ -34,7 +34,7 @@ public sealed class MailboxBridgeConformanceTests
         {
             var plan = new MapPlan
             {
-                SchemaVersion = MapPlan.CurrentSchemaVersion,
+                SchemaVersion = MapPlan.LegacySchemaVersion,
                 RequestId = "mutation-size-001",
                 BaseRevision = 0,
                 Mode = MapOperationMode.Add,

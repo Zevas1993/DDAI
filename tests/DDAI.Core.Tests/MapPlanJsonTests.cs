@@ -12,7 +12,7 @@ public sealed class MapPlanJsonTests
     {
         var plan = new MapPlan
         {
-            SchemaVersion = MapPlan.CurrentSchemaVersion,
+            SchemaVersion = MapPlan.LegacySchemaVersion,
             RequestId = "request-003",
             BaseRevision = 7,
             Mode = MapOperationMode.Add,
@@ -114,7 +114,7 @@ public sealed class MapPlanJsonTests
     public void Deserialize_RejectsInvalidEnvelopeValuesWithStableIssues()
     {
         const string Json =
-            "{\"schema_version\":\"2.0\",\"request_id\":\"   \",\"base_revision\":-1,\"mode\":\"add\",\"canvas\":{\"width\":0,\"height\":0}}";
+            "{\"schema_version\":\"3.0\",\"request_id\":\"   \",\"base_revision\":-1,\"mode\":\"add\",\"canvas\":{\"width\":0,\"height\":0}}";
 
         var exception = Assert.Throws<MapPlanValidationException>(
             () => MapPlanJson.Deserialize(Json));
@@ -163,7 +163,7 @@ public sealed class MapPlanJsonTests
 
     private static MapPlan ValidPlan() => new()
     {
-        SchemaVersion = MapPlan.CurrentSchemaVersion,
+        SchemaVersion = MapPlan.LegacySchemaVersion,
         RequestId = "room-job-001",
         BaseRevision = 0,
         Mode = MapOperationMode.Add,

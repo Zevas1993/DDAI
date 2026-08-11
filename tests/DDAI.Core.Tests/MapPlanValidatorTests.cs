@@ -9,7 +9,7 @@ public sealed class MapPlanValidatorTests
     {
         var plan = new MapPlan
         {
-            SchemaVersion = "2.0",
+            SchemaVersion = "3.0",
             RequestId = "request-001",
             BaseRevision = 0,
             Mode = MapOperationMode.Add,
@@ -28,7 +28,7 @@ public sealed class MapPlanValidatorTests
     {
         var plan = new MapPlan
         {
-            SchemaVersion = MapPlan.CurrentSchemaVersion,
+            SchemaVersion = MapPlan.LegacySchemaVersion,
             RequestId = "   ",
             BaseRevision = 0,
             Mode = MapOperationMode.Add,
@@ -61,7 +61,7 @@ public sealed class MapPlanValidatorTests
     {
         var plan = new MapPlan
         {
-            SchemaVersion = MapPlan.CurrentSchemaVersion,
+            SchemaVersion = MapPlan.LegacySchemaVersion,
             RequestId = "request-002",
             BaseRevision = -1,
             Mode = MapOperationMode.Add,
@@ -80,7 +80,7 @@ public sealed class MapPlanValidatorTests
     {
         var plan = new MapPlan
         {
-            SchemaVersion = MapPlan.CurrentSchemaVersion,
+            SchemaVersion = MapPlan.LegacySchemaVersion,
             RequestId = "request-005",
             BaseRevision = 0,
             Mode = MapOperationMode.Add,
@@ -99,7 +99,7 @@ public sealed class MapPlanValidatorTests
     {
         var plan = new MapPlan
         {
-            SchemaVersion = MapPlan.CurrentSchemaVersion,
+            SchemaVersion = MapPlan.LegacySchemaVersion,
             RequestId = "request-006",
             BaseRevision = 0,
             Mode = MapOperationMode.Add,
@@ -118,7 +118,7 @@ public sealed class MapPlanValidatorTests
     {
         var plan = new MapPlan
         {
-            SchemaVersion = "2.0",
+            SchemaVersion = "3.0",
             RequestId = string.Empty,
             BaseRevision = -1,
             Mode = MapOperationMode.Add,
@@ -143,7 +143,7 @@ public sealed class MapPlanValidatorTests
     {
         var plan = new MapPlan
         {
-            SchemaVersion = MapPlan.CurrentSchemaVersion,
+            SchemaVersion = MapPlan.LegacySchemaVersion,
             RequestId = "request-007",
             BaseRevision = 0,
             Mode = MapOperationMode.Add,
@@ -161,7 +161,7 @@ public sealed class MapPlanValidatorTests
     {
         var plan = ValidPlan() with
         {
-            SchemaVersion = "2.0",
+            SchemaVersion = "3.0",
             Rooms = null!,
         };
 
@@ -177,7 +177,7 @@ public sealed class MapPlanValidatorTests
 
     private static MapPlan ValidPlan() => new()
     {
-        SchemaVersion = MapPlan.CurrentSchemaVersion,
+        SchemaVersion = MapPlan.LegacySchemaVersion,
         RequestId = "room-job-001",
         BaseRevision = 0,
         Mode = MapOperationMode.Add,

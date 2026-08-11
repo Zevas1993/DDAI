@@ -29,6 +29,10 @@ public static class MapPlanValidator
         if (!string.Equals(
                 plan.SchemaVersion,
                 MapPlan.CurrentSchemaVersion,
+                StringComparison.Ordinal) &&
+            !string.Equals(
+                plan.SchemaVersion,
+                MapPlan.LegacySchemaVersion,
                 StringComparison.Ordinal))
         {
             issues.Add(new MapPlanValidationIssue(
