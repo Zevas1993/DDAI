@@ -73,6 +73,14 @@ public sealed class DdaiStatusService
     {
         _ = catalogRepository.TryRefresh();
         var catalog = catalogRepository.GetCurrent();
+        var catalogAge = catalog is null
+            ? (TimeSpan?)null
+            : timeProvider.GetUtcNow() - catalog.Manifest.SnapshotAt;
+        if (catalogAge < TimeSpan.Zero)
+        {
+            catalogAge = TimeSpan.Zero;
+        }
+
         return new DdaiStatusResult(
             success,
             command,
@@ -80,8 +88,8 @@ public sealed class DdaiStatusService
             error,
             ReadMapRevision(payload),
             catalog?.Manifest.CatalogRevision,
-            catalog is null ? null : (long)catalog.Age.TotalMilliseconds,
-            catalog?.Live,
+            catalogAge is null ? null : (long)Math.Ceiling(catalogAge.Value.TotalMilliseconds),
+            catalogAge is null ? null : catalogAge <= AssetCatalogRepository.MaximumLiveAge,
             catalog?.Manifest.Complete,
             catalog?.Entries.Count,
             catalog?.Manifest.Errors.ToArray() ?? [],

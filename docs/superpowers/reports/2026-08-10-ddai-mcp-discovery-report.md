@@ -22,14 +22,15 @@ The snake-case MCP/CLI status document adds:
 - `catalog_errors`, preserving the accepted manifest's code, message, and category records; and
 - `bridge_capabilities`, preserving the exact ordered `supported_commands` list returned by the bridge.
 
-Unavailable catalog fields remain `null` and catalog errors remain an empty list. Malformed optional enrichment fields are not promoted into synthetic capabilities and do not change the underlying mailbox success/error result. The bridge response is bounded by the 1 MiB atomic-mailbox contract, and the accepted manifest/errors are bounded by the 1 MiB catalog JSON contract.
+Unavailable catalog fields remain `null` and catalog errors remain an empty list. Malformed optional enrichment fields are not promoted into synthetic capabilities and do not change the underlying mailbox success/error result. Catalog age and liveness are now derived from one clock sample; age milliseconds use a ceiling so the document cannot report `45000` with `catalog_live: false`. The bridge response is bounded by the 1 MiB atomic-mailbox contract, and the accepted manifest/errors are bounded by the 1 MiB catalog JSON contract.
 
 TDD receipt:
 
 - RED: `dotnet test tests\DDAI.App.Tests\DDAI.App.Tests.csproj -c Release --no-restore --filter FullyQualifiedName~Status_EnrichesTheUnchangedBridgeResponseWithBoundedDiscoveryState`
   - failed 1/1 with `KeyNotFoundException` at the first missing enriched status field;
 - GREEN: the same command passed 1/1;
-- wider status regression: `FullyQualifiedName~CliAndStatusTests|FullyQualifiedName~Status_EnrichesTheUnchangedBridgeResponseWithBoundedDiscoveryState` passed 13/13.
+- round-one RED: the focused one-clock/absent/malformed/failed-response command failed 1/3 because the old double sample returned `catalog_live: false` at the exact 45-second age;
+- round-one GREEN: the enriched, one-clock, absent/malformed, and failed-response status slice passed 4/4. The added cases preserve the exact failed mailbox `success`, `command`, cloned `payload`, and structured `error` while keeping malformed optional fields unpromoted.
 
 ## Published MCP acceptance
 
@@ -46,7 +47,22 @@ TDD receipt:
 | `ddai_validate_plan` | `plan` | true | false | true | false |
 | `ddai_apply_plan` | `plan` | false | true | true | false |
 
-Schema assertions covered all top-level parameters, the nine search fields (`query`, `categories`, `tags`, `packIds`, `generated`, `previewRequired`, `includeStagedGenerated`, `limit`, `cursor`), the four inspection fields (`region`, `level`, `limit`, `cursor`), the preview reference, and all eight import fields already covered by the dedicated published import test.
+The committed [acceptance receipt](./2026-08-10-ddai-mcp-acceptance-receipt.json) is the canonical full-schema snapshot. The official client deep-compares every complete `inputSchema`, not selected names. It therefore locks object/array/scalar/null types, every required array, the complete canvas/room/region/import/search nesting, list item types, search/inspection defaults, and the plan-mode `Add`/`Replace`/`Patch` enum emitted by ModelContextProtocol 1.4.1. The receipt is 5,794 bytes with SHA-256 `8aadb9b7d306d678ccafeb1d356ea552235ca79a2215046742a39a46668dd0d6`.
+
+The exact schema shapes are:
+
+| Tool | Required input and nested schema constraints |
+|---|---|
+| `ddai_status` | object with no properties |
+| `ddai_get_capabilities` | object with no properties |
+| `ddai_get_asset_preview` | required string `assetRef` |
+| `ddai_search_assets` | required object `query`; nine typed nullable/defaulted fields; string items for categories, pack IDs, and tags |
+| `ddai_import_asset` | required object `request`; all eight generated fields in its required array; string-array tags; nullable string content/inbox alternatives |
+| `ddai_inspect_map` | required object `query`; nullable region with required numeric `x`, `y`, `width`, `height`; nullable level/cursor and integer limit default 100 |
+| `ddai_validate_plan` | required object `plan`; required schema/request/base/mode/canvas; required integer canvas dimensions; typed room array with five required item fields |
+| `ddai_apply_plan` | same complete plan schema as validate |
+
+Runtime bounds such as limit 100/500 are enforced and acceptance-tested below, but the generated schemas do not encode numeric `minimum`/`maximum` keywords. This report does not claim otherwise.
 
 The acceptance used an isolated real `AtomicMailbox`, a fake bridge with exact `status`/`apply_plan`/`inspect_map` behavior, a cryptographically validated accepted catalog, and the real generated-asset store. Observed result shapes were:
 
@@ -57,9 +73,18 @@ The acceptance used an isolated real `AtomicMailbox`, a fake bridge with exact `
 - validate/apply: one JSON text block each;
 - expected failures: `isError: true` with matching JSON text/structured content and stable `invalid_request` or `asset_not_found` codes.
 
-The same client imported `Cross Tool Lantern`, then searched with `generated: true` and `includeStagedGenerated: true`; the returned staged `asset_ref` matched `sha256:<generated_asset_id>`, `generated` was true, and `placeable` was false. A deliberately unanswered inspection was cancelled through the official client and surfaced as `OperationCanceledException`. Search limit 101 and inspection limit 501 were rejected as `invalid_request`. A missing preview reference was shaped as `asset_not_found`.
+The same client imported `Cross Tool Lantern`, then searched with `generated: true` and `includeStagedGenerated: true`; the returned staged `asset_ref` matched `sha256:<generated_asset_id>`, `generated` was true, and `placeable` was false. Search limit 101 and inspection limit 501 were rejected as `invalid_request`. A missing preview reference was shaped as `asset_not_found`.
 
-The direct stdout capture test parsed every non-empty stdout line as JSON-RPC 2.0 and found no contamination. The complete `McpPublishedIntegrationTests` slice passed 6/6.
+Cancellation is no longer inferred from a local SDK token. The official 1.4.1 client sends a low-level `tools/call` with request ID 200, waits until the real mailbox peer has claimed the correlated processing file, then sends `notifications/cancelled` through `SendNotificationAsync`. Server stderr records the resulting `OperationCanceledException` before the local wait token is cancelled. The test verifies no mailbox response existed at cancellation, calls status successfully, deliberately publishes the late bridge response, verifies the processing-to-response transition, and calls capabilities successfully afterward.
+
+The independent raw harness initializes, lists, and invokes all eight tools, including import-then-search, image, inspection, status, capability, mutation, validation, and shaped-error paths. It also sends request ID 20 plus `notifications/cancelled`, publishes a late mailbox response, and proves stdout never contains ID 20. Every nonempty stdout line/frame—initialization, list, eight tools, the second search, error, and post-cancellation status—is parsed as a JSON-RPC 2.0 response. Expected cancellation diagnostics remain on stderr only. The complete `McpPublishedIntegrationTests` slice passed 9/9.
+
+Round-one acceptance RED/GREEN:
+
+- retained artifact/schema RED: the published preview test failed 1/1 on the intentionally missing committed receipt; GREEN passed 1/1 after publishing and executing the exact retained path and matching the receipt;
+- raw breadth RED: the exact tool-set assertion failed 1/1 with only `ddai_get_asset_preview` observed; GREEN passed 1/1 with all eight tools and all stdout frames parsed;
+- cancellation RED: merely cancelling the high-level SDK call left the server diagnostic queue empty even after the bridge had claimed the request; GREEN passed 1/1 after explicit official-SDK `notifications/cancelled` tied to request ID 200;
+- complete focused published acceptance: 9/9 passed.
 
 ## Limits verified or advertised
 
@@ -83,20 +108,21 @@ The direct stdout capture test parsed every non-empty stdout line as JSON-RPC 2.
 - Files in publish directory: 1
 - Runtime: self-contained `win-x64`
 - Size: 86,871,226 bytes
-- SHA-256: `32e99cce9fc07b6e70cfa4555e02fdf2a1d206fb0c5cceaf972aec4843a1c67e`
+- SHA-256: `7e666846bf938bdfeed92e24247bd6da8a2165487e4d9fb041d8b310f3380945`
 
-The artifact directory is machine-local/ignored evidence and is not part of the source commit.
+Every published-process acceptance test runs this exact retained path and rechecks both size and hash against the committed receipt before process launch. The artifact directory is machine-local/ignored evidence and is not part of the source commit.
 
 ## Verification receipts
 
-- `dotnet test DDAI.slnx -c Release --no-restore`: 325/325 Core and 307/307 App tests passed; 632/632 total.
+- `dotnet test DDAI.slnx -c Release --no-restore`: fresh final rerun passed 325/325 Core and 310/310 App tests; 635/635 total. The first full attempt observed one non-reproducible unrelated catalog quarantine count (`5` instead of `8`); the exact test then passed 1/1 and the unchanged full suite passed cleanly on rerun.
 - `dotnet build DDAI.slnx -c Release --no-restore`: succeeded with 0 warnings and 0 errors.
 - `dotnet list DDAI.slnx package --vulnerable --include-transitive`: no vulnerable packages for `DDAI.App`, `DDAI.Core`, both test projects, or `DDAI.McpProbe` using the configured NuGet sources.
+- `dotnet format src\DDAI.App\DDAI.App.csproj --verify-no-changes --no-restore` and the same scoped to `tests\DDAI.App.Tests\McpPublishedIntegrationTests.cs`: passed. `dotnet format` 9.0.201 cannot parse `DDAI.slnx`; unscoped test-project verification also reports a pre-existing whitespace issue in untouched `AssetCatalogRepositoryTests.cs:537`.
 - PowerShell AST for `tools/Install-DDAIMod.ps1`: 0 parse errors, 1,462 tokens.
 - Pinned Godot 3.5.3 exact bridge parser, exact bounded inspection behavior, and package listener test: 3/3 passed with empty parser/behavior stderr.
 - Durable network-listener scan across `src`, `mods`, and `tools`: 0 listener hits.
-- `git diff --check`: clean before report creation; rerun immediately before commit.
-- GitNexus pre-change impact: `DdaiStatusService` LOW (2 direct callers, 1 affected `RunAsync` flow); `McpStdioServer` LOW (0 upstream dependents). The final staged-only detector reported HIGH across 46 changed symbols and 12 affected processes because it counted the expanded integration harness and the status/host registrations. Its four files were exactly the Task 6 scope, and its affected processes were confined to expected `GetStatusAsync` mailbox paths and `McpStdioServer.RunAsync` registration paths.
+- `git diff --check`: rerun immediately before the scoped commit.
+- GitNexus round-one pre-change impact: `DdaiStatusService` LOW (2 direct callers, 1 affected `RunAsync` flow); `McpPublishedIntegrationTests` and `McpStdioServer` LOW (0 upstream dependents). Final staged-only detection reported LOW across 50 changed symbols, 0 affected execution flows, and exactly the four Task 6 fix files; most indexed changes are acceptance-test locals/helpers, with the production blast radius already covered by the pre-change status analysis.
 
 ## Remaining live gaps
 

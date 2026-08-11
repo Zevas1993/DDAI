@@ -89,12 +89,120 @@ public sealed class McpPublishedIntegrationTests
         Assert.Equal(bridgeCapabilities, wire.GetProperty("bridge_capabilities").EnumerateArray().Select(item => item.GetString()).ToArray());
     }
 
-    [Fact(Timeout = 120_000)]
-    public async Task PublishedAssetPreview_EmitsOnlyJsonRpcFramesOnStdout()
+    [Fact]
+    public async Task Status_UsesOneClockSampleForCatalogAgeAndLiveness()
     {
         using var sandbox = new TestDirectory();
-        var asset = sandbox.PublishAcceptedAssetCatalog(includePreview: true);
-        var executable = PublishSingleFile(sandbox.PublishDirectory);
+        var snapshotAt = DateTimeOffset.Parse("2026-08-10T20:00:00Z");
+        sandbox.PublishAcceptedAssetCatalog(snapshotAt: snapshotAt);
+        var clock = new SequenceTimeProvider(
+            snapshotAt + AssetCatalogRepository.MaximumLiveAge,
+            snapshotAt + AssetCatalogRepository.MaximumLiveAge,
+            snapshotAt + AssetCatalogRepository.MaximumLiveAge + TimeSpan.FromMilliseconds(1));
+
+        var result = await GetStatusResultAsync(
+            sandbox,
+            clock,
+            success: true,
+            JsonSerializer.SerializeToElement(new { state = "ready" }),
+            error: null);
+
+        Assert.Equal((long)AssetCatalogRepository.MaximumLiveAge.TotalMilliseconds, result.CatalogCacheAgeMilliseconds);
+        Assert.True(result.CatalogLive);
+        Assert.Equal(2, clock.SampleCount);
+    }
+
+    [Fact]
+    public async Task Status_LeavesAbsentAndMalformedOptionalEnrichmentUnpromoted()
+    {
+        using var absentSandbox = new TestDirectory();
+        var absentPayload = JsonSerializer.SerializeToElement(new { state = "ready" });
+        var absent = await GetStatusResultAsync(
+            absentSandbox,
+            new FixedTimeProvider(DateTimeOffset.Parse("2026-08-10T20:00:00Z")),
+            success: true,
+            absentPayload,
+            error: null);
+
+        Assert.True(absent.Success);
+        Assert.True(JsonNode.DeepEquals(JsonNode.Parse(absentPayload.GetRawText()), JsonNode.Parse(absent.Payload.GetRawText())));
+        Assert.Null(absent.MapRevision);
+        Assert.Null(absent.CatalogRevision);
+        Assert.Null(absent.CatalogCacheAgeMilliseconds);
+        Assert.Null(absent.CatalogLive);
+        Assert.Null(absent.CatalogComplete);
+        Assert.Null(absent.CatalogEntryCount);
+        Assert.Empty(absent.CatalogErrors);
+        Assert.Empty(absent.BridgeCapabilities);
+
+        using var malformedSandbox = new TestDirectory();
+        var malformedPayload = JsonSerializer.SerializeToElement(new
+        {
+            state = "ready",
+            revision = 42,
+            supported_commands = new object[] { "status", 42 },
+        });
+        var malformed = await GetStatusResultAsync(
+            malformedSandbox,
+            new FixedTimeProvider(DateTimeOffset.Parse("2026-08-10T20:00:00Z")),
+            success: true,
+            malformedPayload,
+            error: null);
+
+        Assert.True(JsonNode.DeepEquals(JsonNode.Parse(malformedPayload.GetRawText()), JsonNode.Parse(malformed.Payload.GetRawText())));
+        Assert.Null(malformed.MapRevision);
+        Assert.Empty(malformed.BridgeCapabilities);
+    }
+
+    [Fact]
+    public async Task Status_PreservesFailedMailboxResponseWhileEnrichingDefensively()
+    {
+        using var sandbox = new TestDirectory();
+        var payload = JsonSerializer.SerializeToElement(new
+        {
+            state = "degraded",
+            map_revision = new string('c', 64),
+            supported_commands = new[] { "status" },
+        });
+        var error = new MailboxErrorDetails("bridge_unavailable", "The fake bridge is unavailable.");
+
+        var result = await GetStatusResultAsync(
+            sandbox,
+            new FixedTimeProvider(DateTimeOffset.Parse("2026-08-10T20:00:00Z")),
+            success: false,
+            payload,
+            error);
+
+        Assert.False(result.Success);
+        Assert.Equal("status", result.Command);
+        Assert.True(JsonNode.DeepEquals(JsonNode.Parse(payload.GetRawText()), JsonNode.Parse(result.Payload.GetRawText())));
+        Assert.Equal(error, result.Error);
+        Assert.Equal(new string('c', 64), result.MapRevision);
+        Assert.Equal(["status"], result.BridgeCapabilities);
+    }
+
+    [Fact(Timeout = 120_000)]
+    public async Task RawProtocol_InvokesAllToolsAndEmitsOnlyJsonRpcFramesOnStdout()
+    {
+        using var sandbox = new TestDirectory();
+        var asset = sandbox.PublishAcceptedAssetCatalog(includePreview: true, revision: 73);
+        sandbox.WriteRuntimeReceipt();
+        var executable = PublishRetainedSingleFile();
+        var mailbox = new AtomicMailbox(sandbox.MailboxDirectory);
+        var fakeBridge = new PublishedDiscoveryBridgeHarness(mailbox, asset.AssetRef);
+        using var workerCancellation = new CancellationTokenSource();
+        var worker = Task.Run(async () =>
+        {
+            while (!workerCancellation.IsCancellationRequested)
+            {
+                if (!fakeBridge.HandleOne())
+                {
+                    await Task.Delay(10, workerCancellation.Token);
+                }
+            }
+        }, workerCancellation.Token);
+        var calledTools = new HashSet<string>(StringComparer.Ordinal);
+        var stdoutFrames = new List<string>();
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         using var process = StartCapturedServer(executable, sandbox);
 
@@ -112,32 +220,188 @@ public sealed class McpPublishedIntegrationTests
                     clientInfo = new { name = "ddai-stdout-capture", version = "1.0" },
                 },
             });
-            AssertJsonRpcResponse(await ReadFrameAsync(process.StandardOutput, 1, deadline.Token), 1);
+            stdoutFrames.Add(await ReadFrameAsync(process.StandardOutput, 1, deadline.Token));
 
             await WriteFrameAsync(process.StandardInput, new { jsonrpc = "2.0", method = "notifications/initialized" });
+            await WriteFrameAsync(process.StandardInput, new { jsonrpc = "2.0", id = 2, method = "tools/list", @params = new { } });
+            var listed = await ReadResultAsync(process.StandardOutput, 2, stdoutFrames, deadline.Token);
+            Assert.Equal(
+                ["ddai_apply_plan", "ddai_get_asset_preview", "ddai_get_capabilities", "ddai_import_asset", "ddai_inspect_map", "ddai_search_assets", "ddai_status", "ddai_validate_plan"],
+                listed.GetProperty("tools").EnumerateArray().Select(tool => tool.GetProperty("name").GetString()).Order(StringComparer.Ordinal));
+
+            var status = await CallRawToolAsync(process, stdoutFrames, calledTools, 10, "ddai_status", new { }, deadline.Token);
+            Assert.False(status.TryGetProperty("isError", out var statusError) && statusError.GetBoolean());
+            Assert.Equal("ready", ParseRawTextContent(status).GetProperty("payload").GetProperty("state").GetString());
+
+            var capabilities = await CallRawToolAsync(process, stdoutFrames, calledTools, 11, "ddai_get_capabilities", new { }, deadline.Token);
+            Assert.Equal("live", ParseRawTextContent(capabilities).GetProperty("runtime_state").GetString());
+
+            var search = await CallRawToolAsync(
+                process,
+                stdoutFrames,
+                calledTools,
+                12,
+                "ddai_search_assets",
+                new Dictionary<string, object?> { ["query"] = new { query = "ancient", limit = 1 } },
+                deadline.Token);
+            Assert.Equal(asset.AssetRef, ParseRawTextContent(search).GetProperty("items")[0].GetProperty("asset_ref").GetString());
+            Assert.True(search.TryGetProperty("structuredContent", out _));
+
+            var preview = await CallRawToolAsync(
+                process,
+                stdoutFrames,
+                calledTools,
+                13,
+                "ddai_get_asset_preview",
+                new Dictionary<string, object?> { ["assetRef"] = asset.AssetRef },
+                deadline.Token);
+            Assert.Contains(preview.GetProperty("content").EnumerateArray(), block =>
+                block.GetProperty("type").GetString() == "image" && block.GetProperty("mimeType").GetString() == "image/png");
+
+            var importRequest = new
+            {
+                idempotencyKey = "raw-complete-discovery-import-001",
+                category = "Objects",
+                name = "Raw Cross Tool Lantern",
+                tags = new[] { "generated", "raw-cross-tool" },
+                gridWidth = 1,
+                gridHeight = 1,
+                contentBase64 = Convert.ToBase64String(sandbox.PreviewBytes),
+            };
+            var import = await CallRawToolAsync(
+                process,
+                stdoutFrames,
+                calledTools,
+                14,
+                "ddai_import_asset",
+                new Dictionary<string, object?> { ["request"] = importRequest },
+                deadline.Token);
+            Assert.Contains(import.GetProperty("content").EnumerateArray(), block => block.GetProperty("type").GetString() == "image");
+            var generatedAssetId = ParseRawTextContent(import).GetProperty("generated_asset_id").GetString();
+
+            var importedSearch = await CallRawToolAsync(
+                process,
+                stdoutFrames,
+                calledTools,
+                15,
+                "ddai_search_assets",
+                new Dictionary<string, object?>
+                {
+                    ["query"] = new
+                    {
+                        query = "Raw Cross Tool Lantern",
+                        generated = true,
+                        includeStagedGenerated = true,
+                        limit = 100,
+                    },
+                },
+                deadline.Token);
+            var staged = Assert.Single(ParseRawTextContent(importedSearch).GetProperty("items").EnumerateArray());
+            Assert.Equal("sha256:" + generatedAssetId, staged.GetProperty("asset_ref").GetString());
+            Assert.True(staged.GetProperty("generated").GetBoolean());
+            Assert.False(staged.GetProperty("placeable").GetBoolean());
+
+            var inspection = await CallRawToolAsync(
+                process,
+                stdoutFrames,
+                calledTools,
+                16,
+                "ddai_inspect_map",
+                new Dictionary<string, object?> { ["query"] = new { level = 0, limit = 1 } },
+                deadline.Token);
+            Assert.Equal(PublishedDiscoveryBridgeHarness.MapRevision, ParseRawTextContent(inspection).GetProperty("map_revision").GetString());
+
+            var plan = ValidPlan("raw-plan-001");
+            var planArguments = new Dictionary<string, object?> { ["plan"] = plan };
+            var validation = await CallRawToolAsync(process, stdoutFrames, calledTools, 17, "ddai_validate_plan", planArguments, deadline.Token);
+            Assert.True(ParseRawTextContent(validation).GetProperty("valid").GetBoolean());
+            var apply = await CallRawToolAsync(process, stdoutFrames, calledTools, 18, "ddai_apply_plan", planArguments, deadline.Token);
+            Assert.True(ParseRawTextContent(apply).GetProperty("success").GetBoolean());
+
+            var invalidSearch = await CallRawToolAsync(
+                process,
+                stdoutFrames,
+                calledTools,
+                19,
+                "ddai_search_assets",
+                new Dictionary<string, object?> { ["query"] = new { limit = AssetSearchService.MaximumLimit + 1 } },
+                deadline.Token);
+            Assert.True(invalidSearch.GetProperty("isError").GetBoolean());
+            Assert.Equal("invalid_request", ParseRawTextContent(invalidSearch).GetProperty("error").GetString());
+
+            Assert.Equal(
+                ["ddai_apply_plan", "ddai_get_asset_preview", "ddai_get_capabilities", "ddai_import_asset", "ddai_inspect_map", "ddai_search_assets", "ddai_status", "ddai_validate_plan"],
+                calledTools.Order(StringComparer.Ordinal));
+
             await WriteFrameAsync(process.StandardInput, new
             {
                 jsonrpc = "2.0",
-                id = 2,
+                id = 20,
                 method = "tools/call",
                 @params = new
                 {
-                    name = "ddai_get_asset_preview",
-                    arguments = new Dictionary<string, object?> { ["assetRef"] = asset.AssetRef },
+                    name = "ddai_inspect_map",
+                    arguments = new Dictionary<string, object?>
+                    {
+                        ["query"] = new { level = PublishedDiscoveryBridgeHarness.UnansweredLevel, limit = 1 },
+                    },
                 },
             });
-            AssertJsonRpcResponse(await ReadFrameAsync(process.StandardOutput, 2, deadline.Token), 2);
+            var unansweredClaim = await fakeBridge.WaitForUnansweredClaimAsync(deadline.Token);
+            var lateResponsePath = Path.Combine(
+                mailbox.RootDirectory,
+                "responses",
+                Path.GetFileName(unansweredClaim.ProcessingPath));
+            Assert.True(File.Exists(unansweredClaim.ProcessingPath));
+            Assert.False(File.Exists(lateResponsePath));
+
+            await WriteFrameAsync(process.StandardInput, new
+            {
+                jsonrpc = "2.0",
+                method = "notifications/cancelled",
+                @params = new { requestId = 20, reason = "raw cancellation acceptance" },
+            });
+            var postCancellationStatus = await CallRawToolAsync(
+                process,
+                stdoutFrames,
+                calledTools,
+                21,
+                "ddai_status",
+                new { },
+                deadline.Token);
+            Assert.Equal("ready", ParseRawTextContent(postCancellationStatus).GetProperty("payload").GetProperty("state").GetString());
+
+            fakeBridge.PublishLateUnansweredResponse();
+            Assert.False(File.Exists(unansweredClaim.ProcessingPath));
+            Assert.True(File.Exists(lateResponsePath));
+            await Task.Delay(250, deadline.Token);
 
             process.StandardInput.Close();
             await process.WaitForExitAsync(deadline.Token);
             var trailing = await process.StandardOutput.ReadToEndAsync(deadline.Token);
             Assert.Equal(0, process.ExitCode);
-            Assert.Equal(string.Empty, process.StandardError.ReadToEnd());
-            Assert.All(trailing.Split('\n', StringSplitOptions.None).Where(line => line.Length > 0),
-                line => AssertJsonRpcResponse(line, expectedId: null));
+            stdoutFrames.AddRange(trailing.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+            Assert.All(stdoutFrames, line => AssertJsonRpcResponse(line, expectedId: null));
+            var stderr = process.StandardError.ReadToEnd();
+            Assert.DoesNotContain(stdoutFrames, line =>
+            {
+                using var document = JsonDocument.Parse(line);
+                return document.RootElement.TryGetProperty("id", out var id) && id.TryGetInt32(out var value) && value == 20;
+            });
+            Assert.Contains("\"ddai_inspect_map\" threw an unhandled exception", stderr, StringComparison.Ordinal);
+            Assert.Contains(nameof(OperationCanceledException), stderr, StringComparison.Ordinal);
         }
         finally
         {
+            workerCancellation.Cancel();
+            try
+            {
+                await worker;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
             if (!process.HasExited)
             {
                 process.Kill(entireProcessTree: true);
@@ -151,7 +415,7 @@ public sealed class McpPublishedIntegrationTests
     {
         using var sandbox = new TestDirectory();
         var asset = sandbox.PublishAcceptedAssetCatalog(includePreview: true);
-        var executable = PublishSingleFile(sandbox.PublishDirectory);
+        var executable = PublishRetainedSingleFile();
         var stderr = new ConcurrentQueue<string>();
         var transport = new StdioClientTransport(new StdioClientTransportOptions
         {
@@ -202,7 +466,7 @@ public sealed class McpPublishedIntegrationTests
     {
         using var sandbox = new TestDirectory();
         sandbox.PublishAcceptedAssetCatalog();
-        var executable = PublishSingleFile(sandbox.PublishDirectory);
+        var executable = PublishRetainedSingleFile();
         var stderr = new ConcurrentQueue<string>();
         var transport = new StdioClientTransport(new StdioClientTransportOptions
         {
@@ -262,7 +526,7 @@ public sealed class McpPublishedIntegrationTests
     {
         using var sandbox = new TestDirectory();
         sandbox.PublishAcceptedAssetCatalog();
-        var executable = PublishSingleFile(sandbox.PublishDirectory);
+        var executable = PublishRetainedSingleFile();
         var stderr = new ConcurrentQueue<string>();
         var transport = new StdioClientTransport(new StdioClientTransportOptions
         {
@@ -353,12 +617,12 @@ public sealed class McpPublishedIntegrationTests
     }
 
     [Fact(Timeout = 120_000)]
-    public async Task SdkClient_InitializesListsAndCallsPublishedStdioServerWithoutStdoutContamination()
+    public async Task SdkClient_InitializesListsCallsExactSchemasAndProvesServerCancellation()
     {
         using var sandbox = new TestDirectory();
         var asset = sandbox.PublishAcceptedAssetCatalog(includePreview: true, revision: 73);
         sandbox.WriteRuntimeReceipt();
-        var executable = PublishSingleFile(sandbox.PublishDirectory);
+        var executable = PublishRetainedSingleFile();
         var mailbox = new AtomicMailbox(sandbox.MailboxDirectory);
         var fakeBridge = new PublishedDiscoveryBridgeHarness(mailbox, asset.AssetRef);
         using var workerCancellation = new CancellationTokenSource();
@@ -415,6 +679,17 @@ public sealed class McpPublishedIntegrationTests
                     ? properties.EnumerateObject().Select(property => property.Name).Order(StringComparer.Ordinal).ToArray()
                     : [];
                 Assert.Equal(expected.Parameters.Order(StringComparer.Ordinal), parameterNames);
+            }
+
+            using var acceptanceReceipt = ReadAcceptanceReceipt();
+            var schemaSnapshots = acceptanceReceipt.RootElement.GetProperty("input_schemas");
+            foreach (var tool in tools)
+            {
+                Assert.True(
+                    JsonNode.DeepEquals(
+                        JsonNode.Parse(schemaSnapshots.GetProperty(tool.Name).GetRawText()),
+                        JsonNode.Parse(tool.ProtocolTool.InputSchema.GetRawText())),
+                    $"The canonical input schema changed for {tool.Name}.");
             }
 
             var searchFields = tools.Single(tool => tool.Name == "ddai_search_assets").ProtocolTool.InputSchema
@@ -546,12 +821,70 @@ public sealed class McpPublishedIntegrationTests
                     cancellationToken: deadline.Token),
                 "invalid_request");
 
-            using var cancelled = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await client.CallToolAsync(
-                "ddai_inspect_map",
-                new Dictionary<string, object?> { ["query"] = new { level = PublishedDiscoveryBridgeHarness.UnansweredLevel, limit = 1 } },
-                cancellationToken: cancelled.Token));
-            Assert.Empty(stderr);
+            var cancellationRequestId = new RequestId(200);
+            using var cancelledCallCancellation = new CancellationTokenSource();
+            var cancelledCall = client.SendRequestAsync<CallToolRequestParams, CallToolResult>(
+                RequestMethods.ToolsCall,
+                new CallToolRequestParams
+                {
+                    Name = "ddai_inspect_map",
+                    Arguments = new Dictionary<string, JsonElement>
+                    {
+                        ["query"] = JsonSerializer.SerializeToElement(new
+                        {
+                            level = PublishedDiscoveryBridgeHarness.UnansweredLevel,
+                            limit = 1,
+                        }),
+                    },
+                },
+                serializerOptions: null,
+                cancellationRequestId,
+                cancelledCallCancellation.Token);
+            var unansweredClaim = await fakeBridge.WaitForUnansweredClaimAsync(deadline.Token);
+            var lateResponsePath = Path.Combine(
+                mailbox.RootDirectory,
+                "responses",
+                Path.GetFileName(unansweredClaim.ProcessingPath));
+            Assert.True(File.Exists(unansweredClaim.ProcessingPath));
+            Assert.False(File.Exists(lateResponsePath));
+
+            await client.SendNotificationAsync(
+                NotificationMethods.CancelledNotification,
+                new CancelledNotificationParams
+                {
+                    RequestId = cancellationRequestId,
+                    Reason = "official SDK cancellation acceptance",
+                },
+                serializerOptions: null,
+                cancellationToken: deadline.Token);
+
+            for (var attempt = 0; attempt < 100 && !stderr.Any(line => line.Contains(nameof(OperationCanceledException), StringComparison.Ordinal)); attempt++)
+            {
+                await Task.Delay(10, deadline.Token);
+            }
+            Assert.Contains(stderr, line => line.Contains(nameof(OperationCanceledException), StringComparison.Ordinal));
+            cancelledCallCancellation.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await cancelledCall);
+            var postCancellationStatus = await client.CallToolAsync(
+                "ddai_status",
+                new Dictionary<string, object?>(),
+                cancellationToken: deadline.Token);
+            using var postCancellationStatusDocument = JsonDocument.Parse(
+                Assert.IsType<TextContentBlock>(Assert.Single(postCancellationStatus.Content)).Text);
+            Assert.Equal("ready", postCancellationStatusDocument.RootElement.GetProperty("payload").GetProperty("state").GetString());
+
+            fakeBridge.PublishLateUnansweredResponse();
+            Assert.False(File.Exists(unansweredClaim.ProcessingPath));
+            Assert.True(File.Exists(lateResponsePath));
+            await Task.Delay(250, deadline.Token);
+            var postLateResponseCapabilities = await client.CallToolAsync(
+                "ddai_get_capabilities",
+                new Dictionary<string, object?>(),
+                cancellationToken: deadline.Token);
+            Assert.Null(postLateResponseCapabilities.IsError);
+            using var postLateResponseCapabilitiesDocument = JsonDocument.Parse(
+                Assert.IsType<TextContentBlock>(Assert.Single(postLateResponseCapabilities.Content)).Text);
+            Assert.Equal("live", postLateResponseCapabilitiesDocument.RootElement.GetProperty("runtime_state").GetString());
         }
         finally
         {
@@ -600,6 +933,47 @@ public sealed class McpPublishedIntegrationTests
         Rooms = [new MapRoom("room-entrance", 8, 7, 10, 8)],
     };
 
+    private static async Task<DdaiStatusResult> GetStatusResultAsync(
+        TestDirectory sandbox,
+        TimeProvider timeProvider,
+        bool success,
+        JsonElement payload,
+        MailboxErrorDetails? error)
+    {
+        var mailbox = new AtomicMailbox(sandbox.MailboxDirectory);
+        var service = new DdaiStatusService(mailbox, timeProvider);
+        var worker = Task.Run(async () =>
+        {
+            for (var attempt = 0; attempt < 100; attempt++)
+            {
+                var claim = mailbox.ClaimNextRequest();
+                if (claim is null)
+                {
+                    await Task.Delay(10);
+                    continue;
+                }
+
+                mailbox.PublishResponse(claim, new MailboxResponse
+                {
+                    SchemaVersion = MailboxRequest.CurrentSchemaVersion,
+                    RequestId = claim.Request.RequestId,
+                    Command = claim.Request.Command,
+                    Timestamp = DateTimeOffset.Parse("2026-08-10T20:00:00Z"),
+                    Success = success,
+                    Payload = payload,
+                    Error = error,
+                });
+                return;
+            }
+
+            throw new TimeoutException("The status request was not published to the real atomic mailbox.");
+        });
+
+        var result = await service.GetStatusAsync(TimeSpan.FromSeconds(2));
+        await worker;
+        return result;
+    }
+
     private static Process StartCapturedServer(string executable, TestDirectory sandbox)
     {
         var startInfo = new ProcessStartInfo(executable)
@@ -633,6 +1007,49 @@ public sealed class McpPublishedIntegrationTests
         return line;
     }
 
+    private static async Task<JsonElement> ReadResultAsync(
+        StreamReader output,
+        int expectedId,
+        ICollection<string> stdoutFrames,
+        CancellationToken cancellationToken)
+    {
+        var line = await ReadFrameAsync(output, expectedId, cancellationToken);
+        stdoutFrames.Add(line);
+        using var document = JsonDocument.Parse(line);
+        return document.RootElement.GetProperty("result").Clone();
+    }
+
+    private static async Task<JsonElement> CallRawToolAsync(
+        Process process,
+        ICollection<string> stdoutFrames,
+        ISet<string> calledTools,
+        int id,
+        string toolName,
+        object arguments,
+        CancellationToken cancellationToken)
+    {
+        await WriteFrameAsync(process.StandardInput, new
+        {
+            jsonrpc = "2.0",
+            id,
+            method = "tools/call",
+            @params = new { name = toolName, arguments },
+        });
+        calledTools.Add(toolName);
+        return await ReadResultAsync(process.StandardOutput, id, stdoutFrames, cancellationToken);
+    }
+
+    private static JsonElement ParseRawTextContent(JsonElement callResult)
+    {
+        var text = Assert.Single(
+                callResult.GetProperty("content").EnumerateArray(),
+                block => block.GetProperty("type").GetString() == "text")
+            .GetProperty("text")
+            .GetString();
+        using var document = JsonDocument.Parse(Assert.IsType<string>(text));
+        return document.RootElement.Clone();
+    }
+
     private static void AssertJsonRpcResponse(string line, int? expectedId)
     {
         using var document = JsonDocument.Parse(line);
@@ -646,10 +1063,12 @@ public sealed class McpPublishedIntegrationTests
         }
     }
 
-    private static string PublishSingleFile(string outputDirectory)
+    private static string PublishRetainedSingleFile()
     {
         var repositoryRoot = FindRepositoryRoot();
         var project = Path.Combine(repositoryRoot, "src", "DDAI.App", "DDAI.App.csproj");
+        var outputDirectory = Path.Combine(repositoryRoot, "artifacts", "task6", "win-x64");
+        Directory.CreateDirectory(outputDirectory);
         var startInfo = new ProcessStartInfo("dotnet")
         {
             WorkingDirectory = repositoryRoot,
@@ -674,8 +1093,26 @@ public sealed class McpPublishedIntegrationTests
         var executable = Path.Combine(outputDirectory, "ddai.exe");
         Assert.True(File.Exists(executable), $"Published executable not found: {executable}");
         Assert.Equal(["ddai.exe"], Directory.GetFiles(outputDirectory).Select(path => Path.GetFileName(path)!).Order().ToArray());
+        using var receipt = ReadAcceptanceReceipt();
+        var artifact = receipt.RootElement.GetProperty("artifact");
+        Assert.Equal(
+            Path.GetFullPath(Path.Combine(repositoryRoot, artifact.GetProperty("relative_path").GetString()!)),
+            Path.GetFullPath(executable),
+            ignoreCase: true);
+        Assert.Equal(artifact.GetProperty("size_bytes").GetInt64(), new FileInfo(executable).Length);
+        Assert.Equal(
+            artifact.GetProperty("sha256").GetString(),
+            Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(executable))).ToLowerInvariant());
         return executable;
     }
+
+    private static JsonDocument ReadAcceptanceReceipt() => JsonDocument.Parse(File.ReadAllText(
+        Path.Combine(
+            FindRepositoryRoot(),
+            "docs",
+            "superpowers",
+            "reports",
+            "2026-08-10-ddai-mcp-acceptance-receipt.json")));
 
     private static string FindRepositoryRoot()
     {
@@ -786,6 +1223,20 @@ public sealed class McpPublishedIntegrationTests
         public static readonly string MapRevision = new('b', 64);
         public static readonly string[] Capabilities = ["status", "apply_plan", "inspect_map"];
 
+        private readonly TaskCompletionSource<ClaimedMailboxRequest> unansweredClaim = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        private ClaimedMailboxRequest? pendingUnansweredClaim;
+
+        public Task<ClaimedMailboxRequest> WaitForUnansweredClaimAsync(CancellationToken cancellationToken) =>
+            unansweredClaim.Task.WaitAsync(cancellationToken);
+
+        public void PublishLateUnansweredResponse()
+        {
+            var claim = pendingUnansweredClaim
+                ?? throw new InvalidOperationException("No deliberately unanswered inspection has been claimed.");
+            mailbox.PublishResponse(claim, Inspect(claim.Request));
+        }
+
         public bool HandleOne()
         {
             var claim = mailbox.ClaimNextRequest();
@@ -798,6 +1249,8 @@ public sealed class McpPublishedIntegrationTests
                 claim.Request.Payload.TryGetProperty("level", out var level) &&
                 level.GetInt32() == UnansweredLevel)
             {
+                pendingUnansweredClaim = claim;
+                unansweredClaim.TrySetResult(claim);
                 return true;
             }
 
@@ -831,7 +1284,7 @@ public sealed class McpPublishedIntegrationTests
                 null,
                 false,
                 ["object", "portal", "light", "text", "material", "floor_shape"]);
-            Assert.Equal(0, query.Level);
+            Assert.Contains(query.Level, new int?[] { 0, UnansweredLevel });
             Assert.Equal(1, query.Limit);
             return Success(request, JsonSerializer.Deserialize<JsonElement>(MapSnapshotJson.SerializePage(page)));
         }
@@ -875,5 +1328,18 @@ public sealed class McpPublishedIntegrationTests
     private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => now;
+    }
+
+    private sealed class SequenceTimeProvider(params DateTimeOffset[] samples) : TimeProvider
+    {
+        private int sampleIndex;
+
+        public int SampleCount => Volatile.Read(ref sampleIndex);
+
+        public override DateTimeOffset GetUtcNow()
+        {
+            var index = Interlocked.Increment(ref sampleIndex) - 1;
+            return samples[Math.Min(index, samples.Length - 1)];
+        }
     }
 }

@@ -1,0 +1,175 @@
+{
+  "schema_version": "1.0",
+  "artifact": {
+    "relative_path": "artifacts/task6/win-x64/ddai.exe",
+    "size_bytes": 86871226,
+    "sha256": "7e666846bf938bdfeed92e24247bd6da8a2165487e4d9fb041d8b310f3380945"
+  },
+  "input_schemas": {
+    "ddai_apply_plan": {
+      "type": "object",
+      "properties": {
+        "plan": {
+          "type": "object",
+          "properties": {
+            "schema_version": { "type": "string" },
+            "request_id": { "type": "string" },
+            "base_revision": { "type": "integer" },
+            "mode": { "type": "string", "enum": ["Add", "Replace", "Patch"] },
+            "canvas": {
+              "type": "object",
+              "properties": {
+                "width": { "type": "integer" },
+                "height": { "type": "integer" }
+              },
+              "required": ["width", "height"]
+            },
+            "rooms": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": { "type": "string" },
+                  "x": { "type": "integer" },
+                  "y": { "type": "integer" },
+                  "width": { "type": "integer" },
+                  "height": { "type": "integer" }
+                },
+                "required": ["id", "x", "y", "width", "height"]
+              }
+            }
+          },
+          "required": ["schema_version", "request_id", "base_revision", "mode", "canvas"]
+        }
+      },
+      "required": ["plan"]
+    },
+    "ddai_get_asset_preview": {
+      "type": "object",
+      "properties": {
+        "assetRef": { "type": "string" }
+      },
+      "required": ["assetRef"]
+    },
+    "ddai_get_capabilities": {
+      "type": "object",
+      "properties": {}
+    },
+    "ddai_import_asset": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "type": "object",
+          "properties": {
+            "idempotencyKey": { "type": "string" },
+            "category": { "type": "string" },
+            "name": { "type": "string" },
+            "tags": { "type": "array", "items": { "type": "string" } },
+            "gridWidth": { "type": "integer" },
+            "gridHeight": { "type": "integer" },
+            "contentBase64": { "type": ["string", "null"] },
+            "inboxToken": { "type": ["string", "null"] }
+          },
+          "required": [
+            "idempotencyKey",
+            "category",
+            "name",
+            "tags",
+            "gridWidth",
+            "gridHeight",
+            "contentBase64",
+            "inboxToken"
+          ]
+        }
+      },
+      "required": ["request"]
+    },
+    "ddai_inspect_map": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "object",
+          "properties": {
+            "region": {
+              "type": ["object", "null"],
+              "properties": {
+                "x": { "type": "number" },
+                "y": { "type": "number" },
+                "width": { "type": "number" },
+                "height": { "type": "number" }
+              },
+              "required": ["x", "y", "width", "height"],
+              "default": null
+            },
+            "level": { "type": ["integer", "null"], "default": null },
+            "limit": { "type": "integer", "default": 100 },
+            "cursor": { "type": ["string", "null"], "default": null }
+          }
+        }
+      },
+      "required": ["query"]
+    },
+    "ddai_search_assets": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "object",
+          "properties": {
+            "query": { "type": ["string", "null"], "default": null },
+            "categories": { "type": ["array", "null"], "items": { "type": "string" }, "default": null },
+            "packIds": { "type": ["array", "null"], "items": { "type": "string" }, "default": null },
+            "generated": { "type": ["boolean", "null"], "default": null },
+            "previewRequired": { "type": ["boolean", "null"], "default": null },
+            "tags": { "type": ["array", "null"], "items": { "type": "string" }, "default": null },
+            "limit": { "type": ["integer", "null"], "default": null },
+            "cursor": { "type": ["string", "null"], "default": null },
+            "includeStagedGenerated": { "type": "boolean", "default": false }
+          }
+        }
+      },
+      "required": ["query"]
+    },
+    "ddai_status": {
+      "type": "object",
+      "properties": {}
+    },
+    "ddai_validate_plan": {
+      "type": "object",
+      "properties": {
+        "plan": {
+          "type": "object",
+          "properties": {
+            "schema_version": { "type": "string" },
+            "request_id": { "type": "string" },
+            "base_revision": { "type": "integer" },
+            "mode": { "type": "string", "enum": ["Add", "Replace", "Patch"] },
+            "canvas": {
+              "type": "object",
+              "properties": {
+                "width": { "type": "integer" },
+                "height": { "type": "integer" }
+              },
+              "required": ["width", "height"]
+            },
+            "rooms": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": { "type": "string" },
+                  "x": { "type": "integer" },
+                  "y": { "type": "integer" },
+                  "width": { "type": "integer" },
+                  "height": { "type": "integer" }
+                },
+                "required": ["id", "x", "y", "width", "height"]
+              }
+            }
+          },
+          "required": ["schema_version", "request_id", "base_revision", "mode", "canvas"]
+        }
+      },
+      "required": ["plan"]
+    }
+  }
+}
