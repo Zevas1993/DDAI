@@ -166,6 +166,27 @@ public sealed class DdaiMapInspectionToolTests
     }
 
     [Fact]
+    public async Task InspectMap_RejectsEmptyPageOutsideReturnedCanvasAndAcceptsExactBoundary()
+    {
+        var emptyPage = Page() with
+        {
+            Items = [],
+            NextCursor = null,
+            Truncated = false,
+        };
+        var outsideCanvas = await InvokeWithPageAsync(
+            new MapInspectionQuery(new MapInspectionRegion(100, 100, 1, 1), Level: 3, Limit: 1),
+            emptyPage);
+        var exactBoundary = await InvokeWithPageAsync(
+            new MapInspectionQuery(new MapInspectionRegion(39, 29, 1, 1), Level: 3, Limit: 1),
+            emptyPage);
+
+        Assert.True(outsideCanvas.IsError);
+        Assert.Equal("invalid_response", ErrorCode(outsideCanvas));
+        Assert.Null(exactBoundary.IsError);
+    }
+
+    [Fact]
     public async Task InspectMap_RejectsCursorsNotCorrelatedToReturnedStateAndExactProgression()
     {
         var arbitrarySubmittedCursor = new string('c', 64) + ":0";

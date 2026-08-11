@@ -159,6 +159,25 @@ public sealed class MapSnapshotContractTests
     }
 
     [Fact]
+    public void PageQueryCorrelation_RejectsEmptyPageOutsideCanvasAndAcceptsExactBoundary()
+    {
+        var emptyPage = ValidPage() with
+        {
+            Items = [],
+            NextCursor = null,
+            Truncated = false,
+        };
+
+        Assert.Throws<JsonException>(() => MapSnapshotJson.ValidatePageForQuery(
+            emptyPage,
+            new MapInspectionQuery(new MapInspectionRegion(100, 100, 1, 1), Level: 3, Limit: 1)));
+
+        MapSnapshotJson.ValidatePageForQuery(
+            emptyPage,
+            new MapInspectionQuery(new MapInspectionRegion(39, 29, 1, 1), Level: 3, Limit: 1));
+    }
+
+    [Fact]
     public void SnapshotPage_RejectsOverOneMiBBeforeDeserialization()
     {
         var oversized = "{\"map_id\":\"" + new string('x', MapSnapshotJson.MaximumJsonBytes) + "\"}";

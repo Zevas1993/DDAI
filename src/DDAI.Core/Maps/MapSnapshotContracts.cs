@@ -109,7 +109,7 @@ public static class MapSnapshotJson
             if (!IsFinite(region.X) || !IsFinite(region.Y) ||
                 !IsFinite(region.Width) || !IsFinite(region.Height) ||
                 region.X < 0 || region.Y < 0 || region.Width <= 0 || region.Height <= 0 ||
-                !IsFinite(region.X + region.Width) || !IsFinite(region.Y + region.Height) ||
+                region.Width > double.MaxValue - region.X || region.Height > double.MaxValue - region.Y ||
                 !HasCanonicalPrecision(region.X) || !HasCanonicalPrecision(region.Y) ||
                 !HasCanonicalPrecision(region.Width) || !HasCanonicalPrecision(region.Height))
             {
@@ -173,6 +173,11 @@ public static class MapSnapshotJson
     {
         ValidateQuery(query);
         ValidatePage(page);
+
+        if (query.Region is { } requestedRegion && !FitsWithinCanvas(requestedRegion, page.Canvas))
+        {
+            throw new JsonException("Requested inspection region is outside the returned map canvas.");
+        }
 
         var currentLevel = page.Levels.Single(level => level.Current);
         if (query.Level is { } requestedLevel && requestedLevel != currentLevel.Id)
@@ -472,6 +477,12 @@ public static class MapSnapshotJson
     private static bool Intersects(MapSnapshotBounds bounds, MapInspectionRegion region) =>
         bounds.X < region.X + region.Width && bounds.X + bounds.Width > region.X &&
         bounds.Y < region.Y + region.Height && bounds.Y + bounds.Height > region.Y;
+
+    private static bool FitsWithinCanvas(MapInspectionRegion region, MapCanvas canvas) =>
+        IsFinite(region.X) && IsFinite(region.Y) && IsFinite(region.Width) && IsFinite(region.Height) &&
+        region.X >= 0 && region.Y >= 0 && region.Width > 0 && region.Height > 0 &&
+        region.X <= canvas.Width && region.Y <= canvas.Height &&
+        region.Width <= canvas.Width - region.X && region.Height <= canvas.Height - region.Y;
 
     private static bool HasCanonicalPrecision(double value)
     {
