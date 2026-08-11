@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Globalization;
 using DDAI.App.Assets;
 using DDAI.Core.Assets;
 using DDAI.Core.Mailbox;
@@ -119,7 +120,7 @@ public sealed class DdaiCapabilityService(
         foreach (var path in paths)
         {
             var receipt = TryReadReceipt(path);
-            if (receipt is not null && (latest is null || receipt.Timestamp > latest.Timestamp))
+            if (receipt is not null && (latest is null || RuntimeReceiptIsNewer(receipt, latest)))
             {
                 latest = receipt;
             }
@@ -132,12 +133,7 @@ public sealed class DdaiCapabilityService(
     {
         try
         {
-            if (!File.Exists(path) || new FileInfo(path).Length > AtomicMailbox.MaximumMessageBytes)
-            {
-                return null;
-            }
-
-            using var document = JsonDocument.Parse(File.ReadAllBytes(path));
+            using var document = JsonDocument.Parse(ReadBoundedReceipt(path));
             var root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object ||
                 !TryGetString(root, "schema_version", out var schemaVersion) || schemaVersion != "1.0" ||
@@ -145,8 +141,8 @@ public sealed class DdaiCapabilityService(
                 !TryGetString(root, "mod_version", out var modVersion) ||
                 !TryGetString(root, "target_dungeondraft_version", out var dungeondraftVersion) ||
                 !TryGetString(root, "session_id", out var sessionId) || string.IsNullOrWhiteSpace(sessionId) ||
-                !root.TryGetProperty("timestamp", out var timestampElement) ||
-                !timestampElement.TryGetDateTimeOffset(out var timestamp) ||
+                !TryGetString(root, "timestamp", out var timestampText) ||
+                !DateTimeOffset.TryParse(timestampText, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var timestamp) ||
                 !TryGetCommands(root, out var supportedCommands))
             {
                 return null;
@@ -155,15 +151,78 @@ public sealed class DdaiCapabilityService(
             var now = timeProvider.GetUtcNow();
             var fresh = timestamp >= now - MaximumReceiptAge && timestamp <= now + MaximumReceiptFutureSkew;
             return new RuntimeReceipt(
-                timestamp,
+                timestampText,
                 fresh,
                 modVersion == ExpectedModVersion && dungeondraftVersion == ExpectedDungeondraftVersion,
-                supportedCommands);
+                supportedCommands,
+                sessionId);
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or ArgumentException or NotSupportedException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException or ArgumentException or NotSupportedException or OverflowException)
         {
             return null;
         }
+    }
+
+    private static byte[] ReadBoundedReceipt(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan);
+        if (stream.Length > AtomicMailbox.MaximumMessageBytes)
+        {
+            throw new InvalidDataException("Runtime receipts must not exceed 1 MiB.");
+        }
+
+        var bytes = new byte[checked((int)stream.Length)];
+        var offset = 0;
+        while (offset < bytes.Length)
+        {
+            var count = stream.Read(bytes, offset, bytes.Length - offset);
+            if (count == 0)
+            {
+                throw new InvalidDataException("Runtime receipt ended before its advertised length.");
+            }
+
+            offset += count;
+        }
+
+        if (stream.ReadByte() != -1)
+        {
+            throw new InvalidDataException("Runtime receipt grew beyond its bounded length while being read.");
+        }
+
+        return bytes;
+    }
+
+    private static bool RuntimeReceiptIsNewer(RuntimeReceipt candidate, RuntimeReceipt current)
+    {
+        var timestampComparison = StringComparer.Ordinal.Compare(candidate.TimestampText, current.TimestampText);
+        if (timestampComparison != 0)
+        {
+            return timestampComparison > 0;
+        }
+
+        var candidateSequence = RuntimeSessionSequence(candidate.SessionId);
+        var currentSequence = RuntimeSessionSequence(current.SessionId);
+        if (candidateSequence.First != currentSequence.First)
+        {
+            return candidateSequence.First > currentSequence.First;
+        }
+
+        if (candidateSequence.Second != currentSequence.Second)
+        {
+            return candidateSequence.Second > currentSequence.Second;
+        }
+
+        return StringComparer.Ordinal.Compare(candidate.SessionId, current.SessionId) > 0;
+    }
+
+    private static (long First, long Second) RuntimeSessionSequence(string value)
+    {
+        var parts = value.Split('-', StringSplitOptions.None);
+        return parts.Length == 2 &&
+            long.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var first) &&
+            long.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var second)
+            ? (first, second)
+            : (-1, -1);
     }
 
     private static bool TryGetString(JsonElement root, string propertyName, out string value)
@@ -203,8 +262,9 @@ public sealed class DdaiCapabilityService(
     }
 
     private sealed record RuntimeReceipt(
-        DateTimeOffset Timestamp,
+        string TimestampText,
         bool Fresh,
         bool MatchesExpectedVersion,
-        IReadOnlyList<string> SupportedCommands);
+        IReadOnlyList<string> SupportedCommands,
+        string SessionId);
 }

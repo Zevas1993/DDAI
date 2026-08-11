@@ -83,6 +83,33 @@ public sealed class DdaiCapabilityToolTests
     }
 
     [Fact]
+    public void GetCapabilities_PrefersBridgeNewerSessionWhenReceiptsShareATimestamp()
+    {
+        using var sandbox = new CapabilitySandbox();
+        sandbox.WriteReceipt(sandbox.Now, "0.2.1", "1.2.0.1", ["status"], "1723377600-1000", slot: 0);
+        sandbox.WriteReceipt(sandbox.Now, "0.2.1", "1.2.0.1", ["apply_plan"], "1723377600-1001", slot: 1);
+
+        var capabilities = sandbox.CreateService().GetCapabilities();
+
+        Assert.False(Assert.Single(capabilities.Operations, operation => operation.Name == "status").RuntimeCertified);
+        Assert.True(Assert.Single(capabilities.Operations, operation => operation.Name == "apply_plan").RuntimeCertified);
+    }
+
+    [Fact]
+    public void GetCapabilities_FailsClosedForAnOversizedRuntimeReceipt()
+    {
+        using var sandbox = new CapabilitySandbox();
+        File.WriteAllBytes(
+            Path.Combine(sandbox.Root, "runtime-receipt-slot-0.json"),
+            new byte[AtomicMailbox.MaximumMessageBytes + 1]);
+
+        var capabilities = sandbox.CreateService().GetCapabilities();
+
+        Assert.Equal("closed", capabilities.RuntimeState);
+        Assert.All(capabilities.Operations, operation => Assert.False(operation.RuntimeCertified));
+    }
+
+    [Fact]
     public void CapabilityTool_SerializesSnakeCaseStructuredOutput()
     {
         using var sandbox = new CapabilitySandbox();
@@ -112,17 +139,23 @@ public sealed class DdaiCapabilityToolTests
             new AssetCatalogRepository(Path.Combine(Root, "catalog"), new FixedTimeProvider(Now)),
             new FixedTimeProvider(Now));
 
-        public void WriteReceipt(DateTimeOffset timestamp, string modVersion, string dungeondraftVersion, IReadOnlyList<string> commands)
+        public void WriteReceipt(
+            DateTimeOffset timestamp,
+            string modVersion,
+            string dungeondraftVersion,
+            IReadOnlyList<string> commands,
+            string sessionId = "test-session",
+            int slot = 0)
         {
-            var path = Path.Combine(Root, "runtime-receipt-slot-0.json");
+            var path = Path.Combine(Root, $"runtime-receipt-slot-{slot}.json");
             File.WriteAllText(path, JsonSerializer.Serialize(new
             {
                 schema_version = "1.0",
                 @event = "started",
                 mod_version = modVersion,
                 target_dungeondraft_version = dungeondraftVersion,
-                timestamp,
-                session_id = "test-session",
+                timestamp = timestamp.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture),
+                session_id = sessionId,
                 supported_commands = commands,
             }));
         }
