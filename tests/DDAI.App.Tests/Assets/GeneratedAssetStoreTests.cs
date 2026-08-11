@@ -463,13 +463,14 @@ public sealed class GeneratedAssetStoreTests
     [Fact]
     public async Task ImportAsync_RealChildProcessesSerializeExactRetriesAndClassifyKeyConflicts()
     {
-        using var sandbox = new GeneratedAssetSandbox();
+        var sandbox = new GeneratedAssetSandbox();
         var gatePath = Path.Combine(sandbox.Root, "child-start.gate");
-        var children = Enumerable.Range(0, 8)
-            .Select(index => StartChildImport(sandbox.Root, "cross-process-key", 1, gatePath, index.ToString()))
-            .ToArray();
+        RunningChildImport[] children = [];
         try
         {
+            children = StartChildImports(
+                8,
+                index => StartChildImport(sandbox.Root, "cross-process-key", 1, gatePath, index.ToString()));
             Assert.True(SpinWait.SpinUntil(
                 () => children.All(child => File.Exists(child.ReadyPath)),
                 TimeSpan.FromSeconds(30)), "The generated-asset child processes did not reach the shared start gate.");
@@ -493,14 +494,21 @@ public sealed class GeneratedAssetStoreTests
         }
         finally
         {
-            foreach (var child in children) child.Dispose();
+            DisposeChildProcesses(children);
+            Assert.All(children, child =>
+            {
+                Assert.True(child.LeaderExitConfirmed);
+                Assert.True(child.JobEmptyConfirmed);
+                Assert.Equal(0u, child.FinalActiveProcessCount);
+            });
+            sandbox.Dispose();
         }
     }
 
     [Fact]
     public async Task ImportAsync_RealChildProcessCrashLeavesAnAbandonedTransactionRecoverable()
     {
-        using var sandbox = new GeneratedAssetSandbox();
+        var sandbox = new GeneratedAssetSandbox();
         PausedCrashTopology? topology = null;
         try
         {
@@ -528,6 +536,16 @@ public sealed class GeneratedAssetStoreTests
         finally
         {
             topology?.Dispose();
+            if (topology is not null)
+            {
+                Assert.All([topology.Owner, topology.Waiter], child =>
+                {
+                    Assert.True(child.LeaderExitConfirmed);
+                    Assert.True(child.JobEmptyConfirmed);
+                    Assert.Equal(0u, child.FinalActiveProcessCount);
+                });
+            }
+            sandbox.Dispose();
         }
     }
 
@@ -559,7 +577,15 @@ public sealed class GeneratedAssetStoreTests
             {
                 cleanupFailure = exception;
             }
-            finally
+
+            if (cleanupFailure is null &&
+                (topology is null ||
+                    (topology.Owner.LeaderExitConfirmed &&
+                    topology.Owner.JobEmptyConfirmed &&
+                    topology.Owner.FinalActiveProcessCount == 0 &&
+                    topology.Waiter.LeaderExitConfirmed &&
+                    topology.Waiter.JobEmptyConfirmed &&
+                    topology.Waiter.FinalActiveProcessCount == 0)))
             {
                 sandbox.Dispose();
             }
@@ -567,17 +593,152 @@ public sealed class GeneratedAssetStoreTests
 
         Assert.Null(cleanupFailure);
         Assert.NotNull(topology);
-        Assert.True(topology.Owner.ProcessTreeExitConfirmed);
-        Assert.True(topology.Waiter.ProcessTreeExitConfirmed);
-        Assert.True(topology.Owner.CapturedDescendantCount > 0);
-        Assert.True(topology.Waiter.CapturedDescendantCount > 0);
+        Assert.True(topology.Owner.LeaderExitConfirmed);
+        Assert.True(topology.Waiter.LeaderExitConfirmed);
+        Assert.True(topology.Owner.JobEmptyConfirmed);
+        Assert.True(topology.Waiter.JobEmptyConfirmed);
+        Assert.Equal(0u, topology.Owner.FinalActiveProcessCount);
+        Assert.Equal(0u, topology.Waiter.FinalActiveProcessCount);
         Assert.False(Directory.Exists(root));
         Assert.True(cleanupElapsed.Elapsed < TimeSpan.FromSeconds(15), $"Child cleanup took {cleanupElapsed.Elapsed}.");
     }
 
     [Fact]
+    public void GeneratedAssetChildJobs_EarlyFailureTerminatesALateDescendantAndOnlyTheOwnedProcessTreesBeforeSandboxCleanup()
+    {
+        var sandbox = new GeneratedAssetSandbox();
+        var root = sandbox.Root;
+        var duplicateGatePath = Path.Combine(root, "duplicate-early-failure.gate");
+        var lateDescendantSpawnPath = Path.Combine(root, "late-descendant.spawn");
+        var lateDescendantReadyPath = Path.Combine(root, "late-descendant.ready");
+        PausedCrashTopology? topology = null;
+        RunningChildImport[] duplicateChildren = [];
+        RunningChildImport? unrelatedControl = null;
+        Exception? cleanupFailure = null;
+        var cleanupElapsed = new Stopwatch();
+        try
+        {
+            topology = StartPausedCrashTopology(sandbox);
+            duplicateChildren = StartChildImports(
+                8,
+                index => StartChildImport(
+                    root,
+                    "early-failure-duplicate",
+                    1,
+                    duplicateGatePath,
+                    "early-failure-duplicate-" + index,
+                    lateDescendantSpawnPath: index == 0 ? lateDescendantSpawnPath : null,
+                    lateDescendantReadyPath: index == 0 ? lateDescendantReadyPath : null));
+            unrelatedControl = StartChildImport(
+                root,
+                "unrelated-control",
+                1,
+                duplicateGatePath,
+                "unrelated-control");
+            Assert.True(SpinWait.SpinUntil(
+                () => duplicateChildren.All(child => File.Exists(child.ReadyPath)) &&
+                    File.Exists(unrelatedControl.ReadyPath),
+                TimeSpan.FromSeconds(30)), "The duplicate and control children did not reach their held gates.");
+
+            Assert.False(File.Exists(lateDescendantReadyPath));
+            var beforeLateDescendant = duplicateChildren[0].JobAccounting;
+            File.WriteAllBytes(lateDescendantSpawnPath, []);
+            Assert.True(SpinWait.SpinUntil(
+                () => File.Exists(lateDescendantReadyPath) || duplicateChildren[0].LeaderHasExited,
+                TimeSpan.FromSeconds(30)), "The deliberately late descendant did not start.");
+            Assert.False(duplicateChildren[0].LeaderHasExited, "The duplicate leader exited before cleanup.");
+            var afterLateDescendant = duplicateChildren[0].JobAccounting;
+            Assert.True(afterLateDescendant.TotalProcesses > beforeLateDescendant.TotalProcesses);
+            Assert.True(afterLateDescendant.ActiveProcesses > beforeLateDescendant.ActiveProcesses);
+
+            throw new InjectedChildTopologyException();
+        }
+        catch (InjectedChildTopologyException)
+        {
+        }
+        finally
+        {
+            cleanupElapsed.Start();
+            try
+            {
+                DisposeChildProcesses([topology?.Waiter, topology?.Owner, .. duplicateChildren]);
+            }
+            catch (Exception exception)
+            {
+                cleanupFailure = exception;
+            }
+            cleanupElapsed.Stop();
+
+            try
+            {
+                if (unrelatedControl is not null)
+                {
+                    Assert.False(unrelatedControl.LeaderHasExited);
+                    Assert.True(unrelatedControl.JobAccounting.ActiveProcesses > 0);
+                }
+            }
+            catch (Exception exception)
+            {
+                cleanupFailure ??= exception;
+            }
+            finally
+            {
+                try
+                {
+                    unrelatedControl?.Dispose();
+                }
+                catch (Exception exception)
+                {
+                    cleanupFailure ??= exception;
+                }
+            }
+
+            if (cleanupFailure is null)
+            {
+                var ownedChildren = duplicateChildren
+                    .Concat(topology is null ? [] : [topology.Owner, topology.Waiter])
+                    .Concat(unrelatedControl is null ? [] : [unrelatedControl])
+                    .ToArray();
+                if (ownedChildren.All(child =>
+                    child.LeaderExitConfirmed &&
+                    child.JobEmptyConfirmed &&
+                    child.FinalActiveProcessCount == 0))
+                {
+                    sandbox.Dispose();
+                }
+                else
+                {
+                    cleanupFailure = new InvalidOperationException(
+                        "A test-owned job was not empty before sandbox deletion.");
+                }
+            }
+        }
+
+        Assert.Null(cleanupFailure);
+        Assert.NotNull(topology);
+        Assert.All(
+            duplicateChildren.Concat([topology.Owner, topology.Waiter, unrelatedControl!]),
+            child =>
+            {
+                Assert.True(child.LeaderExitConfirmed);
+                Assert.True(child.JobEmptyConfirmed);
+                Assert.Equal(0u, child.FinalActiveProcessCount);
+            });
+        Assert.False(Directory.Exists(root));
+        Assert.True(cleanupElapsed.Elapsed < TimeSpan.FromSeconds(60), $"Child cleanup took {cleanupElapsed.Elapsed}.");
+    }
+
+    [Fact]
     public async Task ChildProcessImportEntryPoint()
     {
+        var lateDescendantReady = Environment.GetEnvironmentVariable("DDAI_GENERATED_LATE_DESCENDANT_READY");
+        if (!string.IsNullOrEmpty(lateDescendantReady))
+        {
+            File.WriteAllBytes(lateDescendantReady, []);
+            Thread.Sleep(Timeout.Infinite);
+            return;
+        }
+
         var root = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_ROOT");
         if (string.IsNullOrEmpty(root)) return;
 
@@ -596,10 +757,18 @@ public sealed class GeneratedAssetStoreTests
         var durableBoundaryPath = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_DURABLE_BOUNDARY");
         var retainedHandlePath = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_RETAINED_MUTEX");
         var allowOwnerCrashPath = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_ALLOW_CRASH");
+        var lateDescendantSpawnPath = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_LATE_SPAWN");
+        var lateDescendantReadyPath = Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_LATE_READY");
         var waitForAbandoned = string.Equals(
             Environment.GetEnvironmentVariable("DDAI_GENERATED_CHILD_WAIT_ABANDONED"),
             "1",
             StringComparison.Ordinal);
+        if (lateDescendantSpawnPath is not null || lateDescendantReadyPath is not null)
+        {
+            Assert.False(string.IsNullOrEmpty(lateDescendantSpawnPath));
+            Assert.False(string.IsNullOrEmpty(lateDescendantReadyPath));
+            _ = Task.Run(() => LaunchLateDescendant(lateDescendantSpawnPath, lateDescendantReadyPath));
+        }
         File.WriteAllBytes(readyPath, []);
         Assert.True(SpinWait.SpinUntil(() => File.Exists(gatePath), TimeSpan.FromSeconds(30)));
 
@@ -1022,6 +1191,24 @@ public sealed class GeneratedAssetStoreTests
         Assert.InRange(Math.Abs(expected.Blue - actual.Blue), 0, 20);
     }
 
+    private static void LaunchLateDescendant(string spawnPath, string readyPath)
+    {
+        Assert.True(SpinWait.SpinUntil(
+            () => File.Exists(spawnPath),
+            TimeSpan.FromSeconds(30)), "The parent did not release the late-descendant spawn gate.");
+        var testAssembly = typeof(GeneratedAssetStoreTests).Assembly.Location;
+        using var descendant = WindowsTestProcessJob.StartDotNetVstest(
+            testAssembly,
+            typeof(GeneratedAssetStoreTests).FullName + "." + nameof(ChildProcessImportEntryPoint),
+            Path.GetDirectoryName(testAssembly)!,
+            new Dictionary<string, string>
+            {
+                ["DDAI_GENERATED_LATE_DESCENDANT_READY"] = readyPath,
+            });
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        descendant.WaitForExitAsync(deadline.Token).GetAwaiter().GetResult();
+    }
+
     private static PausedCrashTopology StartPausedCrashTopology(GeneratedAssetSandbox sandbox)
     {
         var gatePath = Path.Combine(sandbox.Root, "crash-start.gate");
@@ -1044,9 +1231,9 @@ public sealed class GeneratedAssetStoreTests
                 retainedHandlePath,
                 allowOwnerCrashPath);
             Assert.True(SpinWait.SpinUntil(
-                () => File.Exists(durableBoundaryPath) || owner.Process.HasExited,
+                () => File.Exists(durableBoundaryPath) || owner.LeaderHasExited,
                 TimeSpan.FromSeconds(30)), "The crash owner did not reach the manifest durability boundary.");
-            Assert.False(owner.Process.HasExited, "The crash owner exited before a second process retained the mutex object.");
+            Assert.False(owner.LeaderHasExited, "The crash owner exited before a second process retained the mutex object.");
             Assert.Single(Directory.EnumerateFiles(
                 Path.Combine(sandbox.Root, "generated-assets", "manifest"),
                 "*.json"));
@@ -1060,9 +1247,9 @@ public sealed class GeneratedAssetStoreTests
                 waitForAbandoned: true,
                 retainedHandlePath: retainedHandlePath);
             Assert.True(SpinWait.SpinUntil(
-                () => File.Exists(retainedHandlePath) || waiter.Process.HasExited,
+                () => File.Exists(retainedHandlePath) || waiter.LeaderHasExited,
                 TimeSpan.FromSeconds(30)), "The recovery child did not open and retain the owner's mutex object.");
-            Assert.False(waiter.Process.HasExited, "The recovery child exited before the owner crash.");
+            Assert.False(waiter.LeaderHasExited, "The recovery child exited before the owner crash.");
             return new PausedCrashTopology(owner, waiter, gatePath, allowOwnerCrashPath);
         }
         catch
@@ -1093,6 +1280,33 @@ public sealed class GeneratedAssetStoreTests
         }
     }
 
+    private static RunningChildImport[] StartChildImports(
+        int count,
+        Func<int, RunningChildImport> start)
+    {
+        var children = new List<RunningChildImport>(count);
+        try
+        {
+            for (var index = 0; index < count; index++) children.Add(start(index));
+            return [.. children];
+        }
+        catch (Exception startFailure)
+        {
+            try
+            {
+                DisposeChildProcesses([.. children]);
+            }
+            catch (Exception cleanupFailure)
+            {
+                throw new AggregateException(
+                    "Generated-asset child startup failed and a previously started test job did not cleanly exit.",
+                    startFailure,
+                    cleanupFailure);
+            }
+            throw;
+        }
+    }
+
     private static RunningChildImport StartChildImport(
         string root,
         string key,
@@ -1103,38 +1317,36 @@ public sealed class GeneratedAssetStoreTests
         string? durableBoundaryPath = null,
         string? retainedHandlePath = null,
         string? allowOwnerCrashPath = null,
-        bool waitForAbandoned = false)
+        bool waitForAbandoned = false,
+        string? lateDescendantSpawnPath = null,
+        string? lateDescendantReadyPath = null)
     {
         var testAssembly = typeof(GeneratedAssetStoreTests).Assembly.Location;
         var resultPath = Path.Combine(root, "child-" + suffix + ".json");
         var readyPath = Path.Combine(root, "child-" + suffix + ".ready");
-        var startInfo = new ProcessStartInfo("dotnet")
+        var environment = new Dictionary<string, string>
         {
-            WorkingDirectory = Path.GetDirectoryName(testAssembly)!,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
+            ["DDAI_GENERATED_CHILD_ROOT"] = root,
+            ["DDAI_GENERATED_CHILD_RESULT"] = resultPath,
+            ["DDAI_GENERATED_CHILD_READY"] = readyPath,
+            ["DDAI_GENERATED_CHILD_GATE"] = gatePath,
+            ["DDAI_GENERATED_CHILD_KEY"] = key,
+            ["DDAI_GENERATED_CHILD_GRID"] = gridWidth.ToString(System.Globalization.CultureInfo.InvariantCulture),
         };
-        startInfo.ArgumentList.Add("vstest");
-        startInfo.ArgumentList.Add(testAssembly);
-        startInfo.ArgumentList.Add("--Tests:" + typeof(GeneratedAssetStoreTests).FullName + "." + nameof(ChildProcessImportEntryPoint));
-        startInfo.Environment["DDAI_GENERATED_CHILD_ROOT"] = root;
-        startInfo.Environment["DDAI_GENERATED_CHILD_RESULT"] = resultPath;
-        startInfo.Environment["DDAI_GENERATED_CHILD_READY"] = readyPath;
-        startInfo.Environment["DDAI_GENERATED_CHILD_GATE"] = gatePath;
-        startInfo.Environment["DDAI_GENERATED_CHILD_KEY"] = key;
-        startInfo.Environment["DDAI_GENERATED_CHILD_GRID"] = gridWidth.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        if (crashMove is not null) startInfo.Environment["DDAI_GENERATED_CHILD_CRASH_MOVE"] = crashMove;
-        if (durableBoundaryPath is not null) startInfo.Environment["DDAI_GENERATED_CHILD_DURABLE_BOUNDARY"] = durableBoundaryPath;
-        if (retainedHandlePath is not null) startInfo.Environment["DDAI_GENERATED_CHILD_RETAINED_MUTEX"] = retainedHandlePath;
-        if (allowOwnerCrashPath is not null) startInfo.Environment["DDAI_GENERATED_CHILD_ALLOW_CRASH"] = allowOwnerCrashPath;
-        if (waitForAbandoned) startInfo.Environment["DDAI_GENERATED_CHILD_WAIT_ABANDONED"] = "1";
-        var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Could not start the generated-asset child process.");
+        if (crashMove is not null) environment["DDAI_GENERATED_CHILD_CRASH_MOVE"] = crashMove;
+        if (durableBoundaryPath is not null) environment["DDAI_GENERATED_CHILD_DURABLE_BOUNDARY"] = durableBoundaryPath;
+        if (retainedHandlePath is not null) environment["DDAI_GENERATED_CHILD_RETAINED_MUTEX"] = retainedHandlePath;
+        if (allowOwnerCrashPath is not null) environment["DDAI_GENERATED_CHILD_ALLOW_CRASH"] = allowOwnerCrashPath;
+        if (waitForAbandoned) environment["DDAI_GENERATED_CHILD_WAIT_ABANDONED"] = "1";
+        if (lateDescendantSpawnPath is not null) environment["DDAI_GENERATED_CHILD_LATE_SPAWN"] = lateDescendantSpawnPath;
+        if (lateDescendantReadyPath is not null) environment["DDAI_GENERATED_CHILD_LATE_READY"] = lateDescendantReadyPath;
+        var process = WindowsTestProcessJob.StartDotNetVstest(
+            testAssembly,
+            typeof(GeneratedAssetStoreTests).FullName + "." + nameof(ChildProcessImportEntryPoint),
+            Path.GetDirectoryName(testAssembly)!,
+            environment);
         return new RunningChildImport(
             process,
-            process.StandardOutput.ReadToEndAsync(),
-            process.StandardError.ReadToEndAsync(),
             resultPath,
             readyPath);
     }
@@ -1154,114 +1366,17 @@ public sealed class GeneratedAssetStoreTests
     private static async Task<ChildProcessResult> CompleteChildProcessAsync(RunningChildImport child)
     {
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-        await child.Process.WaitForExitAsync(deadline.Token);
-        return new ChildProcessResult(child.Process.ExitCode, await child.StandardOutput, await child.StandardError);
+        await child.WaitForLeaderExitAsync(deadline.Token);
+        return new ChildProcessResult(
+            child.ExitCode,
+            await child.StandardOutput.WaitAsync(deadline.Token),
+            await child.StandardError.WaitAsync(deadline.Token));
     }
 
     private static GeneratedAssetImportResult ImportSynchronouslyWhileHoldingMutex(
         string root,
         GeneratedAssetImportRequest request) =>
         new GeneratedAssetStore(root).ImportAsync(request).GetAwaiter().GetResult();
-
-    private static IReadOnlyList<Process> CaptureDescendantProcesses(int rootProcessId)
-    {
-        using var snapshot = CreateToolhelp32Snapshot(0x00000002, 0);
-        if (snapshot.IsInvalid)
-        {
-            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-        }
-        var entry = new ProcessEntry32
-        {
-            Size = checked((uint)Marshal.SizeOf<ProcessEntry32>()),
-            ExecutableFile = string.Empty,
-        };
-        var childrenByParent = new Dictionary<int, List<int>>();
-        if (Process32First(snapshot, ref entry))
-        {
-            do
-            {
-                var parent = checked((int)entry.ParentProcessId);
-                var process = checked((int)entry.ProcessId);
-                if (!childrenByParent.TryGetValue(parent, out var children))
-                {
-                    children = [];
-                    childrenByParent.Add(parent, children);
-                }
-                children.Add(process);
-                entry.Size = checked((uint)Marshal.SizeOf<ProcessEntry32>());
-            }
-            while (Process32Next(snapshot, ref entry));
-            var error = Marshal.GetLastWin32Error();
-            if (error != 18)
-            {
-                throw new System.ComponentModel.Win32Exception(error);
-            }
-        }
-        else
-        {
-            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-        }
-
-        var result = new List<Process>();
-        var pending = new Queue<int>();
-        pending.Enqueue(rootProcessId);
-        try
-        {
-            while (pending.TryDequeue(out var parent))
-            {
-                if (!childrenByParent.TryGetValue(parent, out var children)) continue;
-                foreach (var childId in children)
-                {
-                    pending.Enqueue(childId);
-                    try
-                    {
-                        var process = Process.GetProcessById(childId);
-                        try
-                        {
-                            _ = process.SafeHandle;
-                            result.Add(process);
-                        }
-                        catch
-                        {
-                            process.Dispose();
-                            throw;
-                        }
-                    }
-                    catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
-                    {
-                        // The exact child exited between the snapshot and eagerly opening its native handle.
-                    }
-                }
-            }
-            return result;
-        }
-        catch
-        {
-            foreach (var process in result) process.Dispose();
-            throw;
-        }
-    }
-
-    private static bool WaitForExactProcessTreeExit(
-        Process root,
-        IReadOnlyList<Process> descendants,
-        TimeSpan timeout)
-    {
-        var elapsed = Stopwatch.StartNew();
-        if (!WaitForExactProcessExit(root, elapsed, timeout)) return false;
-        foreach (var descendant in descendants)
-        {
-            if (!WaitForExactProcessExit(descendant, elapsed, timeout)) return false;
-        }
-        return true;
-    }
-
-    private static bool WaitForExactProcessExit(Process process, Stopwatch elapsed, TimeSpan timeout)
-    {
-        if (process.HasExited) return true;
-        var remaining = timeout - elapsed.Elapsed;
-        return remaining > TimeSpan.Zero && process.WaitForExit(checked((int)Math.Ceiling(remaining.TotalMilliseconds)));
-    }
 
     private static void CreateDirectoryJunction(string linkPath, string targetPath)
     {
@@ -1308,32 +1423,6 @@ public sealed class GeneratedAssetStoreTests
         public IntPtr SecurityDescriptor;
         [MarshalAs(UnmanagedType.Bool)] public bool InheritHandle;
     }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct ProcessEntry32
-    {
-        public uint Size;
-        public uint UsageCount;
-        public uint ProcessId;
-        public UIntPtr DefaultHeapId;
-        public uint ModuleId;
-        public uint ThreadCount;
-        public uint ParentProcessId;
-        public int PriorityBase;
-        public uint Flags;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string ExecutableFile;
-    }
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern SafeFileHandle CreateToolhelp32Snapshot(uint flags, uint processId);
-
-    [DllImport("kernel32.dll", EntryPoint = "Process32FirstW", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool Process32First(SafeFileHandle snapshot, ref ProcessEntry32 entry);
-
-    [DllImport("kernel32.dll", EntryPoint = "Process32NextW", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool Process32Next(SafeFileHandle snapshot, ref ProcessEntry32 entry);
 
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -1495,46 +1584,26 @@ public sealed class GeneratedAssetStoreTests
         bool AbandonedObserved);
     private sealed record ChildProcessResult(int ExitCode, string StandardOutput, string StandardError);
 
-    private sealed record RunningChildImport(
-        Process Process,
-        Task<string> StandardOutput,
-        Task<string> StandardError,
-        string ResultPath,
-        string ReadyPath) : IDisposable
+    private sealed class RunningChildImport(
+        WindowsTestProcessJob processJob,
+        string resultPath,
+        string readyPath) : IDisposable
     {
-        private int disposed;
+        public string ResultPath { get; } = resultPath;
+        public string ReadyPath { get; } = readyPath;
+        public Task<string> StandardOutput => processJob.StandardOutput;
+        public Task<string> StandardError => processJob.StandardError;
+        public bool LeaderHasExited => processJob.HasExited;
+        public int ExitCode => processJob.ExitCode;
+        public WindowsJobAccounting JobAccounting => processJob.Accounting;
+        public bool LeaderExitConfirmed => processJob.LeaderExitConfirmed;
+        public bool JobEmptyConfirmed => processJob.JobEmptyConfirmed;
+        public uint FinalActiveProcessCount => processJob.FinalActiveProcessCount;
 
-        public int CapturedDescendantCount { get; private set; }
-        public bool ProcessTreeExitConfirmed { get; private set; }
+        public Task WaitForLeaderExitAsync(CancellationToken cancellationToken) =>
+            processJob.WaitForExitAsync(cancellationToken);
 
-        public void Dispose()
-        {
-            if (Interlocked.Exchange(ref disposed, 1) != 0) return;
-            IReadOnlyList<Process> descendants = [];
-            try
-            {
-                descendants = CaptureDescendantProcesses(Process.Id);
-                CapturedDescendantCount = descendants.Count;
-                if (!Process.HasExited)
-                {
-                    try { Process.Kill(entireProcessTree: true); }
-                    catch (InvalidOperationException) { }
-                }
-                ProcessTreeExitConfirmed = WaitForExactProcessTreeExit(
-                    Process,
-                    descendants,
-                    TimeSpan.FromSeconds(5));
-                if (!ProcessTreeExitConfirmed)
-                {
-                    throw new TimeoutException($"Child process tree {Process.Id} did not exit after bounded cleanup.");
-                }
-            }
-            finally
-            {
-                foreach (var descendant in descendants) descendant.Dispose();
-                Process.Dispose();
-            }
-        }
+        public void Dispose() => processJob.Dispose();
     }
 
     private sealed class PausedCrashTopology(
