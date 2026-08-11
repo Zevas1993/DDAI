@@ -1,6 +1,10 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using DDAI.Core.Assets;
 using DDAI.Core.Mailbox;
 using DDAI.Core.MapPlans;
 using ModelContextProtocol.Client;
@@ -11,6 +15,66 @@ namespace DDAI.App.Tests;
 [Collection("Published executable")]
 public sealed class McpPublishedIntegrationTests
 {
+    [Fact(Timeout = 120_000)]
+    public async Task SdkClient_DiscoversBindsAndCallsPublishedAssetSearchWithStructuredContent()
+    {
+        using var sandbox = new TestDirectory();
+        sandbox.PublishAcceptedAssetCatalog();
+        var executable = PublishSingleFile(sandbox.PublishDirectory);
+        var stderr = new ConcurrentQueue<string>();
+        var transport = new StdioClientTransport(new StdioClientTransportOptions
+        {
+            Name = "ddai-published-asset-search-integration",
+            Command = executable,
+            Arguments = ["serve", "--stdio", "--mailbox-root", sandbox.MailboxDirectory, "--timeout-ms", "2000"],
+            WorkingDirectory = sandbox.PublishDirectory,
+            ShutdownTimeout = TimeSpan.FromSeconds(5),
+            StandardErrorLines = stderr.Enqueue,
+        });
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        await using var client = await McpClient.CreateAsync(transport, cancellationToken: deadline.Token);
+        var tool = Assert.Single(
+            await client.ListToolsAsync(cancellationToken: deadline.Token),
+            candidate => candidate.Name == "ddai_search_assets");
+        var querySchema = tool.ProtocolTool.InputSchema.GetProperty("properties").GetProperty("query");
+        var queryFields = querySchema.GetProperty("properties");
+        foreach (var field in new[]
+                 {
+                     "query", "categories", "tags", "packIds", "generated", "previewRequired",
+                     "includeStagedGenerated", "limit", "cursor",
+                 })
+        {
+            Assert.True(queryFields.TryGetProperty(field, out _), $"Missing asset-search query field '{field}'.");
+        }
+
+        var result = await client.CallToolAsync(
+            "ddai_search_assets",
+            new Dictionary<string, object?>
+            {
+                ["query"] = new
+                {
+                    query = "ancient",
+                    categories = new[] { "Objects" },
+                    tags = new[] { "fixture" },
+                    generated = false,
+                    previewRequired = false,
+                    limit = 1,
+                },
+            },
+            cancellationToken: deadline.Token);
+
+        Assert.Null(result.IsError);
+        var text = Assert.IsType<TextContentBlock>(Assert.Single(result.Content)).Text;
+        using var textDocument = JsonDocument.Parse(text);
+        Assert.Equal("Ancient Gate", textDocument.RootElement.GetProperty("items")[0].GetProperty("display_name").GetString());
+        Assert.True(result.StructuredContent.HasValue);
+        Assert.True(JsonNode.DeepEquals(
+            JsonNode.Parse(text),
+            JsonNode.Parse(result.StructuredContent.Value.GetRawText())));
+        Assert.Empty(stderr);
+    }
+
     [Fact(Timeout = 120_000)]
     public async Task SdkClient_InitializesListsAndCallsPublishedStdioServerWithoutStdoutContamination()
     {
@@ -158,6 +222,47 @@ public sealed class McpPublishedIntegrationTests
         public string PublishDirectory { get; }
         public string MailboxDirectory { get; }
 
+        public void PublishAcceptedAssetCatalog()
+        {
+            var catalogRoot = Path.Combine(MailboxDirectory, "catalog");
+            var snapshotRoot = Path.Combine(catalogRoot, "snapshots", "fixture-snapshot");
+            Directory.CreateDirectory(snapshotRoot);
+            var entry = new AssetCatalogEntry(
+                AssetReference.Create("official-pack", "Objects", "resource/ancient-gate"),
+                "Objects",
+                "Ancient Gate",
+                Hash("resource/ancient-gate"),
+                "official-pack",
+                "Official Pack",
+                ["ancient"],
+                ["fixture"],
+                null,
+                false,
+                false);
+            var chunkBytes = Encoding.UTF8.GetBytes(AssetCatalogJson.SerializeChunk([entry]));
+            File.WriteAllBytes(Path.Combine(snapshotRoot, "assets-000.json"), chunkBytes);
+            var manifest = new AssetCatalogManifest(
+                AssetCatalogManifest.CurrentSchemaVersion,
+                "published-fixture",
+                1,
+                new string('0', 64),
+                DateTimeOffset.UtcNow,
+                true,
+                AssetCategory.All.ToDictionary(category => category, category => category == "Objects" ? 1 : 0, StringComparer.Ordinal),
+                [new AssetCatalogChunk("assets-000.json", Hash(chunkBytes), 1, chunkBytes.LongLength)],
+                []);
+            manifest = manifest with { CatalogFingerprint = AssetCatalogJson.ComputeCatalogFingerprint(manifest) };
+            File.WriteAllText(Path.Combine(snapshotRoot, "manifest.json"), AssetCatalogJson.SerializeManifest(manifest));
+            File.WriteAllText(
+                Path.Combine(catalogRoot, "current.json"),
+                JsonSerializer.Serialize(new { manifest = "fixture-snapshot/manifest.json", session_id = "published-fixture" }));
+        }
+
         public void Dispose() => Directory.Delete(Root, recursive: true);
+
+        private static string Hash(string text) => Hash(Encoding.UTF8.GetBytes(text));
+
+        private static string Hash(byte[] bytes) =>
+            Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
     }
 }

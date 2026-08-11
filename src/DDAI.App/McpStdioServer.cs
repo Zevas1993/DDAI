@@ -27,7 +27,15 @@ public static class McpStdioServer
         builder.Services.AddSingleton(serviceProvider => new AssetCatalogRepository(
             Path.Combine(options.MailboxRoot, "catalog"),
             serviceProvider.GetRequiredService<TimeProvider>()));
-        builder.Services.AddSingleton<AssetSearchService>();
+        builder.Services.AddSingleton(serviceProvider =>
+        {
+            var catalogRepository = serviceProvider.GetRequiredService<AssetCatalogRepository>();
+            return new AssetSearchService(() =>
+            {
+                _ = catalogRepository.TryRefresh();
+                return catalogRepository.GetCurrent();
+            });
+        });
         builder.Services.AddSingleton<DdaiStatusService>();
         builder.Services.AddSingleton<DdaiPlanService>();
         builder.Services.AddSingleton<DdaiCapabilityService>();
