@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
@@ -128,18 +129,66 @@ public sealed class AssetSearchService
 
     private static string CursorFingerprint(string catalogFingerprint, IReadOnlyList<SearchCandidate> candidates)
     {
-        var stagedReferences = candidates
+        var stagedEntries = candidates
             .Where(candidate => !candidate.Placeable)
-            .Select(candidate => candidate.Entry.AssetRef)
-            .Order(StringComparer.Ordinal)
+            .OrderBy(candidate => candidate.Entry.AssetRef, StringComparer.Ordinal)
             .ToArray();
-        if (stagedReferences.Length == 0)
+        if (stagedEntries.Length == 0)
         {
             return catalogFingerprint;
         }
 
-        var payload = string.Join('\n', ["staged-overlay-v1", catalogFingerprint, .. stagedReferences]);
-        return Convert.ToHexString(SHA256.HashData(StrictUtf8.GetBytes(payload))).ToLowerInvariant();
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        AppendCursorString(hash, "staged-overlay-v2");
+        AppendCursorString(hash, catalogFingerprint);
+        AppendCursorInteger(hash, stagedEntries.Length);
+        foreach (var candidate in stagedEntries)
+        {
+            var entry = candidate.Entry;
+            AppendCursorString(hash, entry.AssetRef);
+            AppendCursorString(hash, entry.Category);
+            AppendCursorString(hash, entry.DisplayName);
+            AppendCursorString(hash, entry.ResourceFingerprint);
+            AppendCursorString(hash, entry.PackId);
+            AppendCursorString(hash, entry.PackName);
+            AppendCursorStrings(hash, entry.SearchTerms);
+            AppendCursorStrings(hash, entry.Tags);
+            AppendCursorString(hash, entry.PreviewHash);
+            hash.AppendData([entry.AllowThirdPartyUse ? (byte)1 : (byte)0]);
+            hash.AppendData([entry.Generated ? (byte)1 : (byte)0]);
+            hash.AppendData([candidate.Placeable ? (byte)1 : (byte)0]);
+        }
+
+        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+    }
+
+    private static void AppendCursorStrings(IncrementalHash hash, IReadOnlyList<string> values)
+    {
+        AppendCursorInteger(hash, values.Count);
+        foreach (var value in values)
+        {
+            AppendCursorString(hash, value);
+        }
+    }
+
+    private static void AppendCursorString(IncrementalHash hash, string? value)
+    {
+        if (value is null)
+        {
+            AppendCursorInteger(hash, -1);
+            return;
+        }
+
+        var bytes = StrictUtf8.GetBytes(value);
+        AppendCursorInteger(hash, bytes.Length);
+        hash.AppendData(bytes);
+    }
+
+    private static void AppendCursorInteger(IncrementalHash hash, int value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32BigEndian(bytes, value);
+        hash.AppendData(bytes);
     }
 
     private static int DecodeCursor(string? cursor, string fingerprint, int entryCount)

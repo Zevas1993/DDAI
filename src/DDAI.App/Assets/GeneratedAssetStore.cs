@@ -44,7 +44,7 @@ public sealed class GeneratedAssetStore
     public const int MaximumPreviewBytes = 262_144;
 
     private const int MaximumPersistedImageBytes = 83_886_080;
-    private const int MaximumManifestBytes = 65_536;
+    internal const int MaximumManifestBytes = 65_536;
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> Gates = new(StringComparer.OrdinalIgnoreCase);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -142,14 +142,7 @@ public sealed class GeneratedAssetStore
         var preview = EncodeBoundedPreview(decoded);
         var previewHash = Hash(preview);
 
-        var canonical = new CanonicalImport(
-            contentHash,
-            metadata.Category,
-            metadata.Name,
-            metadata.Tags,
-            metadata.GridWidth,
-            metadata.GridHeight);
-        var canonicalBytes = JsonSerializer.SerializeToUtf8Bytes(canonical, JsonOptions);
+        var canonicalBytes = SerializeCanonicalImport(contentHash, metadata);
         var generatedAssetId = Hash(canonicalBytes);
         var result = new GeneratedAssetImportResult(
             generatedAssetId,
@@ -170,11 +163,11 @@ public sealed class GeneratedAssetStore
             previewHash,
             decoded.Width,
             decoded.Height,
-            canonical.Category,
-            canonical.Name,
-            canonical.Tags,
-            canonical.GridWidth,
-            canonical.GridHeight,
+            metadata.Category,
+            metadata.Name,
+            metadata.Tags,
+            metadata.GridWidth,
+            metadata.GridHeight,
             "staged");
         var manifestBytes = JsonSerializer.SerializeToUtf8Bytes(manifest, JsonOptions);
         GeneratedAssetMutex mutex;
@@ -342,49 +335,168 @@ public sealed class GeneratedAssetStore
             GeneratedAssetDurableMove.Manifest);
     }
 
+    internal static AssetCatalogEntry ReadStagedCatalogEntry(byte[] manifestBytes, string manifestFileName)
+    {
+        ArgumentNullException.ThrowIfNull(manifestBytes);
+        ArgumentException.ThrowIfNullOrWhiteSpace(manifestFileName);
+        ValidateGeneratedManifestWireShape(manifestBytes);
+        var manifest = JsonSerializer.Deserialize<GeneratedAssetManifest>(manifestBytes, JsonOptions)
+            ?? throw Failure("stored_data_invalid", "A generated asset manifest cannot be JSON null.");
+        if (manifest.SchemaVersion != 1 ||
+            !IsHash(manifest.GeneratedAssetId) ||
+            !IsHash(manifest.ContentHash) ||
+            !IsHash(manifest.PreviewHash) ||
+            manifest.Width is < 1 or > MaximumEdge ||
+            manifest.Height is < 1 or > MaximumEdge ||
+            (long)manifest.Width * manifest.Height > MaximumPixels ||
+            !string.Equals(manifest.ActivationState, "staged", StringComparison.Ordinal) ||
+            !string.Equals(Path.GetFileName(manifestFileName), manifestFileName, StringComparison.Ordinal) ||
+            !string.Equals(manifestFileName, manifest.GeneratedAssetId + ".json", StringComparison.Ordinal))
+        {
+            throw Failure("stored_data_invalid", "A generated asset manifest is invalid.");
+        }
+
+        var metadata = ValidateAndCanonicalizeMetadata(
+            manifest.Category,
+            manifest.Name,
+            manifest.Tags,
+            manifest.GridWidth,
+            manifest.GridHeight);
+        if (!string.Equals(metadata.Category, manifest.Category, StringComparison.Ordinal) ||
+            !string.Equals(metadata.Name, manifest.Name, StringComparison.Ordinal) ||
+            !metadata.Tags.SequenceEqual(manifest.Tags, StringComparer.Ordinal) ||
+            !string.Equals(Hash(SerializeCanonicalImport(manifest.ContentHash, metadata)), manifest.GeneratedAssetId, StringComparison.Ordinal))
+        {
+            throw Failure("stored_data_invalid", "A generated asset manifest does not match its canonical identity.");
+        }
+
+        return new AssetCatalogEntry(
+            "sha256:" + manifest.GeneratedAssetId,
+            metadata.Category,
+            metadata.Name,
+            manifest.ContentHash,
+            "ddai-generated",
+            "DDAI Generated Assets",
+            [],
+            metadata.Tags.ToArray(),
+            manifest.PreviewHash,
+            true,
+            true);
+    }
+
+    private static void ValidateGeneratedManifestWireShape(byte[] manifestBytes)
+    {
+        using var document = JsonDocument.Parse(manifestBytes, new JsonDocumentOptions
+        {
+            AllowTrailingCommas = false,
+            CommentHandling = JsonCommentHandling.Disallow,
+            MaxDepth = 8,
+        });
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            throw new JsonException("A generated asset manifest must be a JSON object.");
+        }
+
+        var expected = new HashSet<string>(
+            [
+                "schema_version",
+                "generated_asset_id",
+                "content_hash",
+                "preview_hash",
+                "width",
+                "height",
+                "category",
+                "name",
+                "tags",
+                "grid_width",
+                "grid_height",
+                "activation_state",
+            ],
+            StringComparer.Ordinal);
+        foreach (var property in document.RootElement.EnumerateObject())
+        {
+            if (!expected.Remove(property.Name))
+            {
+                throw new JsonException("A generated asset manifest has duplicate or unsupported properties.");
+            }
+        }
+
+        if (expected.Count != 0)
+        {
+            throw new JsonException("A generated asset manifest is missing required properties.");
+        }
+    }
+
     private static CanonicalMetadata ValidateAndCanonicalizeRequest(GeneratedAssetImportRequest request)
     {
         if (string.IsNullOrWhiteSpace(request.IdempotencyKey))
         {
             throw Failure("invalid_request", "An idempotency key is required.");
         }
-        if (!AssetCategory.IsCanonical(request.Category))
+        var metadata = ValidateAndCanonicalizeMetadata(
+            request.Category,
+            request.Name,
+            request.Tags,
+            request.GridWidth,
+            request.GridHeight);
+        if (request.ContentBase64 is null == (request.InboxToken is null))
+        {
+            throw Failure("invalid_input", "Exactly one generated asset input form is required.");
+        }
+        return metadata;
+    }
+
+    private static CanonicalMetadata ValidateAndCanonicalizeMetadata(
+        string category,
+        string? requestedName,
+        IReadOnlyList<string>? requestedTags,
+        int gridWidth,
+        int gridHeight)
+    {
+        if (!AssetCategory.IsCanonical(category))
         {
             throw Failure("unsupported_category", "The generated asset category is unsupported.");
         }
-        if (!IsWellFormedUtf16(request.Name) || ContainsControlledScalar(request.Name!))
+        if (!IsWellFormedUtf16(requestedName) || ContainsControlledScalar(requestedName!))
         {
             throw Failure("invalid_name", "The generated asset name contains invalid or controlled Unicode.");
         }
-        var name = NormalizeWhitespace(request.Name);
+        var name = NormalizeWhitespace(requestedName);
         if (string.IsNullOrWhiteSpace(name) || CountScalars(name) > 120 || IsPathLikeOrControlledName(name))
         {
             throw Failure("invalid_name", "The generated asset name is invalid or exceeds 120 Unicode scalars.");
         }
-        if (request.Tags is null || request.Tags.Count > 32)
+        if (requestedTags is null || requestedTags.Count > 32)
         {
             throw Failure("invalid_tags", "Generated asset tags are invalid or exceed 32 entries.");
         }
-        if (request.Tags.Any(tag => !IsWellFormedUtf16(tag) || ContainsControlledScalar(tag!)))
+        if (requestedTags.Any(tag => !IsWellFormedUtf16(tag) || ContainsControlledScalar(tag!)))
         {
             throw Failure("invalid_tags", "A generated asset tag contains invalid or controlled Unicode.");
         }
-        var tags = request.Tags.Select(NormalizeTag).ToArray();
+        var tags = requestedTags.Select(NormalizeTag).ToArray();
         if (tags.Any(tag => tag.Length == 0 || CountScalars(tag) > 64 || IsPathLikeOrControlled(tag)))
         {
             throw Failure("invalid_tags", "A generated asset tag is invalid or exceeds 64 Unicode scalars.");
         }
         tags = tags.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
-        if (request.GridWidth is <= 0 or > MaximumEdge || request.GridHeight is <= 0 or > MaximumEdge)
+        if (gridWidth is <= 0 or > MaximumEdge || gridHeight is <= 0 or > MaximumEdge)
         {
             throw Failure("invalid_grid", "Generated asset grid dimensions must be between 1 and 4096.");
         }
-        if (request.ContentBase64 is null == (request.InboxToken is null))
-        {
-            throw Failure("invalid_input", "Exactly one generated asset input form is required.");
-        }
-        return new CanonicalMetadata(request.Category, name, tags, request.GridWidth, request.GridHeight);
+        return new CanonicalMetadata(category, name, tags, gridWidth, gridHeight);
     }
+
+    private static byte[] SerializeCanonicalImport(string contentHash, CanonicalMetadata metadata) =>
+        JsonSerializer.SerializeToUtf8Bytes(
+            new CanonicalImport(
+                contentHash,
+                metadata.Category,
+                metadata.Name,
+                metadata.Tags,
+                metadata.GridWidth,
+                metadata.GridHeight),
+            JsonOptions);
 
     private byte[] ReadInbox(string token)
     {

@@ -1,6 +1,8 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using DDAI.App.Assets;
 using DDAI.Core.Assets;
 using SkiaSharp;
@@ -80,6 +82,113 @@ public sealed class GeneratedCatalogIntegrationTests
         Assert.Equal(afterManifest.CatalogFingerprint, stagedAfterActivation.CatalogFingerprint);
     }
 
+    [Theory]
+    [InlineData("arbitrary-id")]
+    [InlineData("content-hash")]
+    [InlineData("category")]
+    [InlineData("grid-width")]
+    [InlineData("path-name")]
+    [InlineData("controlled-name")]
+    [InlineData("oversize-name")]
+    [InlineData("oversize-tags")]
+    [InlineData("oversize-tag")]
+    [InlineData("noncanonical-tag")]
+    [InlineData("traversal-id")]
+    public async Task Search_RejectsStagedManifestThatDoesNotMatchTheGeneratedStoreCanonicalAuthority(string mutation)
+    {
+        using var sandbox = new GeneratedCatalogSandbox();
+        var imported = await sandbox.ImportAsync("hostile-authority");
+        sandbox.PublishCatalog(revision: 51, additionalEntries: []);
+        var repository = new AssetCatalogRepository(sandbox.CatalogRoot, sandbox.DataRoot, sandbox.TimeProvider);
+        Assert.True(repository.TryRefresh());
+        var accepted = repository.GetCurrent()!.Manifest;
+        var leakedPath = @"C:\Users\Someone\Purchased Pack\secret.png";
+
+        sandbox.MutateManifest(imported.GeneratedAssetId, mutation, leakedPath);
+
+        var result = new AssetSearchService(repository).Search(new AssetSearchQuery(
+            Generated: true,
+            IncludeStagedGenerated: true));
+
+        Assert.Empty(result.Items);
+        Assert.Equal(51, result.CatalogRevision);
+        Assert.Equal(accepted.CatalogFingerprint, result.CatalogFingerprint);
+        Assert.Equal(accepted.SnapshotAt, result.SnapshotAt);
+        Assert.DoesNotContain(leakedPath, JsonSerializer.Serialize(result), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Search_MalformedAndOversizeStagedManifestsDoNotContaminateAcceptedLiveState()
+    {
+        using var sandbox = new GeneratedCatalogSandbox();
+        var imported = await sandbox.ImportAsync("malformed-bounds");
+        sandbox.PublishCatalog(revision: 61, additionalEntries: []);
+        var repository = new AssetCatalogRepository(sandbox.CatalogRoot, sandbox.DataRoot, sandbox.TimeProvider);
+        Assert.True(repository.TryRefresh());
+        var accepted = repository.GetCurrent()!.Manifest;
+        var service = new AssetSearchService(repository);
+
+        File.WriteAllText(sandbox.ManifestPath(imported.GeneratedAssetId), "{\"schema_version\":1}");
+        var malformed = service.Search(new AssetSearchQuery(Generated: true, IncludeStagedGenerated: true));
+        File.WriteAllText(sandbox.ManifestPath(imported.GeneratedAssetId), new string('x', 65_537));
+        var oversize = service.Search(new AssetSearchQuery(Generated: true, IncludeStagedGenerated: true));
+
+        Assert.Empty(malformed.Items);
+        Assert.Empty(oversize.Items);
+        Assert.Equal(accepted.CatalogFingerprint, repository.GetCurrent()!.Manifest.CatalogFingerprint);
+        Assert.Equal(61, repository.GetCurrent()!.Manifest.CatalogRevision);
+    }
+
+    [Fact]
+    public async Task Search_ReparseBackedGeneratedManifestDirectoryDoesNotContaminateAcceptedLiveState()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var sandbox = new GeneratedCatalogSandbox();
+        _ = await sandbox.ImportAsync("reparse-root");
+        sandbox.PublishCatalog(revision: 71, additionalEntries: []);
+        var repository = new AssetCatalogRepository(sandbox.CatalogRoot, sandbox.DataRoot, sandbox.TimeProvider);
+        Assert.True(repository.TryRefresh());
+        var accepted = repository.GetCurrent()!.Manifest;
+
+        sandbox.ReplaceManifestDirectoryWithJunction();
+        var result = new AssetSearchService(repository).Search(new AssetSearchQuery(
+            Generated: true,
+            IncludeStagedGenerated: true));
+
+        Assert.Empty(result.Items);
+        Assert.Equal(71, result.CatalogRevision);
+        Assert.Equal(accepted.CatalogFingerprint, result.CatalogFingerprint);
+    }
+
+    [Fact]
+    public async Task Search_SameReferenceVisibleMetadataMutationInvalidatesAnExistingOverlayCursor()
+    {
+        using var sandbox = new GeneratedCatalogSandbox();
+        var first = await sandbox.ImportAsync("cursor-first", "Alpha Statue");
+        _ = await sandbox.ImportAsync("cursor-second", "Beta Statue");
+        sandbox.PublishCatalog(revision: 81, additionalEntries: []);
+        var repository = new AssetCatalogRepository(sandbox.CatalogRoot, sandbox.DataRoot, sandbox.TimeProvider);
+        Assert.True(repository.TryRefresh());
+        var service = new AssetSearchService(repository);
+        var firstPage = service.Search(new AssetSearchQuery(
+            Generated: true,
+            Limit: 1,
+            IncludeStagedGenerated: true));
+        Assert.NotNull(firstPage.NextCursor);
+
+        sandbox.SetPreviewHash(first.GeneratedAssetId, new string('f', 64));
+
+        Assert.Throws<ArgumentException>(() => service.Search(new AssetSearchQuery(
+            Generated: true,
+            Limit: 1,
+            Cursor: firstPage.NextCursor,
+            IncludeStagedGenerated: true)));
+    }
+
     private static AssetCatalogEntry Entry(string assetRef, string displayName, bool generated = false) => new(
         assetRef,
         "Objects",
@@ -108,6 +217,7 @@ public sealed class GeneratedCatalogIntegrationTests
     private sealed class GeneratedCatalogSandbox : IDisposable
     {
         private static readonly DateTimeOffset SnapshotAt = new(2026, 8, 10, 18, 0, 0, TimeSpan.Zero);
+        private string? manifestJunctionPath;
 
         public GeneratedCatalogSandbox()
         {
@@ -123,6 +233,95 @@ public sealed class GeneratedCatalogIntegrationTests
         public string CatalogRoot { get; }
         public GeneratedAssetStore Store { get; }
         public TimeProvider TimeProvider { get; }
+
+        public Task<GeneratedAssetImportResult> ImportAsync(string key, string name = "Ancient Statue") =>
+            Store.ImportAsync(new GeneratedAssetImportRequest(
+                key,
+                "Objects",
+                name,
+                ["stone", "ruin"],
+                1,
+                1,
+                Convert.ToBase64String(CreatePng()),
+                null));
+
+        public string ManifestPath(string generatedAssetId) =>
+            Path.Combine(DataRoot, "generated-assets", "manifest", generatedAssetId + ".json");
+
+        public void MutateManifest(string generatedAssetId, string mutation, string leakedPath)
+        {
+            var originalPath = ManifestPath(generatedAssetId);
+            var manifest = JsonNode.Parse(File.ReadAllText(originalPath))!.AsObject();
+            switch (mutation)
+            {
+                case "arbitrary-id":
+                    var arbitraryId = generatedAssetId[0] == 'a' ? new string('b', 64) : new string('a', 64);
+                    manifest["generated_asset_id"] = arbitraryId;
+                    File.WriteAllText(ManifestPath(arbitraryId), manifest.ToJsonString());
+                    File.Delete(originalPath);
+                    return;
+                case "content-hash":
+                    manifest["content_hash"] = new string('c', 64);
+                    break;
+                case "category":
+                    manifest["category"] = "Walls";
+                    break;
+                case "grid-width":
+                    manifest["grid_width"] = 2;
+                    break;
+                case "path-name":
+                    manifest["name"] = leakedPath;
+                    break;
+                case "controlled-name":
+                    manifest["name"] = "safe\u202ename";
+                    break;
+                case "oversize-name":
+                    manifest["name"] = new string('n', 121);
+                    break;
+                case "oversize-tags":
+                    manifest["tags"] = new JsonArray(
+                        Enumerable.Range(0, 33).Select(index => JsonValue.Create("tag-" + index)).ToArray());
+                    break;
+                case "oversize-tag":
+                    manifest["tags"] = new JsonArray(new string('t', 65));
+                    break;
+                case "noncanonical-tag":
+                    manifest["tags"] = new JsonArray(" Stone ");
+                    break;
+                case "traversal-id":
+                    manifest["generated_asset_id"] = "../secret";
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(mutation));
+            }
+
+            File.WriteAllText(originalPath, manifest.ToJsonString());
+        }
+
+        public void SetPreviewHash(string generatedAssetId, string previewHash)
+        {
+            var path = ManifestPath(generatedAssetId);
+            var manifest = JsonNode.Parse(File.ReadAllText(path))!.AsObject();
+            manifest["preview_hash"] = previewHash;
+            File.WriteAllText(path, manifest.ToJsonString());
+        }
+
+        public void ReplaceManifestDirectoryWithJunction()
+        {
+            var manifestRoot = Path.Combine(DataRoot, "generated-assets", "manifest");
+            var targetRoot = Path.Combine(DataRoot, "generated-assets", "manifest-target");
+            Directory.Move(manifestRoot, targetRoot);
+            using var process = Process.Start(new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/c mklink /J \"{manifestRoot}\" \"{targetRoot}\"",
+                CreateNoWindow = true,
+                UseShellExecute = false,
+            }) ?? throw new InvalidOperationException("cmd.exe could not create the junction fixture.");
+            process.WaitForExit();
+            Assert.True(process.ExitCode == 0 && Directory.Exists(manifestRoot), "The Windows junction fixture could not be created.");
+            manifestJunctionPath = manifestRoot;
+        }
 
         public void PublishCatalog(long revision, IReadOnlyList<AssetCatalogEntry> additionalEntries)
         {
@@ -178,6 +377,11 @@ public sealed class GeneratedCatalogIntegrationTests
 
         public void Dispose()
         {
+            if (manifestJunctionPath is not null && Directory.Exists(manifestJunctionPath))
+            {
+                Directory.Delete(manifestJunctionPath);
+            }
+
             if (Directory.Exists(DataRoot))
             {
                 Directory.Delete(DataRoot, recursive: true);
