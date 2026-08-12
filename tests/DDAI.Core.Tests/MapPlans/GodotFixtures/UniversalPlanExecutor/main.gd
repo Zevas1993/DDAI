@@ -170,7 +170,8 @@ func _ready():
 	Global.WorldUI = MockWorldUI.new()
 	var bridge = BridgeScript.new()
 	bridge._session_id = "executor-session"
-	bridge._certified_operation_executors = {"wall_polyline": funcref(bridge, "_execute_wall_polyline")}
+	bridge._certified_operation_executors = {"wall_polyline": funcref(bridge, "_execute_wall_polyline"), "cave_region": funcref(bridge, "_execute_cave_region")}
+	bridge._runtime_certified_operation_types = ["wall_polyline"]
 	bridge._asset_list_provider = funcref(self, "_asset_list")
 	bridge._texture_loader = funcref(self, "_texture")
 	bridge._ensure_mailbox_directories()
@@ -191,6 +192,10 @@ func _ready():
 	var fingerprint_ok = plan_fingerprint.length() == 64
 	var validation_ok = bridge._validate_universal_plan(plan, plan.request_id).ok
 	var preflight_ok = bridge._preflight_universal_plan(plan).ok
+	var uncertified_plan = plan.duplicate(true)
+	uncertified_plan.operations[0].operation_type = "cave_region"
+	var uncertified_preflight = bridge._preflight_universal_plan(uncertified_plan)
+	var uncertified_executor_rejected = not uncertified_preflight.ok and uncertified_preflight.error.code == "unsupported_operation"
 	Global.Editor.ActiveToolName = ""
 	var unnamed_inactive_tool_preflight_ok = bridge._preflight_universal_plan(plan).ok
 	Global.Editor.ActiveToolName = null
@@ -317,12 +322,24 @@ func _ready():
 	var repeated_preflight_ok = bridge._preflight_universal_plan(repeated_asset_plan).ok and _asset_list_calls - calls_before_repeated == 1
 	_clear_request_state("universal-bad-level")
 	var correlated_failure = yield(_run_job(bridge, bad_level_plan), "completed")
-	var preflight_correlation_ok = not correlated_failure.success and correlated_failure.error.code == "unsupported_level" and correlated_failure.payload.map_id == bad_level_plan.expected_map_id and int(correlated_failure.payload.starting_map_revision) == int(bad_level_plan.base_revision) and int(correlated_failure.payload.catalog_revision) == int(bad_level_plan.expected_catalog_revision) and correlated_failure.payload.catalog_fingerprint == _accepted_catalog_fingerprint
+	var preflight_correlation_ok = typeof(correlated_failure) == TYPE_DICTIONARY and correlated_failure.has("success") and not correlated_failure.success and correlated_failure.has("error") and typeof(correlated_failure.error) == TYPE_DICTIONARY and correlated_failure.has("payload") and typeof(correlated_failure.payload) == TYPE_DICTIONARY
+	if preflight_correlation_ok:
+		preflight_correlation_ok = correlated_failure.error.get("code", "") == "unsupported_level"
+	if preflight_correlation_ok:
+		preflight_correlation_ok = correlated_failure.payload.get("map_id", "") == bad_level_plan.expected_map_id
+	if preflight_correlation_ok:
+		preflight_correlation_ok = int(correlated_failure.payload.get("starting_map_revision", -1)) == int(bad_level_plan.base_revision)
+	if preflight_correlation_ok:
+		preflight_correlation_ok = int(correlated_failure.payload.get("catalog_revision", -1)) == int(bad_level_plan.expected_catalog_revision)
+	if preflight_correlation_ok:
+		preflight_correlation_ok = correlated_failure.payload.get("catalog_fingerprint", "") == _accepted_catalog_fingerprint
 	var catalog_race_plan = _plan(bridge, "universal-catalog-race", bridge._map_job_revision)
 	_clear_request_state("universal-catalog-race")
 	_publish_newer_catalog(bridge)
 	var catalog_race_failure = yield(_run_job(bridge, catalog_race_plan), "completed")
-	var catalog_race_correlation_ok = not catalog_race_failure.success and catalog_race_failure.error.code == "catalog_revision_mismatch" and int(catalog_race_failure.payload.catalog_revision) == 7 and catalog_race_failure.payload.catalog_fingerprint == _accepted_catalog_fingerprint
+	var catalog_race_correlation_ok = typeof(catalog_race_failure) == TYPE_DICTIONARY and catalog_race_failure.has("success") and not catalog_race_failure.success and catalog_race_failure.has("error") and typeof(catalog_race_failure.error) == TYPE_DICTIONARY and catalog_race_failure.has("payload") and typeof(catalog_race_failure.payload) == TYPE_DICTIONARY
+	if catalog_race_correlation_ok:
+		catalog_race_correlation_ok = catalog_race_failure.error.get("code", "") == "catalog_revision_mismatch" and int(catalog_race_failure.payload.get("catalog_revision", -1)) == 7 and catalog_race_failure.payload.get("catalog_fingerprint", "") == _accepted_catalog_fingerprint
 
 	var tampered = bridge._new_map_job_journal(crash_request, crash_request_fingerprint, bridge._universal_plan_fingerprint_input(crash_plan).sha256_text(), {
 		"map_id": crash_plan.expected_map_id,
@@ -374,6 +391,7 @@ func _ready():
 	print("DDAI_UNIVERSAL_PLAN_JSON:", to_json(plan))
 	print("DDAI_UNIVERSAL_PLAN_FINGERPRINT:", plan_fingerprint)
 	print("DDAI_UNIVERSAL_VALIDATION_PREFLIGHT:", validation_ok and preflight_ok and unnamed_inactive_tool_preflight_ok and null_inactive_tool_preflight_ok)
+	print("DDAI_UNIVERSAL_UNCERTIFIED_EXECUTOR_REJECTED:", uncertified_executor_rejected)
 	print("DDAI_UNIVERSAL_APPLY_OBSERVE:", observed_ok)
 	print("DDAI_UNIVERSAL_COMPLETION_TAMPER_BLOCKED:", completion_tamper_blocked)
 	print("DDAI_UNIVERSAL_REVERSAL:", reversal_ok)

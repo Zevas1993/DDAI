@@ -6,6 +6,28 @@ namespace DDAI.Core.Tests.Mailbox;
 
 public sealed class UniversalMapJobStateMachineTests
 {
+    [Theory]
+    [InlineData("terrain-stroke")]
+    [InlineData("pattern-region")]
+    [InlineData("colorable-pattern-region")]
+    [InlineData("cave-region")]
+    [InlineData("roof-region")]
+    public void SurfaceOperationObservationFailure_ReversesOnlyItsBoundEvidence(string operationId)
+    {
+        using var sandbox = new JobSandbox("surface-" + operationId);
+        var runtime = new RecordingRuntime { ObservationResult = false };
+        using var machine = sandbox.Create(runtime);
+        var submission = sandbox.Submission with { OperationIds = [operationId] };
+
+        Assert.Equal(MapJobSubmissionResult.Accepted, machine.Submit(submission));
+        RunToNoWork(machine, submission.RequestId);
+
+        Assert.Equal([0], runtime.Applied);
+        Assert.Equal([0], runtime.Observed);
+        Assert.Equal([0], runtime.Reversed);
+        Assert.Contains("reversed", File.ReadAllText(sandbox.ResponsePath), StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Advance_PerformsExactlyOneBoundaryAndConvergesToCleanup()
     {

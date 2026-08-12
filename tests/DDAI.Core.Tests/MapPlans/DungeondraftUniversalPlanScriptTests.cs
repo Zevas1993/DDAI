@@ -8,6 +8,53 @@ namespace DDAI.Core.Tests.MapPlans;
 public sealed class DungeondraftUniversalPlanScriptTests
 {
     [Fact]
+    public void FreshRequestsCannotStarveBehindARecoverableProcessingClaim()
+    {
+        var body = FunctionBody(ReadBridge(), "_process_one_request");
+
+        Assert.True(
+            body.IndexOf("_claim_next_request()", StringComparison.Ordinal) <
+            body.IndexOf("_claim_next_processing()", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ProcessingClaimsRoundRobinSoOneBlockedClaimCannotStarvePreparedJobs()
+    {
+        var script = ReadBridge();
+        var claim = FunctionBody(script, "_claim_next_processing");
+
+        Assert.Contains("_processing_claim_cursor", script, StringComparison.Ordinal);
+        Assert.Contains("file_names.sort()", claim, StringComparison.Ordinal);
+        Assert.Contains("MAXIMUM_PROCESSING_CLAIMS", claim, StringComparison.Ordinal);
+        Assert.Contains("(_processing_claim_cursor + offset) % file_names.size()", claim, StringComparison.Ordinal);
+        Assert.Contains("_processing_claim_cursor = (index + 1) % file_names.size()", claim, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void StatusCapturesTheOpenMapBaselineAfterDungeondraftFinishesStartup()
+    {
+        var script = ReadBridge();
+        var start = FunctionBody(script, "start");
+        var update = FunctionBody(script, "update");
+        var status = FunctionBody(script, "_status_payload");
+
+        Assert.Contains("if _asset_list_provider == null:\n\t\t_asset_list_provider =", start, StringComparison.Ordinal);
+        Assert.Contains("if _texture_loader == null:\n\t\t_texture_loader =", start, StringComparison.Ordinal);
+        Assert.DoesNotContain("_capture_map_job_state_fingerprint()", start, StringComparison.Ordinal);
+        Assert.DoesNotContain("_recover_processing_claims()", start, StringComparison.Ordinal);
+        Assert.DoesNotContain("_capture_map_job_state_fingerprint()", update, StringComparison.Ordinal);
+        Assert.Contains("_capture_map_job_state_fingerprint()", status, StringComparison.Ordinal);
+        Assert.Contains("_map_job_state_fingerprint = current_state_fingerprint", status, StringComparison.Ordinal);
+        Assert.Contains("_claim_next_processing()", FunctionBody(script, "_process_one_request"), StringComparison.Ordinal);
+
+        var capture = FunctionBody(script, "_capture_map_job_state_fingerprint");
+        Assert.Contains("_inspect_map_payload", capture, StringComparison.Ordinal);
+        Assert.DoesNotContain("_terrain_state_hash", capture, StringComparison.Ordinal);
+        Assert.DoesNotContain("_cave_state_hash", capture, StringComparison.Ordinal);
+    }
+
+
+    [Fact]
     public void V2PlansRouteToTheUniversalStateMachineBeforeLegacyValidation()
     {
         var script = ReadBridge();
@@ -30,8 +77,7 @@ public sealed class DungeondraftUniversalPlanScriptTests
                  {
                      "MAXIMUM_UNIVERSAL_OPERATIONS", "MAXIMUM_UNIVERSAL_POINTS",
                      "expected_map_id", "base_revision", "expected_catalog_revision",
-                     "coordinate_system", "operations", "operation_type", "wall_polyline",
-                     "asset_ref", "level_id", "path", "color_rgba",
+                     "coordinate_system", "operations", "_validate_universal_operation",
                  })
         {
             Assert.Contains(token, body, StringComparison.Ordinal);
@@ -40,7 +86,11 @@ public sealed class DungeondraftUniversalPlanScriptTests
         Assert.Contains("_dictionary_has_exact_keys", body, StringComparison.Ordinal);
         Assert.Contains("operations.size() > MAXIMUM_UNIVERSAL_OPERATIONS", body, StringComparison.Ordinal);
         Assert.Contains("operations.size() == 0", body, StringComparison.Ordinal);
-        Assert.Contains("points.size() > MAXIMUM_UNIVERSAL_POINTS", body, StringComparison.Ordinal);
+        var operationValidation = FunctionBody(script, "_validate_universal_operation");
+        Assert.Contains("operation_type", operationValidation, StringComparison.Ordinal);
+        Assert.Contains("wall_polyline", operationValidation, StringComparison.Ordinal);
+        Assert.Contains("asset_ref", operationValidation, StringComparison.Ordinal);
+        Assert.Contains("points.size() > MAXIMUM_UNIVERSAL_POINTS", operationValidation, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -60,6 +110,11 @@ public sealed class DungeondraftUniversalPlanScriptTests
             Assert.Contains(token, body, StringComparison.Ordinal);
         }
         Assert.Contains("_current_level_ids().has(operation.level_id)", body, StringComparison.Ordinal);
+        Assert.Contains("_map_job_revision += 1", body, StringComparison.Ordinal);
+        Assert.Contains("_map_job_state_fingerprint = current_state_fingerprint", body, StringComparison.Ordinal);
+        Assert.True(
+            body.IndexOf("_map_job_state_fingerprint = current_state_fingerprint", StringComparison.Ordinal) <
+            body.IndexOf("_map_job_revision != int(plan.base_revision)", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -80,6 +135,34 @@ public sealed class DungeondraftUniversalPlanScriptTests
 
         var identity = FunctionBody(script, "_catalog_identity_matches");
         Assert.Contains("_read_current_catalog_identity", identity, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RecoveryCanCorrelateAValidatedHistoricalCatalogAfterPointerRotation()
+    {
+        var script = ReadBridge();
+        var body = FunctionBody(script, "_read_catalog_identity_for_revision");
+
+        Assert.Contains("/catalog/snapshots", body, StringComparison.Ordinal);
+        Assert.Contains("MAXIMUM_CATALOG_SNAPSHOTS", body, StringComparison.Ordinal);
+        Assert.Contains("var revision_marker = \"-\" + str(expected_revision) + \"-\"", body, StringComparison.Ordinal);
+        Assert.Contains("snapshot_name.find(revision_marker) != -1", body, StringComparison.Ordinal);
+        Assert.Contains("_catalog_manifest_is_valid", body, StringComparison.Ordinal);
+        Assert.Contains("int(manifest.catalog_revision) == expected_revision", body, StringComparison.Ordinal);
+        Assert.Contains("matched_fingerprint != manifest.catalog_fingerprint", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PreflightMayUseTheLastValidatedSnapshotWhileLiveResolutionStillFailsClosed()
+    {
+        var script = ReadBridge();
+        var identity = FunctionBody(script, "_read_current_catalog_identity");
+        var preflight = FunctionBody(script, "_preflight_universal_plan");
+
+        Assert.DoesNotContain("pointer.session_id != _session_id", identity, StringComparison.Ordinal);
+        Assert.DoesNotContain("manifest.session_id != _session_id", identity, StringComparison.Ordinal);
+        Assert.Contains("_resolve_live_asset", preflight, StringComparison.Ordinal);
+        Assert.Contains("resource_fingerprint", preflight, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -108,6 +191,21 @@ public sealed class DungeondraftUniversalPlanScriptTests
     }
 
     [Fact]
+    public void UniversalPreflightFailuresResumeTheirJournalInsteadOfBlockingTheMailbox()
+    {
+        var body = FunctionBody(ReadBridge(), "_advance_universal_plan_claim");
+        var journalCheck = body.IndexOf("directory.file_exists(_journal_path)", StringComparison.Ordinal);
+        var completionCheck = body.IndexOf("directory.file_exists(completed_path)", StringComparison.Ordinal);
+        var newJobCheck = body.IndexOf("not directory.file_exists(job_path)", StringComparison.Ordinal);
+
+        Assert.True(journalCheck >= 0);
+        Assert.True(journalCheck < completionCheck);
+        Assert.True(journalCheck < newJobCheck);
+        Assert.Contains("_read_validated_journal(_journal_path, request, request_fingerprint)", body, StringComparison.Ordinal);
+        Assert.Contains("_advance_journaled_response", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void DispatcherUsesOnlyExplicitCertifiedOperationFunctions()
     {
         var script = ReadBridge();
@@ -119,8 +217,7 @@ public sealed class DungeondraftUniversalPlanScriptTests
         Assert.Contains("call_func", dispatcher, StringComparison.Ordinal);
         Assert.DoesNotContain("call(operation.operation_type", dispatcher, StringComparison.Ordinal);
         Assert.Contains("_reverse_wall_polyline", reversal, StringComparison.Ordinal);
-        Assert.Contains("Global.World.HasNodeID", reversalObservation, StringComparison.Ordinal);
-        Assert.Contains("Global.World.GetNodeByID", reversalObservation, StringComparison.Ordinal);
+        Assert.Contains("_observe_addressable_surface_reversal", reversalObservation, StringComparison.Ordinal);
         var wallExecutor = FunctionBody(script, "_execute_wall_polyline");
         Assert.Contains("Global.WorldUI.AddPolyPoint", wallExecutor, StringComparison.Ordinal);
         Assert.Contains("wall_tool.EndWall(operation.closed)", wallExecutor, StringComparison.Ordinal);
@@ -128,23 +225,24 @@ public sealed class DungeondraftUniversalPlanScriptTests
         Assert.Contains("_cleanup_wall_tool(wall_tool, not wall_tool_was_active)", wallExecutor, StringComparison.Ordinal);
         Assert.DoesNotContain("level.Walls.AddWall", wallExecutor, StringComparison.Ordinal);
         Assert.DoesNotContain("GetNodeID()", wallExecutor, StringComparison.Ordinal);
-        var observation = FunctionBody(script, "_observe_operation");
-        Assert.Contains("level.Walls.get_children()", observation, StringComparison.Ordinal);
-        Assert.Contains("inspected_wall_count > MAXIMUM_INSPECTION_STATE_ITEMS", observation, StringComparison.Ordinal);
-        Assert.Contains("observed_node_counts[wall_id.value]", observation, StringComparison.Ordinal);
-        Assert.Contains("observed_node_counts.get(int(node_id), 0) != 1", observation, StringComparison.Ordinal);
-        Assert.Contains("registered_node_ids[int(node_id)] = true", observation, StringComparison.Ordinal);
+        var observation = FunctionBody(script, "_observe_addressable_surface");
+        var addressableNodes = FunctionBody(script, "_addressable_surface_nodes");
+        Assert.Contains("level.Walls.get_children()", addressableNodes, StringComparison.Ordinal);
+        Assert.Contains("MAXIMUM_INSPECTION_STATE_ITEMS", addressableNodes, StringComparison.Ordinal);
+        Assert.Contains("counts[node_id.value]", observation, StringComparison.Ordinal);
+        Assert.Contains("counts.get(int(node_id), 0) != 1", observation, StringComparison.Ordinal);
+        Assert.Contains("targets[int(node_id)] = true", observation, StringComparison.Ordinal);
         Assert.DoesNotContain("wall == registered_node", observation, StringComparison.Ordinal);
         Assert.DoesNotContain("registered_nodes[int(node_id)] = registered_node", observation, StringComparison.Ordinal);
         Assert.DoesNotContain("Global.World.GetNodeByID", observation, StringComparison.Ordinal);
         var stateMachine = FunctionBody(script, "_advance_universal_plan_claim");
-        Assert.Contains("var observation_result = _observe_operation(job.current_operation_node_ids)", stateMachine, StringComparison.Ordinal);
+        Assert.Contains("var observation_result = _observe_operation(plan.operations[int(job.next_operation_index)], job.current_operation_node_ids, key)", stateMachine, StringComparison.Ordinal);
         Assert.Contains("_pending_observation_results[key] = observation_result", stateMachine, StringComparison.Ordinal);
         Assert.DoesNotContain("_pending_observation_results[key] = _observe_operation", stateMachine, StringComparison.Ordinal);
         Assert.DoesNotContain("registered_node.get_parent()", observation, StringComparison.Ordinal);
         Assert.True(
-            observation.IndexOf("level.Walls.get_child_count()", StringComparison.Ordinal) <
-            observation.IndexOf("level.Walls.get_children()", StringComparison.Ordinal));
+            addressableNodes.IndexOf("level.Walls.get_child_count()", StringComparison.Ordinal) <
+            addressableNodes.IndexOf("level.Walls.get_children()", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -243,13 +341,14 @@ public sealed class DungeondraftUniversalPlanScriptTests
 
             var output = await outputTask;
             var error = await errorTask;
-            Assert.True(exited, "Pinned Godot universal executor harness timed out.");
+            Assert.True(exited, $"Pinned Godot universal executor harness timed out.\nstdout:\n{output}\nstderr:\n{error}");
             Assert.True(process.ExitCode == 0, $"Godot exited {process.ExitCode}.\nstdout:\n{output}\nstderr:\n{error}");
             Assert.True(string.IsNullOrEmpty(error), $"Godot stderr:\n{error}");
             foreach (var receipt in new[]
                      {
                          "DDAI_UNIVERSAL_FINGERPRINT:True",
                          "DDAI_UNIVERSAL_VALIDATION_PREFLIGHT:True",
+                         "DDAI_UNIVERSAL_UNCERTIFIED_EXECUTOR_REJECTED:True",
                          "DDAI_UNIVERSAL_APPLY_OBSERVE:True",
                          "DDAI_UNIVERSAL_COMPLETION_TAMPER_BLOCKED:True",
                          "DDAI_UNIVERSAL_REVERSAL:True",

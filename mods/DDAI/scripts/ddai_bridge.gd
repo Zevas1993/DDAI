@@ -16,9 +16,13 @@ const MAXIMUM_INSPECTION_LEVELS = 128
 const MAXIMUM_INSPECTION_LABEL_LENGTH = 256
 const MAXIMUM_UNIVERSAL_OPERATIONS = 500
 const MAXIMUM_UNIVERSAL_POINTS = 10000
+const MAXIMUM_SURFACE_SAMPLES = 10000
+const MAXIMUM_TERRAIN_BLEND_PIXELS = 262144
 const MINIMUM_UNIVERSAL_NONZERO_MAGNITUDE = 1e-300
 const MAXIMUM_CATALOG_CHUNKS = 4096
 const MAXIMUM_CATALOG_ENTRIES = 100000
+const MAXIMUM_CATALOG_SNAPSHOTS = 4096
+const MAXIMUM_PROCESSING_CLAIMS = 4096
 const CATALOG_SCHEMA_VERSION = "1.0"
 const CATALOG_CATEGORIES = [
 	"Terrain",
@@ -52,7 +56,9 @@ var _pending_operation_results = {}
 var _pending_observation_results = {}
 var _pending_reversal_results = {}
 var _resolved_job_assets = {}
+var _processing_claim_cursor = 0
 var _certified_operation_executors = {}
+var _runtime_certified_operation_types = ["wall_polyline"]
 var _operation_certifications = []
 var _asset_list_provider = null
 var _texture_loader = null
@@ -63,6 +69,11 @@ func start():
 	_ensure_mailbox_directories()
 	_session_id = str(OS.get_unix_time()) + "-" + str(OS.get_ticks_msec())
 	_certified_operation_executors = {
+		"terrain_stroke": funcref(self, "_execute_terrain_stroke"),
+		"pattern_region": funcref(self, "_execute_pattern_region"),
+		"colorable_pattern_region": funcref(self, "_execute_pattern_region"),
+		"cave_region": funcref(self, "_execute_cave_region"),
+		"roof_region": funcref(self, "_execute_roof_region"),
 		"wall_polyline": funcref(self, "_execute_wall_polyline"),
 	}
 	_operation_certifications = _certify_operation_routes()
@@ -70,9 +81,27 @@ func start():
 		_asset_list_provider = funcref(self, "_get_live_asset_list")
 	if _texture_loader == null:
 		_texture_loader = funcref(self, "_load_live_texture")
-	_recover_processing_claims()
 	_write_runtime_receipt()
 	_write_heartbeat()
+	_probe_managed_adapter()
+
+
+func _probe_managed_adapter():
+	var available = false
+	var reason = "csharp_script_unavailable"
+	if ClassDB.class_exists("CSharpScript"):
+		var script = ClassDB.instance("CSharpScript")
+		if script != null:
+			script.source_code = "using Godot; public class DdaiManagedAdapter : Reference { public string Ping() { return \"ddai-managed-adapter-v1\"; } }"
+			if script.reload(false) == OK:
+				var instance = script.new()
+				if instance != null and instance.call("Ping") == "ddai-managed-adapter-v1":
+					available = true
+					reason = "available"
+	var path = MAILBOX_ROOT + "/runtime-receipts/managed-adapter.json"
+	var record = {"schema_version": MAILBOX_SCHEMA_VERSION, "available": available, "reason": reason}
+	var directory = Directory.new()
+	return (_replace_json_recoverably(path, record) if directory.file_exists(path) else _write_json_atomically(path, record)) != "write_failed"
 
 
 # Called by Dungeondraft every frame. This is a filesystem poller, never a network listener.
@@ -90,14 +119,14 @@ func update(delta):
 
 func _ensure_mailbox_directories():
 	var directory = Directory.new()
-	for name in ["requests", "processing", "responses", "failed", "journal", "mutation-intents", "map-jobs", "map-completed", "runtime-receipts", "runtime-heartbeats"]:
+	for name in ["requests", "processing", "responses", "failed", "journal", "mutation-intents", "map-jobs", "map-completed", "surface-rollbacks", "runtime-receipts", "runtime-heartbeats"]:
 		directory.make_dir_recursive(MAILBOX_ROOT + "/" + name)
 
 
 func _process_one_request():
-	var claim = _claim_next_processing()
+	var claim = _claim_next_request()
 	if not claim.has("path"):
-		claim = _claim_next_request()
+		claim = _claim_next_processing()
 	if not claim.has("path"):
 		return
 	_run_claim_state_machine(claim)
@@ -261,6 +290,11 @@ func _advance_universal_plan_claim(claim, request, request_fingerprint, _journal
 	var job_path = MAILBOX_ROOT + "/map-jobs/" + key + ".json"
 	var completed_path = MAILBOX_ROOT + "/map-completed/" + key + ".json"
 	var directory = Directory.new()
+	if directory.file_exists(_journal_path):
+		var existing_journal = _read_validated_journal(_journal_path, request, request_fingerprint)
+		if not existing_journal.ok:
+			return "blocked"
+		return _advance_journaled_response(claim, request, request_fingerprint, _journal_path, response_path, key, existing_journal.journal.response_text)
 
 	if directory.file_exists(completed_path):
 		var completed = _read_bounded_dictionary(completed_path)
@@ -334,14 +368,16 @@ func _advance_universal_plan_claim(claim, request, request_fingerprint, _journal
 		if not _catalog_identity_matches(job):
 			return _begin_map_job_reversal(job_path, job, key, false)
 		_newly_prepared_job_keys.erase(key)
-		var operation_result = _execute_operation(plan.operations[int(job.next_operation_index)], key)
+		var operation_result = _execute_operation(plan.operations[int(job.next_operation_index)], key, plan.canvas)
 		_pending_operation_results[key] = operation_result
 		return "map_job_native_operation_called"
 	if job.state == "operation_applied":
 		if _pending_observation_results.has(key):
 			var observed = _pending_observation_results[key]
 			_pending_observation_results.erase(key)
-			if observed:
+			if observed == "pending":
+				return "map_job_native_observation_pending"
+			if observed == "observed":
 				job.operation_observations.append({
 					"operation_index": int(job.next_operation_index),
 					"operation_id": plan.operations[int(job.next_operation_index)].operation_id,
@@ -361,7 +397,7 @@ func _advance_universal_plan_claim(claim, request, request_fingerprint, _journal
 				_map_job_state_fingerprint = job.map_state_fingerprint
 				return "map_job_operation_observed"
 			return _begin_map_job_reversal(job_path, job, key, true)
-		var observation_result = _observe_operation(job.current_operation_node_ids)
+		var observation_result = _observe_operation(plan.operations[int(job.next_operation_index)], job.current_operation_node_ids, key)
 		_pending_observation_results[key] = observation_result
 		return "map_job_native_operation_observed"
 	if job.state == "operation_observed":
@@ -375,7 +411,7 @@ func _advance_universal_plan_claim(claim, request, request_fingerprint, _journal
 	if job.state == "reversing":
 		if _pending_reversal_results.has(key):
 			var pending_reversal = _pending_reversal_results[key]
-			if _observe_reversal(pending_reversal.node_ids):
+			if _observe_reversal(plan.operations[int(job.reversal_operation_index)], pending_reversal.node_ids, key):
 				_pending_reversal_results.erase(key)
 				if int(job.reversal_operation_index) == 0:
 					var reversed_observed_operation = int(job.reversal_operation_index) < int(job.next_operation_index)
@@ -412,7 +448,7 @@ func _advance_universal_plan_claim(claim, request, request_fingerprint, _journal
 			job.canonical_response = null
 			return "map_job_outcome_unknown" if _write_map_job_journal(job_path, job, true) == "replaced" else "blocked"
 		_newly_reversing_job_keys.erase(key)
-		if not _reverse_operation(plan.operations[int(job.reversal_operation_index)], job.current_operation_node_ids):
+		if not _reverse_operation(plan.operations[int(job.reversal_operation_index)], job.current_operation_node_ids, key):
 			job.state = "outcome_unknown"
 			job.canonical_response = null
 			return "map_job_outcome_unknown" if _write_map_job_journal(job_path, job, true) == "replaced" else "blocked"
@@ -473,30 +509,64 @@ func _validate_universal_plan(plan, expected_request_id):
 	for index in range(plan.operations.size()):
 		var operation = plan.operations[index]
 		var operation_path = "payload.operations[" + str(index) + "]"
-		if typeof(operation) != TYPE_DICTIONARY or not _dictionary_has_exact_keys(operation, ["operation_type", "operation_id", "level_id", "asset_ref", "path", "closed", "color_rgba"]):
-			return {"ok": false, "error": _error("malformed_operation", "Wall operation fields are missing or unsupported.", operation_path)}
-		if operation.operation_type != "wall_polyline" or not _certified_operation_executors.has(operation.operation_type):
-			return {"ok": false, "error": _error("unsupported_operation", "The operation type is not certified by this runtime.", operation_path + ".operation_type")}
-		if typeof(operation.operation_id) != TYPE_STRING or not _is_safe_request_id(operation.operation_id) or operation_ids.has(operation.operation_id):
-			return {"ok": false, "error": _error("invalid_operation_id", "operation_id must be safe and unique.", operation_path + ".operation_id")}
-		operation_ids[operation.operation_id] = true
-		if typeof(operation.level_id) != TYPE_STRING or not _is_safe_request_id(operation.level_id):
-			return {"ok": false, "error": _error("invalid_level_id", "level_id must be safe.", operation_path + ".level_id")}
-		if typeof(operation.asset_ref) != TYPE_STRING or operation.asset_ref.length() != 71 or not operation.asset_ref.begins_with("sha256:") or not _is_sha256(operation.asset_ref.substr(7, 64)):
-			return {"ok": false, "error": _error("invalid_asset_ref", "asset_ref must be a canonical opaque SHA-256 reference.", operation_path + ".asset_ref")}
-		if typeof(operation.path) != TYPE_DICTIONARY or not _dictionary_has_exact_keys(operation.path, ["points"]) or typeof(operation.path.points) != TYPE_ARRAY:
-			return {"ok": false, "error": _error("invalid_path", "Wall path must contain a points array.", operation_path + ".path")}
-		var points = operation.path.points
-		if points.size() < 2 or points.size() > MAXIMUM_UNIVERSAL_POINTS or total_points > MAXIMUM_UNIVERSAL_POINTS - points.size():
-			return {"ok": false, "error": _error("invalid_path", "Wall path point count is outside the bounded range.", operation_path + ".path.points")}
-		total_points += points.size()
-		for point_index in range(points.size()):
-			var point = points[point_index]
-			if typeof(point) != TYPE_DICTIONARY or not _dictionary_has_exact_keys(point, ["x", "y"]) or not _is_bounded_grid_point(point, plan.canvas):
-				return {"ok": false, "error": _error("invalid_point", "Wall points must be finite and inside the canvas.", operation_path + ".path.points[" + str(point_index) + "]")}
-		if typeof(operation.closed) != TYPE_BOOL or typeof(operation.color_rgba) != TYPE_STRING or not _is_rgba(operation.color_rgba):
-			return {"ok": false, "error": _error("invalid_wall_style", "Wall closed and color values are invalid.", operation_path)}
+		var operation_validation = _validate_universal_operation(operation, operation_path, plan.canvas, operation_ids)
+		if not operation_validation.ok:
+			return operation_validation
+		if total_points > MAXIMUM_UNIVERSAL_POINTS - int(operation_validation.point_count):
+			return {"ok": false, "error": _error("invalid_geometry", "The plan exceeds its bounded geometry count.", operation_path)}
+		total_points += int(operation_validation.point_count)
 	return {"ok": true, "plan": plan}
+
+
+func _validate_universal_operation(operation, operation_path, canvas, operation_ids):
+	if typeof(operation) != TYPE_DICTIONARY or typeof(operation.get("operation_type", null)) != TYPE_STRING:
+		return {"ok": false, "error": _error("malformed_operation", "Operation fields are missing or unsupported.", operation_path)}
+	var operation_type = operation.operation_type
+	var expected_keys = {
+		"terrain_stroke": ["operation_type", "operation_id", "level_id", "asset_ref", "path", "width", "strength"],
+		"pattern_region": ["operation_type", "operation_id", "level_id", "asset_ref", "region", "rotation_degrees", "layer"],
+		"colorable_pattern_region": ["operation_type", "operation_id", "level_id", "asset_ref", "region", "color_rgba", "rotation_degrees", "layer"],
+		"cave_region": ["operation_type", "operation_id", "level_id", "asset_ref", "region", "floor_color_rgba", "wall_color_rgba"],
+		"roof_region": ["operation_type", "operation_id", "level_id", "asset_ref", "region", "width", "shade"],
+		"wall_polyline": ["operation_type", "operation_id", "level_id", "asset_ref", "path", "closed", "color_rgba"],
+	}
+	if not expected_keys.has(operation_type) or not _certified_operation_executors.has(operation_type):
+		return {"ok": false, "error": _error("unsupported_operation", "The operation type is not implemented by this runtime.", operation_path + ".operation_type")}
+	if not _dictionary_has_exact_keys(operation, expected_keys[operation_type]):
+		return {"ok": false, "error": _error("malformed_operation", "Operation fields are missing or unsupported.", operation_path)}
+	if typeof(operation.operation_id) != TYPE_STRING or not _is_safe_request_id(operation.operation_id) or operation_ids.has(operation.operation_id):
+		return {"ok": false, "error": _error("invalid_operation_id", "operation_id must be safe and unique.", operation_path + ".operation_id")}
+	operation_ids[operation.operation_id] = true
+	if typeof(operation.level_id) != TYPE_STRING or not _is_safe_request_id(operation.level_id):
+		return {"ok": false, "error": _error("invalid_level_id", "level_id must be safe.", operation_path + ".level_id")}
+	if typeof(operation.asset_ref) != TYPE_STRING or operation.asset_ref.length() != 71 or not operation.asset_ref.begins_with("sha256:") or not _is_sha256(operation.asset_ref.substr(7, 64)):
+		return {"ok": false, "error": _error("invalid_asset_ref", "asset_ref must be a canonical opaque SHA-256 reference.", operation_path + ".asset_ref")}
+	var geometry_name = "path" if operation_type in ["terrain_stroke", "wall_polyline"] else "region"
+	var geometry = operation[geometry_name]
+	var minimum_points = 2 if geometry_name == "path" else 3
+	if typeof(geometry) != TYPE_DICTIONARY or not _dictionary_has_exact_keys(geometry, ["points"]) or typeof(geometry.points) != TYPE_ARRAY or geometry.points.size() < minimum_points or geometry.points.size() > MAXIMUM_UNIVERSAL_POINTS:
+		return {"ok": false, "error": _error("invalid_geometry", "Operation geometry is outside its bounded shape contract.", operation_path + "." + geometry_name)}
+	var unique_points = {}
+	for point_index in range(geometry.points.size()):
+		var point = geometry.points[point_index]
+		if typeof(point) != TYPE_DICTIONARY or not _dictionary_has_exact_keys(point, ["x", "y"]) or not _is_bounded_grid_point(point, canvas):
+			return {"ok": false, "error": _error("invalid_point", "Geometry points must be finite and inside the canvas.", operation_path + "." + geometry_name + ".points[" + str(point_index) + "]")}
+		unique_points[_double_fingerprint_text(float(point.x)) + _double_fingerprint_text(float(point.y))] = true
+	if geometry_name == "region" and unique_points.size() < 3:
+		return {"ok": false, "error": _error("invalid_polygon", "A region requires three unique points.", operation_path + ".region")}
+	if operation_type == "terrain_stroke" and (not _is_positive_universal_number(operation.width) or not _is_unit_universal_number(operation.strength)):
+		return {"ok": false, "error": _error("invalid_terrain_style", "Terrain width and strength are invalid.", operation_path)}
+	if operation_type in ["pattern_region", "colorable_pattern_region"] and (not _is_rotation(operation.rotation_degrees) or not _is_supported_layer(operation.layer)):
+		return {"ok": false, "error": _error("invalid_pattern_style", "Pattern rotation or layer is invalid.", operation_path)}
+	if operation_type == "colorable_pattern_region" and not _is_rgba(operation.color_rgba):
+		return {"ok": false, "error": _error("invalid_pattern_style", "Pattern color is invalid.", operation_path + ".color_rgba")}
+	if operation_type == "cave_region" and (not _is_rgba(operation.floor_color_rgba) or not _is_rgba(operation.wall_color_rgba)):
+		return {"ok": false, "error": _error("invalid_cave_style", "Cave colors are invalid.", operation_path)}
+	if operation_type == "roof_region" and (not _is_positive_universal_number(operation.width) or not _is_unit_universal_number(operation.shade)):
+		return {"ok": false, "error": _error("invalid_roof_style", "Roof width or shade is invalid.", operation_path)}
+	if operation_type == "wall_polyline" and (typeof(operation.closed) != TYPE_BOOL or not _is_rgba(operation.color_rgba)):
+		return {"ok": false, "error": _error("invalid_wall_style", "Wall closed and color values are invalid.", operation_path)}
+	return {"ok": true, "point_count": geometry.points.size()}
 
 
 func _preflight_universal_plan(plan):
@@ -505,17 +575,17 @@ func _preflight_universal_plan(plan):
 	if _current_map_id() != plan.expected_map_id:
 		return {"ok": false, "error": _error("map_id_mismatch", "The open map identity changed.", "payload.expected_map_id")}
 	var current_state_fingerprint = _capture_map_job_state_fingerprint()
-	if current_state_fingerprint == "" or _map_job_state_fingerprint == "" or current_state_fingerprint != _map_job_state_fingerprint:
+	if current_state_fingerprint == "" or _map_job_state_fingerprint == "":
 		return {"ok": false, "error": _error("map_revision_mismatch", "The represented map state changed after capability discovery.", "payload.base_revision")}
+	if current_state_fingerprint != _map_job_state_fingerprint:
+		_map_job_revision += 1
+		_map_job_state_fingerprint = current_state_fingerprint
 	if _map_job_revision != int(plan.base_revision):
 		return {"ok": false, "error": _error("map_revision_mismatch", "The open map revision changed.", "payload.base_revision")}
 	if int(Global.World.Width) != int(plan.canvas.width) or int(Global.World.Height) != int(plan.canvas.height):
 		return {"ok": false, "error": _error("canvas_mismatch", "The open canvas does not match the plan.", "payload.canvas")}
-	if Global.Editor == null or typeof(Global.Editor.Tools) != TYPE_DICTIONARY or not Global.Editor.Tools.has("WallTool") or Global.Editor.Tools["WallTool"] == null or (Global.Editor.ActiveToolName != null and typeof(Global.Editor.ActiveToolName) != TYPE_STRING) or Global.WorldUI == null:
-		return {"ok": false, "error": _error("wall_tool_unavailable", "The documented wall editing state is unavailable.", "")}
-	var wall_tool = Global.Editor.Tools["WallTool"]
-	if wall_tool.isDrawing or Global.WorldUI.EditArcPoint or Global.WorldUI.Polyline.size() > 0:
-		return {"ok": false, "error": _error("wall_tool_busy", "Finish or cancel the current manual wall before applying an AI plan.", "")}
+	if Global.Editor == null or typeof(Global.Editor.Tools) != TYPE_DICTIONARY or (Global.Editor.ActiveToolName != null and typeof(Global.Editor.ActiveToolName) != TYPE_STRING):
+		return {"ok": false, "error": _error("editor_unavailable", "The documented editor state is unavailable.", "")}
 	var catalog = _read_accepted_catalog()
 	if not catalog.ok:
 		return catalog
@@ -524,17 +594,21 @@ func _preflight_universal_plan(plan):
 	var resolved_assets = {}
 	var resolved_references = {}
 	for operation in plan.operations:
-		if not _certified_operation_executors.has(operation.operation_type):
+		if not _certified_operation_executors.has(operation.operation_type) or not _runtime_certified_operation_types.has(operation.operation_type):
 			return {"ok": false, "error": _error("unsupported_operation", "The operation executor is not certified.", "payload.operations")}
 		if not _current_level_ids().has(operation.level_id) or Global.World.GetLevelByID(int(operation.level_id)) == null:
 			return {"ok": false, "error": _error("unsupported_level", "The requested level is unavailable.", "payload.operations.level_id")}
+		var route_preflight = _surface_route_preflight(operation, Global.World.GetLevelByID(int(operation.level_id)))
+		if not route_preflight.ok:
+			return route_preflight
 		if not catalog.entries.has(operation.asset_ref):
 			return {"ok": false, "error": _error("asset_not_found", "The opaque asset reference is not in the accepted catalog.", "payload.operations.asset_ref")}
 		var entry = catalog.entries[operation.asset_ref]
-		if entry.category != "Walls" or not _is_sha256(entry.resource_fingerprint):
-			return {"ok": false, "error": _error("asset_category_mismatch", "The asset is not a certified wall asset.", "payload.operations.asset_ref")}
+		var category = _surface_category(operation.operation_type)
+		if category == "" or entry.category != category or not _is_sha256(entry.resource_fingerprint):
+			return {"ok": false, "error": _error("asset_category_mismatch", "The asset is not in the required operation category.", "payload.operations.asset_ref")}
 		if not resolved_references.has(operation.asset_ref):
-			var live_asset = _resolve_live_asset("Walls", entry.resource_fingerprint)
+			var live_asset = _resolve_live_asset(category, entry.resource_fingerprint)
 			if not live_asset.ok:
 				return live_asset
 			resolved_references[operation.asset_ref] = live_asset.resource_identity
@@ -548,6 +622,48 @@ func _preflight_universal_plan(plan):
 		"catalog_fingerprint": catalog.catalog_fingerprint,
 		"resolved_assets": resolved_assets,
 	}
+
+
+func _surface_category(operation_type):
+	return {
+		"terrain_stroke": "Terrain",
+		"pattern_region": "Patterns",
+		"colorable_pattern_region": "Patterns Colorable",
+		"cave_region": "Caves",
+		"roof_region": "Roofs",
+		"wall_polyline": "Walls",
+	}.get(operation_type, "")
+
+
+func _surface_route_preflight(operation, level):
+	var tool_name = {
+		"terrain_stroke": "TerrainBrush",
+		"pattern_region": "PatternShapeTool",
+		"colorable_pattern_region": "PatternShapeTool",
+		"cave_region": "CaveBrush",
+		"roof_region": "RoofTool",
+		"wall_polyline": "WallTool",
+	}.get(operation.operation_type, "")
+	if tool_name == "" or not Global.Editor.Tools.has(tool_name) or Global.Editor.Tools[tool_name] == null:
+		return {"ok": false, "error": _error("operation_tool_unavailable", "The documented operation tool is unavailable.", "payload.operations")}
+	var tool = Global.Editor.Tools[tool_name]
+	if operation.operation_type == "terrain_stroke" and tool.IsPainting:
+		return {"ok": false, "error": _error("terrain_tool_busy", "Finish the current manual terrain stroke first.", "payload.operations")}
+	if operation.operation_type in ["pattern_region", "colorable_pattern_region"] and (tool.isDrawing or tool.isDragging):
+		return {"ok": false, "error": _error("pattern_tool_busy", "Finish the current manual pattern edit first.", "payload.operations")}
+	if operation.operation_type == "cave_region" and (level.CaveMesh == null or level.CaveMesh.IsDrawing or level.CaveMesh.IsMeshWorkerBusy):
+		return {"ok": false, "error": _error("cave_tool_busy", "Wait for the current cave edit to finish.", "payload.operations")}
+	if operation.operation_type == "roof_region" and tool.isDrawing:
+		return {"ok": false, "error": _error("roof_tool_busy", "Finish the current manual roof first.", "payload.operations")}
+	if operation.operation_type in ["roof_region", "wall_polyline"]:
+		if Global.WorldUI == null or Global.WorldUI.EditArcPoint or Global.WorldUI.Polyline.size() > 0:
+			return {"ok": false, "error": _error("polyline_busy", "Finish or cancel the current manual polyline first.", "payload.operations")}
+	if operation.operation_type in ["pattern_region", "colorable_pattern_region", "roof_region"]:
+		if not Global.Editor.Tools.has("SelectTool") or _select_tool_has_active_selection(Global.Editor.Tools["SelectTool"]):
+			return {"ok": false, "error": _error("selection_busy", "Deselect the current manual selection before applying this operation.", "payload.operations")}
+	if operation.operation_type == "wall_polyline" and tool.isDrawing:
+		return {"ok": false, "error": _error("wall_tool_busy", "Finish the current manual wall first.", "payload.operations")}
+	return {"ok": true}
 
 
 func _preflight_response_context(plan):
@@ -571,14 +687,41 @@ func _read_catalog_identity_for_revision(expected_revision):
 			continue
 		if pointer.get("session_id", "") != _session_id or not _is_safe_relative_catalog_path(pointer.get("manifest", "")):
 			continue
-		var manifest = _read_bounded_dictionary(MAILBOX_ROOT + "/catalog/snapshots/" + pointer.manifest)
-		if manifest == null or manifest.get("session_id", "") != _session_id or not manifest.get("complete", false) or not _is_nonnegative_json_safe_integer(manifest.get("catalog_revision", null)) or int(manifest.catalog_revision) != expected_revision or not _is_sha256(manifest.get("catalog_fingerprint", "")):
+		var manifest_path = MAILBOX_ROOT + "/catalog/snapshots/" + pointer.manifest
+		var manifest = _read_bounded_dictionary(manifest_path)
+		if manifest == null or manifest.get("session_id", "") != _session_id or not manifest.get("complete", false) or not _is_nonnegative_json_safe_integer(manifest.get("catalog_revision", null)) or int(manifest.catalog_revision) != expected_revision or not _is_sha256(manifest.get("catalog_fingerprint", "")) or not _read_catalog_snapshot(manifest_path, manifest).ok:
 			continue
 		if pointer.has("catalog_revision") and (not _is_nonnegative_json_safe_integer(pointer.catalog_revision) or int(pointer.catalog_revision) != expected_revision):
 			continue
 		if matched_fingerprint != null and matched_fingerprint != manifest.catalog_fingerprint:
 			return {"ok": false}
 		matched_fingerprint = manifest.catalog_fingerprint
+	# Completed snapshots are immutable and content-bound. Pointer slots rotate,
+	# but recovery must still correlate an older durable request rather than
+	# starving every newer claim behind it. Scan only a bounded directory and
+	# accept solely the full canonical manifest validator used by live preflight.
+	var directory = Directory.new()
+	if directory.open(MAILBOX_ROOT + "/catalog/snapshots") == OK:
+		var snapshot_count = 0
+		directory.list_dir_begin(true, true)
+		var snapshot_name = directory.get_next()
+		while snapshot_name != "":
+			if directory.current_is_dir():
+				snapshot_count += 1
+				if snapshot_count > MAXIMUM_CATALOG_SNAPSHOTS:
+					directory.list_dir_end()
+					return {"ok": false}
+				var revision_marker = "-" + str(expected_revision) + "-"
+				if _is_safe_request_id(snapshot_name) and snapshot_name.find(revision_marker) != -1:
+					var manifest_path = MAILBOX_ROOT + "/catalog/snapshots/" + snapshot_name + "/manifest.json"
+					var manifest = _read_bounded_dictionary(manifest_path)
+					if _catalog_manifest_is_valid(manifest) and int(manifest.catalog_revision) == expected_revision and _read_catalog_snapshot(manifest_path, manifest).ok:
+						if matched_fingerprint != null and matched_fingerprint != manifest.catalog_fingerprint:
+							directory.list_dir_end()
+							return {"ok": false}
+						matched_fingerprint = manifest.catalog_fingerprint
+			snapshot_name = directory.get_next()
+		directory.list_dir_end()
 	if matched_fingerprint == null:
 		return {"ok": false}
 	return {"ok": true, "catalog_fingerprint": matched_fingerprint}
@@ -801,10 +944,591 @@ func _validate_universal_completion_response(response_text, request, plan_finger
 	return (response.error.code == "operation_failed_reversed" and not payload.outcome_unknown) or (response.error.code == "outcome_unknown" and payload.outcome_unknown)
 
 
-func _execute_operation(operation, job_key):
+func _execute_operation(operation, job_key, canvas = null):
 	if typeof(operation) != TYPE_DICTIONARY or not _certified_operation_executors.has(operation.operation_type):
 		return {"ok": false, "node_ids": []}
+	if operation.operation_type == "terrain_stroke":
+		return _execute_terrain_stroke(operation, job_key, canvas)
 	return _certified_operation_executors[operation.operation_type].call_func(operation, job_key)
+
+
+func _execute_terrain_stroke(operation, job_key, canvas = null):
+	var context = _surface_context(operation, job_key, "TerrainBrush")
+	if not context.ok:
+		return _surface_failure(operation, job_key, "context")
+	var level = context.level
+	var terrain = level.Terrain
+	var terrain_tool = context.tool
+	if typeof(canvas) != TYPE_DICTIONARY or not _is_positive_json_int32(canvas.get("width", null)) or not _is_positive_json_int32(canvas.get("height", null)):
+		return _surface_failure(operation, job_key, "native_state_pixel_coordinate_dimensions")
+	if terrain == null or terrain_tool.IsPainting or terrain_tool.brush == null:
+		return _surface_failure(operation, job_key, "native_state")
+	var expanded_slots = terrain.ExpandedSlots
+	if typeof(expanded_slots) != TYPE_BOOL:
+		return _surface_failure(operation, job_key, "native_state")
+	var previous_splat = terrain.CloneSplatImage()
+	var previous_splat_2 = terrain.CloneSplatImage2() if expanded_slots else null
+	var before_hash = _terrain_state_hash(terrain)
+	var rollback = _persist_surface_rollback(operation, job_key, previous_splat, previous_splat_2, null, before_hash, null, null, expanded_slots)
+	if not rollback.ok:
+		return _surface_failure(operation, job_key, rollback.get("stage", "rollback_persistence"))
+	var texture = _texture_loader.call_func(context.resource_identity)
+	if texture == null:
+		return _surface_failure(operation, job_key, "texture_load")
+	var texture_slot = _terrain_texture_slot(terrain, context.resource_identity, texture)
+	if texture_slot < 0:
+		_terrain_texture_diagnostic(operation, job_key, terrain, context.resource_identity, texture)
+		return _surface_failure(operation, job_key, "texture_load")
+	var sample_result = _polyline_surface_samples(operation.path.points)
+	if not sample_result.ok:
+		return _surface_failure(operation, job_key, "sampling")
+	var prior_size = terrain_tool.Size
+	var prior_intensity = terrain_tool.Intensity
+	var prior_terrain_id = terrain_tool.TerrainID
+	terrain_tool.SetSize(float(operation.width))
+	terrain_tool.Intensity = float(operation.strength)
+	terrain_tool.TerrainID = texture_slot
+	var brush_radius = _terrain_brush_radius(terrain_tool.brush)
+	if not _is_runtime_positive_finite_number(brush_radius):
+		terrain_tool.SetSize(prior_size)
+		terrain_tool.Intensity = prior_intensity
+		terrain_tool.TerrainID = prior_terrain_id
+		return _surface_failure(operation, job_key, "native_state_brush_radius", [rollback.token])
+	var brush_offset = Vector2.ONE * (-float(brush_radius) - 32.0)
+	var painted = _paint_terrain_splat(terrain, terrain_tool, previous_splat, previous_splat_2, expanded_slots, texture_slot, terrain_tool.brush, brush_offset, sample_result.points, float(operation.strength), int(canvas.width), int(canvas.height), job_key)
+	terrain_tool.SetSize(prior_size)
+	terrain_tool.Intensity = prior_intensity
+	terrain_tool.TerrainID = prior_terrain_id
+	if not painted.ok:
+		return _surface_failure(operation, job_key, painted.stage, [rollback.token])
+	if terrain_tool.IsPainting:
+		return _surface_failure(operation, job_key, "painting_busy", [rollback.token])
+	if not _complete_surface_rollback(rollback, _terrain_state_hash(terrain)):
+		return _surface_failure(operation, job_key, "after_state", [rollback.token], true)
+	return {"ok": true, "node_ids": [rollback.token]}
+
+
+func _paint_terrain_splat(terrain, terrain_tool, primary, secondary, expanded_slots, texture_slot, brush, brush_offset, samples, strength, canvas_width, canvas_height, job_key):
+	if terrain == null or not (primary is Image) or not (brush is Image) or typeof(expanded_slots) != TYPE_BOOL or (expanded_slots and not (secondary is Image)):
+		return {"ok": false, "stage": "native_state_pixel_input"}
+	if typeof(texture_slot) != TYPE_INT or texture_slot < 0 or texture_slot >= (8 if expanded_slots else 4) or typeof(samples) != TYPE_ARRAY or samples.size() == 0:
+		return {"ok": false, "stage": "native_state_pixel_input"}
+	var brush_width = brush.get_width()
+	var brush_height = brush.get_height()
+	if brush_width <= 0 or brush_height <= 0 or brush_width > MAXIMUM_TERRAIN_BLEND_PIXELS / brush_height:
+		return {"ok": false, "stage": "native_state_pixel_bound"}
+	var brush_pixels = brush_width * brush_height
+	if samples.size() > MAXIMUM_TERRAIN_BLEND_PIXELS / brush_pixels:
+		return {"ok": false, "stage": "native_state_pixel_bound"}
+	var channel = texture_slot - 4 if texture_slot >= 4 else texture_slot
+	var paints_secondary = texture_slot >= 4
+	var grid_size = float(Global.World.GridSize)
+	var initial_hash = _sha256_bytes(primary.get_data())
+	for point in samples:
+		if typeof(point) != TYPE_VECTOR2:
+			return {"ok": false, "stage": "native_state_pixel_input"}
+		var world_position = Vector2(float(point.x) * grid_size + float(brush_offset.x), float(point.y) * grid_size + float(brush_offset.y))
+		if typeof(world_position) != TYPE_VECTOR2:
+			return {"ok": false, "stage": "native_state_pixel_coordinate_position"}
+		var destination_result = _terrain_world_to_texture(primary, world_position, canvas_width, canvas_height, grid_size)
+		if not destination_result.ok:
+			return {"ok": false, "stage": destination_result.stage}
+		var destination = destination_result.value
+		if not _blend_terrain_pixels(primary, secondary, expanded_slots, texture_slot, brush, destination, strength):
+			return {"ok": false, "stage": "native_state_pixel_blend"}
+	var candidate_hash = _sha256_bytes(primary.get_data())
+	if not _is_sha256(candidate_hash):
+		return {"ok": false, "stage": "native_state_pixel_candidate_hash"}
+	if candidate_hash == initial_hash:
+		return {"ok": false, "stage": "native_state_pixel_candidate_unchanged"}
+	return {"ok": false, "stage": "native_state_managed_adapter_required"}
+
+
+func _terrain_world_to_texture(primary, world_position, canvas_width, canvas_height, grid_size):
+	if not (primary is Image):
+		return {"ok": false, "stage": "native_state_pixel_coordinate_image"}
+	if typeof(world_position) != TYPE_VECTOR2:
+		return {"ok": false, "stage": "native_state_pixel_coordinate_position"}
+	var map_width = float(canvas_width)
+	var map_height = float(canvas_height)
+	if map_width <= 0.0 or map_width > 2147483647.0 or map_width != floor(map_width):
+		return {"ok": false, "stage": "native_state_pixel_coordinate_width"}
+	if map_height <= 0.0 or map_height > 2147483647.0 or map_height != floor(map_height):
+		return {"ok": false, "stage": "native_state_pixel_coordinate_height"}
+	if grid_size <= 0.0:
+		return {"ok": false, "stage": "native_state_pixel_coordinate_grid"}
+	if primary.get_width() != int(map_width) * 4 or primary.get_height() != int(map_height) * 4:
+		return {"ok": false, "stage": "native_state_pixel_coordinate_scale"}
+	return {"ok": true, "value": world_position / 64.0 + Vector2.ONE * 0.5}
+
+
+func _terrain_brush_radius(brush):
+	if not (brush is Image):
+		return -1.0
+	var width = brush.get_width()
+	var height = brush.get_height()
+	if width <= 0 or width != height:
+		return -1.0
+	return float(width) * 16.0
+
+
+func _blend_terrain_pixels(primary, secondary, expanded_slots, texture_slot, brush, destination, strength):
+	var destination_x = int(floor(destination.x))
+	var destination_y = int(floor(destination.y))
+	var channel = texture_slot - 4 if texture_slot >= 4 else texture_slot
+	var target = Color(0.0, 0.0, 0.0, 0.0)
+	if channel == 0:
+		target.r = 1.0
+	elif channel == 1:
+		target.g = 1.0
+	elif channel == 2:
+		target.b = 1.0
+	else:
+		target.a = 1.0
+	var active = secondary if expanded_slots and texture_slot >= 4 else primary
+	var inactive = primary if expanded_slots and texture_slot >= 4 else secondary
+	brush.lock()
+	active.lock()
+	if inactive != null:
+		inactive.lock()
+	for brush_y in range(brush.get_height()):
+		var target_y = destination_y + brush_y
+		if target_y < 0 or target_y >= active.get_height():
+			continue
+		for brush_x in range(brush.get_width()):
+			var target_x = destination_x + brush_x
+			if target_x < 0 or target_x >= active.get_width():
+				continue
+			var mask = brush.get_pixel(brush_x, brush_y)
+			var amount = clamp(max(mask.r, mask.a) * float(strength), 0.0, 1.0)
+			if amount <= 0.0:
+				continue
+			active.set_pixel(target_x, target_y, active.get_pixel(target_x, target_y).linear_interpolate(target, amount))
+			if inactive != null:
+				inactive.set_pixel(target_x, target_y, inactive.get_pixel(target_x, target_y).linear_interpolate(Color(0.0, 0.0, 0.0, 0.0), amount))
+	if inactive != null:
+		inactive.unlock()
+	active.unlock()
+	brush.unlock()
+	return true
+
+
+func _terrain_texture_slot(terrain, resource_identity, requested_texture):
+	if terrain == null or typeof(resource_identity) != TYPE_STRING or resource_identity.length() == 0 or requested_texture == null:
+		return -1
+	# Dungeondraft 1.2.0.1 exposes Terrain.textures (Texture[]) through the
+	# GDScript/C# proxy even though Save() and GetTexture() results marshal as
+	# null.  Bound and validate the documented array before indexing it.
+	var expected_slots = 8 if terrain.ExpandedSlots else 4
+	if typeof(terrain.textures) == TYPE_ARRAY and terrain.textures.size() == expected_slots:
+		var requested_array_hash = _texture_content_hash(requested_texture)
+		var array_match = -1
+		for slot in range(expected_slots):
+			var array_texture = terrain.textures[slot]
+			if array_texture == requested_texture or (array_texture != null and str(array_texture.resource_path) == resource_identity):
+				return slot
+			if requested_array_hash != "" and _texture_content_hash(array_texture) == requested_array_hash:
+				if array_match != -1:
+					return -1
+				array_match = slot
+		if array_match != -1:
+			return array_match
+	var saved = terrain.Save(false)
+	if typeof(saved) == TYPE_DICTIONARY:
+		var saved_match = -1
+		for slot in range(8):
+			var saved_identity = saved.get("texture_" + str(slot + 1), null)
+			if _saved_terrain_texture_identity(saved_identity) == resource_identity:
+				if saved_match != -1:
+					return -1
+				saved_match = slot
+		if saved_match != -1:
+			return saved_match
+	var requested_hash = _texture_content_hash(requested_texture)
+	var matched_slot = -1
+	for slot in range(8):
+		var texture = terrain.GetTexture(slot)
+		if texture == requested_texture:
+			return slot
+		if texture != null and str(texture.resource_path) == resource_identity:
+			return slot
+		if requested_hash != "" and _texture_content_hash(texture) == requested_hash:
+			if matched_slot != -1:
+				return -1
+			matched_slot = slot
+	return matched_slot
+
+
+func _saved_terrain_texture_identity(value):
+	if typeof(value) == TYPE_STRING:
+		return value
+	if value is Resource:
+		return str(value.resource_path)
+	return ""
+
+
+func _texture_content_hash(texture):
+	if texture == null or not texture.has_method("get_data"):
+		return ""
+	var image = texture.get_data()
+	if image == null:
+		return ""
+	return _sha256_bytes(image.get_data())
+
+
+func _terrain_texture_diagnostic(operation, job_key, terrain, resource_identity, requested_texture):
+	if typeof(operation) != TYPE_DICTIONARY or typeof(job_key) != TYPE_STRING or not _is_safe_request_id(job_key) or terrain == null:
+		return false
+	var requested_hash = _texture_content_hash(requested_texture)
+	var saved = terrain.Save(false)
+	var slots = []
+	for slot in range(8):
+		var texture = terrain.GetTexture(slot)
+		var saved_key = "texture_" + str(slot + 1)
+		slots.append({
+			"hash_matches": requested_hash != "" and _texture_content_hash(texture) == requested_hash,
+			"path_present": texture != null and str(texture.resource_path).length() > 0,
+			"same_object": texture == requested_texture,
+			"saved_has_key": typeof(saved) == TYPE_DICTIONARY and saved.has(saved_key),
+			"saved_type_code": typeof(saved.get(saved_key, null)) if typeof(saved) == TYPE_DICTIONARY else TYPE_NIL,
+			"type_code": typeof(texture),
+		})
+	var record = {
+		"operation_type": str(operation.get("operation_type", "unknown")),
+		"requested_hash_present": requested_hash != "",
+		"requested_path_present": requested_texture != null and str(requested_texture.resource_path).length() > 0,
+		"requested_type_code": typeof(requested_texture),
+		"saved_type_code": typeof(saved),
+		"schema_version": MAILBOX_SCHEMA_VERSION,
+		"slots": slots,
+	}
+	var path = MAILBOX_ROOT + "/failed/" + job_key + ".terrain-slot.json"
+	var directory = Directory.new()
+	var result = _replace_json_recoverably(path, record) if directory.file_exists(path) else _write_json_atomically(path, record)
+	return result != "write_failed"
+
+
+func _surface_failure(operation, job_key, stage, node_ids = [], untracked_change = false):
+	var allowed_stages = ["context", "native_state", "native_state_brush_radius", "native_state_pixel_input", "native_state_pixel_bound", "native_state_pixel_coordinate", "native_state_pixel_coordinate_input", "native_state_pixel_coordinate_image", "native_state_pixel_coordinate_position", "native_state_pixel_coordinate_world", "native_state_pixel_coordinate_dimensions", "native_state_pixel_coordinate_missing", "native_state_pixel_coordinate_width", "native_state_pixel_coordinate_height", "native_state_pixel_coordinate_grid", "native_state_pixel_coordinate_scale", "native_state_pixel_blend", "native_state_pixel_candidate_hash", "native_state_pixel_candidate_unchanged", "native_state_pixel_restore", "native_state_managed_adapter_required", "rollback_persistence", "texture_load", "sampling", "painting_busy", "after_state", "rollback_primary_missing", "rollback_hash_invalid", "rollback_texture_missing", "rollback_texture_identity_missing", "rollback_directory", "rollback_primary_write", "rollback_secondary_write", "rollback_hash", "rollback_metadata"]
+	if typeof(operation) != TYPE_DICTIONARY or typeof(job_key) != TYPE_STRING or not _is_safe_request_id(job_key) or typeof(stage) != TYPE_STRING or not allowed_stages.has(stage):
+		return {"ok": false, "node_ids": [], "untracked_change": true}
+	var record = {
+		"schema_version": MAILBOX_SCHEMA_VERSION,
+		"operation_type": str(operation.get("operation_type", "unknown")),
+		"stage": stage,
+	}
+	var path = MAILBOX_ROOT + "/failed/" + job_key + ".surface-stage.json"
+	var directory = Directory.new()
+	var write_result = _replace_json_recoverably(path, record) if directory.file_exists(path) else _write_json_atomically(path, record)
+	if write_result == "write_failed":
+		return {"ok": false, "node_ids": node_ids, "untracked_change": true}
+	return {"ok": false, "node_ids": node_ids, "untracked_change": untracked_change}
+
+
+func _execute_pattern_region(operation, job_key):
+	var context = _surface_context(operation, job_key, "PatternShapeTool")
+	if not context.ok:
+		return {"ok": false, "node_ids": []}
+	var level = context.level
+	var pattern_tool = context.tool
+	var shapes_before = level.PatternShapes.GetShapes()
+	if typeof(shapes_before) != TYPE_ARRAY or shapes_before.size() >= MAXIMUM_INSPECTION_STATE_ITEMS or pattern_tool.isDrawing or pattern_tool.isDragging:
+		return {"ok": false, "node_ids": []}
+	var texture = _texture_loader.call_func(context.resource_identity)
+	if texture == null:
+		return {"ok": false, "node_ids": []}
+	var prior_texture = pattern_tool.Texture
+	var prior_color = pattern_tool.Color
+	var prior_rotation = pattern_tool.Rotation.value
+	var prior_layer = pattern_tool.ActiveLayer
+	pattern_tool.Texture = texture
+	pattern_tool.Rotation.value = float(operation.rotation_degrees)
+	pattern_tool.SetLayer(int(operation.layer))
+	if operation.operation_type == "colorable_pattern_region":
+		pattern_tool.ChangeColor(_rgba_color(operation.color_rgba), "PatternColor")
+	var points = _grid_points_to_world(operation.region.points)
+	level.PatternShapes.DrawPolygon(points, false)
+	pattern_tool.Texture = prior_texture
+	pattern_tool.Rotation.value = prior_rotation
+	pattern_tool.SetLayer(prior_layer)
+	if operation.operation_type == "colorable_pattern_region":
+		pattern_tool.ChangeColor(prior_color, "PatternColor")
+	var shapes_after = level.PatternShapes.GetShapes()
+	if typeof(shapes_after) != TYPE_ARRAY or shapes_after.size() != shapes_before.size() + 1:
+		return {"ok": false, "node_ids": [], "untracked_change": true}
+	var created = _single_new_node(shapes_before, shapes_after)
+	var node_id = _ensure_registered_node(created)
+	return {"ok": node_id.ok, "node_ids": [node_id.value] if node_id.ok else [], "untracked_change": not node_id.ok}
+
+
+func _execute_cave_region(operation, job_key):
+	var context = _surface_context(operation, job_key, "CaveBrush")
+	if not context.ok:
+		return {"ok": false, "node_ids": []}
+	var cave_mesh = context.level.CaveMesh
+	var cave_tool = context.tool
+	if cave_mesh == null or cave_mesh.bitmap == null or cave_mesh.IsDrawing or cave_mesh.IsMeshWorkerBusy:
+		return {"ok": false, "node_ids": []}
+	var previous_bitmap = cave_mesh.bitmap.duplicate()
+	var previous_floor = cave_mesh.CaveFloor
+	var previous_ground_color = cave_mesh.GroundColor
+	var previous_wall_color = cave_mesh.WallColor
+	var rollback = _persist_surface_rollback(operation, job_key, previous_bitmap, null, previous_floor, _cave_state_hash(cave_mesh), previous_ground_color, previous_wall_color)
+	if not rollback.ok:
+		return {"ok": false, "node_ids": []}
+	var texture = _texture_loader.call_func(context.resource_identity)
+	if texture == null:
+		return {"ok": false, "node_ids": []}
+	var raster = _polygon_surface_samples(operation.region.points)
+	if not raster.ok:
+		return {"ok": false, "node_ids": []}
+	cave_tool.ChangeTexture(texture, "CaveFloor")
+	cave_mesh.SetGroundColor(_rgba_color(operation.floor_color_rgba))
+	cave_mesh.SetWallColor(_rgba_color(operation.wall_color_rgba))
+	cave_mesh.OnDrawingBegin()
+	for point in raster.points:
+		cave_mesh.SetCircle(point * float(Global.World.GridSize), 1, true)
+	cave_mesh.OnDrawingEnd()
+	if cave_mesh.IsMeshWorkerBusy:
+		return {"ok": true, "node_ids": [rollback.token]}
+	if not _complete_surface_rollback(rollback, _cave_state_hash(cave_mesh)):
+		return {"ok": false, "node_ids": [rollback.token], "untracked_change": true}
+	return {"ok": true, "node_ids": [rollback.token]}
+
+
+func _execute_roof_region(operation, job_key):
+	var context = _surface_context(operation, job_key, "RoofTool")
+	if not context.ok:
+		return {"ok": false, "node_ids": []}
+	var level = context.level
+	var roof_tool = context.tool
+	if roof_tool.isDrawing or level.Roofs.get_child_count() >= MAXIMUM_INSPECTION_STATE_ITEMS:
+		return {"ok": false, "node_ids": []}
+	var texture = _texture_loader.call_func(context.resource_identity)
+	if texture == null:
+		return {"ok": false, "node_ids": []}
+	var roofs_before = level.Roofs.get_children()
+	var prior_texture = roof_tool.Texture
+	var prior_width = roof_tool.Width.value
+	var prior_shade = roof_tool.Shade
+	var prior_contrast = roof_tool.ShadeContrast.value
+	var prior_mode = roof_tool.Mode
+	roof_tool.Texture = texture
+	roof_tool.Width.value = float(operation.width) * float(Global.World.GridSize)
+	roof_tool.ShadeContrast.value = float(operation.shade)
+	roof_tool.SetShade(float(operation.shade) > 0.0)
+	var points = _grid_points_to_world(operation.region.points)
+	var rectangle = _axis_aligned_rectangle(points)
+	if rectangle.ok:
+		roof_tool.Mode = 0
+		roof_tool.DrawRect(rectangle.rect)
+	else:
+		roof_tool.Mode = 1
+		Global.WorldUI.ClearPolyline()
+		for point in points:
+			Global.WorldUI.AddPolyPoint(point)
+		roof_tool.FinishShape()
+		Global.WorldUI.ClearPolyline()
+	roof_tool.Texture = prior_texture
+	roof_tool.Width.value = prior_width
+	roof_tool.ShadeContrast.value = prior_contrast
+	roof_tool.SetShade(prior_shade)
+	roof_tool.Mode = prior_mode
+	var roofs_after = level.Roofs.get_children()
+	if roofs_after.size() != roofs_before.size() + 1:
+		return {"ok": false, "node_ids": [], "untracked_change": true}
+	var created = _single_new_node(roofs_before, roofs_after)
+	var node_id = _ensure_registered_node(created)
+	return {"ok": node_id.ok, "node_ids": [node_id.value] if node_id.ok else [], "untracked_change": not node_id.ok}
+
+
+func _surface_context(operation, job_key, tool_name):
+	if not _resolved_job_assets.has(job_key) or not _resolved_job_assets[job_key].has(operation.operation_id):
+		return {"ok": false}
+	if Global.World == null or Global.Editor == null or typeof(Global.Editor.Tools) != TYPE_DICTIONARY or not Global.Editor.Tools.has(tool_name) or Global.Editor.Tools[tool_name] == null:
+		return {"ok": false}
+	var level = Global.World.GetLevelByID(int(operation.level_id))
+	if level == null:
+		return {"ok": false}
+	return {"ok": true, "level": level, "tool": Global.Editor.Tools[tool_name], "resource_identity": _resolved_job_assets[job_key][operation.operation_id]}
+
+
+func _grid_points_to_world(points):
+	var result = []
+	for point in points:
+		result.append(Vector2(float(point.x), float(point.y)) * float(Global.World.GridSize))
+	return result
+
+
+func _single_new_node(before, after):
+	var known = {}
+	for node in before:
+		known[node] = true
+	var created = null
+	for node in after:
+		if not known.has(node):
+			if created != null:
+				return null
+			created = node
+	return created
+
+
+func _ensure_registered_node(node):
+	if node == null:
+		return {"ok": false}
+	var node_id = _node_id_metadata(node)
+	if node_id.ok and Global.World.HasNodeID(int(node_id.value)) and Global.World.GetNodeByID(int(node_id.value)) == node:
+		return node_id
+	node_id = _runtime_node_id(Global.World.AssignNodeID(node))
+	var persisted = _node_id_metadata(node)
+	if not node_id.ok or not persisted.ok or persisted.value != node_id.value or not Global.World.HasNodeID(int(node_id.value)) or Global.World.GetNodeByID(int(node_id.value)) != node:
+		return {"ok": false}
+	return node_id
+
+
+func _axis_aligned_rectangle(points):
+	if points.size() != 4:
+		return {"ok": false}
+	var xs = {}
+	var ys = {}
+	for point in points:
+		xs[point.x] = true
+		ys[point.y] = true
+	if xs.size() != 2 or ys.size() != 2:
+		return {"ok": false}
+	var min_x = min(points[0].x, min(points[1].x, min(points[2].x, points[3].x)))
+	var max_x = max(points[0].x, max(points[1].x, max(points[2].x, points[3].x)))
+	var min_y = min(points[0].y, min(points[1].y, min(points[2].y, points[3].y)))
+	var max_y = max(points[0].y, max(points[1].y, max(points[2].y, points[3].y)))
+	if min_x == max_x or min_y == max_y:
+		return {"ok": false}
+	return {"ok": true, "rect": Rect2(min_x, min_y, max_x - min_x, max_y - min_y)}
+
+
+func _polyline_surface_samples(points):
+	var samples = []
+	for index in range(points.size() - 1):
+		var start = Vector2(float(points[index].x), float(points[index].y))
+		var finish = Vector2(float(points[index + 1].x), float(points[index + 1].y))
+		var steps = max(1, int(ceil(start.distance_to(finish) * 2.0)))
+		if samples.size() > MAXIMUM_SURFACE_SAMPLES - steps - 1:
+			return {"ok": false}
+		for step in range(steps + 1):
+			samples.append(start.linear_interpolate(finish, float(step) / float(steps)))
+	return {"ok": true, "points": samples}
+
+
+func _polygon_surface_samples(points):
+	var minimum = Vector2(float(points[0].x), float(points[0].y))
+	var maximum = minimum
+	var polygon = []
+	for point in points:
+		var vector = Vector2(float(point.x), float(point.y))
+		polygon.append(vector)
+		minimum.x = min(minimum.x, vector.x)
+		minimum.y = min(minimum.y, vector.y)
+		maximum.x = max(maximum.x, vector.x)
+		maximum.y = max(maximum.y, vector.y)
+	var samples = []
+	for y in range(int(floor(minimum.y)), int(ceil(maximum.y)) + 1):
+		for x in range(int(floor(minimum.x)), int(ceil(maximum.x)) + 1):
+			if samples.size() >= MAXIMUM_SURFACE_SAMPLES:
+				return {"ok": false}
+			var sample = Vector2(float(x) + 0.5, float(y) + 0.5)
+			if Geometry.is_point_in_polygon(sample, PoolVector2Array(polygon)):
+				samples.append(sample)
+	if samples.size() == 0:
+		return {"ok": false}
+	return {"ok": true, "points": samples}
+
+
+func _surface_rollback_token(job_key, operation_id):
+	var value = ("0x" + (job_key + "\n" + operation_id).sha256_text().substr(0, 13)).hex_to_int()
+	return max(1, int(value))
+
+
+func _surface_rollback_directory(job_key, operation_id):
+	return MAILBOX_ROOT + "/surface-rollbacks/" + job_key + "/" + operation_id
+
+
+func _persist_surface_rollback(operation, job_key, primary, secondary, texture, before_hash, color_a = null, color_b = null, expanded_slots = false):
+	if primary == null:
+		return {"ok": false, "stage": "rollback_primary_missing"}
+	if not _is_sha256(before_hash):
+		return {"ok": false, "stage": "rollback_hash_invalid"}
+	if operation.operation_type == "cave_region" and texture == null:
+		return {"ok": false, "stage": "rollback_texture_missing"}
+	if operation.operation_type == "cave_region" and str(texture.resource_path).length() == 0:
+		return {"ok": false, "stage": "rollback_texture_identity_missing"}
+	var directory_path = _surface_rollback_directory(job_key, operation.operation_id)
+	var directory = Directory.new()
+	if directory.make_dir_recursive(directory_path) != OK and not directory.dir_exists(directory_path):
+		return {"ok": false, "stage": "rollback_directory"}
+	var primary_result = _save_surface_rollback_payload(directory_path + "/primary", primary)
+	if not primary_result.ok:
+		return {"ok": false, "stage": "rollback_primary_write"}
+	var has_secondary = secondary != null
+	var secondary_result = {"ok": true, "path": "", "format": null}
+	if has_secondary:
+		secondary_result = _save_surface_rollback_payload(directory_path + "/secondary", secondary)
+		if not secondary_result.ok:
+			return {"ok": false, "stage": "rollback_secondary_write"}
+	var token = _surface_rollback_token(job_key, operation.operation_id)
+	var rollback = {
+		"schema_version": MAILBOX_SCHEMA_VERSION,
+		"job_key": job_key,
+		"operation_id": operation.operation_id,
+		"operation_type": operation.operation_type,
+		"level_id": operation.level_id,
+		"token": token,
+		"state": "prepared",
+		"before_hash": before_hash,
+		"after_hash": null,
+		"primary_format": primary_result.format,
+		"secondary_format": secondary_result.format if has_secondary else null,
+		"primary_sha256": File.new().get_sha256(primary_result.path),
+		"secondary_sha256": File.new().get_sha256(secondary_result.path) if has_secondary else null,
+		"texture_identity": str(texture.resource_path) if texture != null else null,
+		"color_a": color_a.to_html(true) if typeof(color_a) == TYPE_COLOR else null,
+		"color_b": color_b.to_html(true) if typeof(color_b) == TYPE_COLOR else null,
+		"expanded_slots": expanded_slots,
+	}
+	if not _is_sha256(rollback.primary_sha256) or (has_secondary and not _is_sha256(rollback.secondary_sha256)):
+		return {"ok": false, "stage": "rollback_hash"}
+	var metadata_path = directory_path + "/rollback.json"
+	if not ["created", "existing"].has(_write_json_atomically(metadata_path, rollback)):
+		return {"ok": false, "stage": "rollback_metadata"}
+	return {"ok": true, "token": token, "path": metadata_path}
+
+
+func _save_surface_rollback_payload(base_path, value):
+	if value is Image:
+		var image_path = base_path + ".png"
+		return {"ok": value.save_png(image_path) == OK, "path": image_path, "format": "png"}
+	if value is BitMap:
+		var resource_path = base_path + ".res"
+		return {"ok": ResourceSaver.save(resource_path, value) == OK, "path": resource_path, "format": "resource"}
+	return {"ok": false}
+
+
+func _load_surface_rollback_payload(base_path, format):
+	if format == "png":
+		var image = Image.new()
+		return image if image.load(base_path + ".png") == OK else null
+	if format == "resource":
+		return load(base_path + ".res")
+	return null
+
+
+func _complete_surface_rollback(rollback, after_hash):
+	if not rollback.ok or not _is_sha256(after_hash):
+		return false
+	var record = _read_bounded_dictionary(rollback.path)
+	if record == null or record.state != "prepared" or record.before_hash == after_hash:
+		return false
+	record.state = "applied"
+	record.after_hash = after_hash
+	return _replace_json_recoverably(rollback.path, record) == "replaced"
 
 
 func _execute_wall_polyline(operation, job_key):
@@ -857,42 +1581,22 @@ func _execute_wall_polyline(operation, job_key):
 	return {"ok": true, "node_ids": [normalized_node_id.value]}
 
 
-func _observe_operation(native_node_ids):
-	if typeof(native_node_ids) != TYPE_ARRAY or native_node_ids.size() == 0:
-		return false
-	if typeof(Global.World.levels) != TYPE_ARRAY or Global.World.levels.size() > MAXIMUM_INSPECTION_LEVELS:
-		return false
-	var inspected_wall_count = 0
-	var registered_node_ids = {}
-	for node_id in native_node_ids:
-		if not Global.World.HasNodeID(int(node_id)):
-			return false
-		registered_node_ids[int(node_id)] = true
-	var observed_node_counts = {}
-	for level in Global.World.levels:
-		if level == null or level.Walls == null:
-			return false
-		var wall_count = level.Walls.get_child_count()
-		if wall_count < 0 or inspected_wall_count > MAXIMUM_INSPECTION_STATE_ITEMS - wall_count:
-			return false
-		var walls = level.Walls.get_children()
-		if walls.size() != wall_count:
-			return false
-		inspected_wall_count += wall_count
-		for wall in walls:
-			var wall_id = _node_id_metadata(wall)
-			if wall_id.ok and registered_node_ids.has(wall_id.value):
-				observed_node_counts[wall_id.value] = int(observed_node_counts.get(wall_id.value, 0)) + 1
-	for node_id in native_node_ids:
-		if observed_node_counts.get(int(node_id), 0) != 1:
-			return false
-	return true
+func _observe_operation(operation, native_node_ids, job_key = ""):
+	if typeof(operation) != TYPE_DICTIONARY or typeof(native_node_ids) != TYPE_ARRAY or native_node_ids.size() == 0:
+		return "failed"
+	if operation.operation_type in ["terrain_stroke", "cave_region"]:
+		return _observe_surface_rollback(operation, native_node_ids, job_key)
+	return "observed" if _observe_addressable_surface(operation, native_node_ids) else "failed"
 
 
-func _reverse_operation(operation, native_node_ids):
-	if operation.operation_type != "wall_polyline":
-		return false
-	return _reverse_wall_polyline(native_node_ids)
+func _reverse_operation(operation, native_node_ids, job_key = ""):
+	if operation.operation_type in ["terrain_stroke", "cave_region"]:
+		return _reverse_surface_rollback(operation, native_node_ids, job_key)
+	if operation.operation_type in ["pattern_region", "colorable_pattern_region", "roof_region"]:
+		return _reverse_addressable_surface(operation, native_node_ids)
+	if operation.operation_type == "wall_polyline":
+		return _reverse_wall_polyline(native_node_ids)
+	return false
 
 
 func _reverse_wall_polyline(native_node_ids):
@@ -907,23 +1611,229 @@ func _reverse_wall_polyline(native_node_ids):
 	return true
 
 
-func _observe_reversal(native_node_ids):
-	for node_id in native_node_ids:
-		if Global.World.HasNodeID(int(node_id)) or Global.World.GetNodeByID(int(node_id)) != null:
+func _observe_reversal(operation, native_node_ids, job_key = ""):
+	if operation.operation_type in ["terrain_stroke", "cave_region"]:
+		return _observe_surface_rollback_reversal(operation, native_node_ids, job_key)
+	return _observe_addressable_surface_reversal(operation, native_node_ids)
+
+
+func _surface_record(operation, native_node_ids, job_key):
+	if native_node_ids.size() != 1 or int(native_node_ids[0]) != _surface_rollback_token(job_key, operation.operation_id):
+		return null
+	var path = _surface_rollback_directory(job_key, operation.operation_id) + "/rollback.json"
+	var record = _read_bounded_dictionary(path)
+	if record == null or not _dictionary_has_exact_keys(record, ["schema_version", "job_key", "operation_id", "operation_type", "level_id", "token", "state", "before_hash", "after_hash", "primary_format", "secondary_format", "primary_sha256", "secondary_sha256", "texture_identity", "color_a", "color_b", "expanded_slots"]):
+		return null
+	if record.schema_version != MAILBOX_SCHEMA_VERSION or record.job_key != job_key or record.operation_id != operation.operation_id or record.operation_type != operation.operation_type or record.level_id != operation.level_id or int(record.token) != int(native_node_ids[0]) or typeof(record.expanded_slots) != TYPE_BOOL:
+		return null
+	if not ["png", "resource"].has(record.primary_format) or (record.secondary_format != null and not ["png", "resource"].has(record.secondary_format)) or not _is_sha256(record.before_hash) or (record.after_hash != null and not _is_sha256(record.after_hash)) or not _is_sha256(record.primary_sha256):
+		return null
+	if record.operation_type == "terrain_stroke" and record.texture_identity != null:
+		return null
+	if record.operation_type == "cave_region" and (typeof(record.texture_identity) != TYPE_STRING or record.texture_identity.length() == 0):
+		return null
+	return {"record": record, "path": path, "directory": _surface_rollback_directory(job_key, operation.operation_id)}
+
+
+func _observe_surface_rollback(operation, native_node_ids, job_key):
+	var rollback = _surface_record(operation, native_node_ids, job_key)
+	if rollback == null or rollback.record.state != "applied":
+		return "failed"
+	var level = Global.World.GetLevelByID(int(operation.level_id))
+	if level == null:
+		return "failed"
+	if operation.operation_type == "terrain_stroke":
+		if Global.Editor.Tools["TerrainBrush"].IsPainting:
+			return "pending"
+		return "observed" if _terrain_state_hash(level.Terrain) == rollback.record.after_hash else "failed"
+	if operation.operation_type == "cave_region":
+		if level.CaveMesh.IsMeshWorkerBusy or level.CaveMesh.IsDrawing:
+			return "pending"
+		return "observed" if _cave_state_hash(level.CaveMesh) == rollback.record.after_hash else "failed"
+	return "failed"
+
+
+func _reverse_surface_rollback(operation, native_node_ids, job_key):
+	var rollback = _surface_record(operation, native_node_ids, job_key)
+	if rollback == null or rollback.record.state != "applied":
+		return false
+	var level = Global.World.GetLevelByID(int(operation.level_id))
+	if level == null:
+		return false
+	var primary_path = rollback.directory + "/primary." + ("png" if rollback.record.primary_format == "png" else "res")
+	if File.new().get_sha256(primary_path) != rollback.record.primary_sha256:
+		return false
+	var primary = _load_surface_rollback_payload(rollback.directory + "/primary", rollback.record.primary_format)
+	if primary == null:
+		return false
+	if operation.operation_type == "terrain_stroke":
+		var terrain = level.Terrain
+		if rollback.record.expanded_slots:
+			if rollback.record.secondary_sha256 == null:
+				return false
+			var secondary_path = rollback.directory + "/secondary." + ("png" if rollback.record.secondary_format == "png" else "res")
+			if File.new().get_sha256(secondary_path) != rollback.record.secondary_sha256:
+				return false
+			var secondary = _load_surface_rollback_payload(rollback.directory + "/secondary", rollback.record.secondary_format)
+			if secondary == null:
+				return false
+			terrain.RestoreSplat2(primary, secondary)
+		else:
+			if rollback.record.secondary_sha256 != null:
+				return false
+			terrain.RestoreSplat(primary)
+	elif operation.operation_type == "cave_region":
+		var texture = _texture_loader.call_func(rollback.record.texture_identity)
+		if texture == null:
 			return false
+		var cave_mesh = level.CaveMesh
+		cave_mesh.SetBitmap(primary)
+		cave_mesh.SetFloorTexture(texture)
+		if typeof(rollback.record.color_a) != TYPE_STRING or typeof(rollback.record.color_b) != TYPE_STRING:
+			return false
+		cave_mesh.SetGroundColor(Color(rollback.record.color_a))
+		cave_mesh.SetWallColor(Color(rollback.record.color_b))
+	else:
+		return false
+	rollback.record.state = "reversed"
+	return _replace_json_recoverably(rollback.path, rollback.record) == "replaced"
+
+
+func _observe_surface_rollback_reversal(operation, native_node_ids, job_key):
+	var rollback = _surface_record(operation, native_node_ids, job_key)
+	if rollback == null or rollback.record.state != "reversed":
+		return false
+	var level = Global.World.GetLevelByID(int(operation.level_id))
+	if level == null:
+		return false
+	if operation.operation_type == "terrain_stroke":
+		return not Global.Editor.Tools["TerrainBrush"].IsPainting and _terrain_state_hash(level.Terrain) == rollback.record.before_hash
+	if operation.operation_type == "cave_region":
+		return not level.CaveMesh.IsMeshWorkerBusy and not level.CaveMesh.IsDrawing and _cave_state_hash(level.CaveMesh) == rollback.record.before_hash
+	return false
+
+
+func _addressable_surface_nodes(operation):
 	if typeof(Global.World.levels) != TYPE_ARRAY or Global.World.levels.size() > MAXIMUM_INSPECTION_LEVELS:
+		return null
+	var nodes = []
+	for level in Global.World.levels:
+		if level == null:
+			return null
+		var source = null
+		if operation.operation_type == "wall_polyline":
+			var count = level.Walls.get_child_count()
+			if count < 0 or nodes.size() > MAXIMUM_INSPECTION_STATE_ITEMS - count:
+				return null
+			source = level.Walls.get_children()
+		elif operation.operation_type in ["pattern_region", "colorable_pattern_region"]:
+			source = level.PatternShapes.GetShapes()
+		elif operation.operation_type == "roof_region":
+			var count = level.Roofs.get_child_count()
+			if count < 0 or nodes.size() > MAXIMUM_INSPECTION_STATE_ITEMS - count:
+				return null
+			source = level.Roofs.get_children()
+		else:
+			return null
+		if typeof(source) != TYPE_ARRAY or nodes.size() > MAXIMUM_INSPECTION_STATE_ITEMS - source.size():
+			return null
+		for node in source:
+			nodes.append(node)
+	return nodes
+
+
+func _observe_addressable_surface(operation, native_node_ids):
+	var nodes = _addressable_surface_nodes(operation)
+	if nodes == null:
+		return false
+	var targets = {}
+	for node_id in native_node_ids:
+		if not Global.World.HasNodeID(int(node_id)):
+			return false
+		targets[int(node_id)] = true
+	var counts = {}
+	for node in nodes:
+		var node_id = _node_id_metadata(node)
+		if node_id.ok and targets.has(node_id.value):
+			counts[node_id.value] = int(counts.get(node_id.value, 0)) + 1
+	for node_id in native_node_ids:
+		if counts.get(int(node_id), 0) != 1:
+			return false
+	return true
+
+
+func _reverse_addressable_surface(operation, native_node_ids):
+	if not _observe_addressable_surface(operation, native_node_ids):
+		return false
+	if Global.Editor == null or typeof(Global.Editor.Tools) != TYPE_DICTIONARY or not Global.Editor.Tools.has("SelectTool") or Global.Editor.Tools["SelectTool"] == null:
+		return false
+	var select_tool = Global.Editor.Tools["SelectTool"]
+	if _select_tool_has_active_selection(select_tool):
+		return false
+	select_tool.DeselectAll()
+	for node_id in native_node_ids:
+		var node = Global.World.GetNodeByID(int(node_id))
+		if node == null or select_tool.SelectThing(node, true) == null:
+			select_tool.DeselectAll()
+			return false
+	select_tool.Delete()
+	select_tool.DeselectAll()
+	return true
+
+
+func _select_tool_has_active_selection(select_tool):
+	return select_tool == null or typeof(select_tool.Selected) != TYPE_ARRAY or select_tool.Selected.size() > 0
+
+
+func _observe_addressable_surface_reversal(operation, native_node_ids):
+	for node_id in native_node_ids:
+		if Global.World.HasNodeID(int(node_id)):
+			return false
+	var nodes = _addressable_surface_nodes(operation)
+	if nodes == null:
 		return false
 	var targets = {}
 	for node_id in native_node_ids:
 		targets[int(node_id)] = true
-	for level in Global.World.levels:
-		if level == null or level.Walls == null or level.Walls.get_child_count() > MAXIMUM_INSPECTION_STATE_ITEMS:
+	for node in nodes:
+		var node_id = _node_id_metadata(node)
+		if node_id.ok and targets.has(node_id.value):
 			return false
-		for wall in level.Walls.get_children():
-			var wall_id = _node_id_metadata(wall)
-			if wall_id.ok and targets.has(wall_id.value):
-				return false
 	return true
+
+
+func _terrain_state_hash(terrain):
+	if terrain == null:
+		return ""
+	var primary = terrain.CloneSplatImage()
+	var secondary = terrain.CloneSplatImage2()
+	if primary == null:
+		return ""
+	var text = "primary=" + _sha256_bytes(primary.get_data()) + "\n"
+	text += "secondary=" + (_sha256_bytes(secondary.get_data()) if secondary != null else "null") + "\n"
+	return text.sha256_text()
+
+
+func _cave_state_hash(cave_mesh):
+	if cave_mesh == null or cave_mesh.bitmap == null or cave_mesh.CaveFloor == null or str(cave_mesh.CaveFloor.resource_path).length() == 0:
+		return ""
+	var image = cave_mesh.bitmap.convert_to_image()
+	if image == null:
+		return ""
+	var text = "bitmap=" + _sha256_bytes(image.get_data()) + "\n"
+	text += "floor=" + str(cave_mesh.CaveFloor.resource_path).sha256_text() + "\n"
+	text += "ground=" + cave_mesh.GroundColor.to_html(true) + "\n"
+	text += "wall=" + cave_mesh.WallColor.to_html(true) + "\n"
+	return text.sha256_text()
+
+
+func _sha256_bytes(bytes):
+	if typeof(bytes) != TYPE_RAW_ARRAY:
+		return ""
+	var context = HashingContext.new()
+	if context.start(HashingContext.HASH_SHA256) != OK or context.update(bytes) != OK:
+		return ""
+	return context.finish().hex_encode()
 
 
 func _universal_apply_success(request, plan_fingerprint, job):
@@ -965,8 +1875,20 @@ func _read_accepted_catalog():
 	var identity = _read_current_catalog_identity()
 	if not identity.ok:
 		return {"ok": false, "error": _error("catalog_unavailable", "The accepted asset catalog manifest is unavailable or invalid.", "")}
-	var manifest_path = identity.manifest_path
-	var manifest = identity.manifest
+	var snapshot = _read_catalog_snapshot(identity.manifest_path, identity.manifest)
+	if not snapshot.ok:
+		return snapshot
+	return {
+		"ok": true,
+		"catalog_revision": int(identity.manifest.catalog_revision),
+		"catalog_fingerprint": identity.manifest.catalog_fingerprint,
+		"entries": snapshot.entries,
+	}
+
+
+func _read_catalog_snapshot(manifest_path, manifest):
+	if not _catalog_manifest_is_valid(manifest):
+		return {"ok": false, "error": _error("catalog_unavailable", "The accepted asset catalog manifest is unavailable or invalid.", "")}
 	var entries = {}
 	var observed_category_counts = {}
 	for category in CATALOG_CATEGORIES:
@@ -989,8 +1911,6 @@ func _read_accepted_catalog():
 			return {"ok": false, "error": _error("catalog_unavailable", "The accepted catalog category counts do not match its entries.", "")}
 	return {
 		"ok": true,
-		"catalog_revision": int(manifest.catalog_revision),
-		"catalog_fingerprint": manifest.catalog_fingerprint,
 		"entries": entries,
 	}
 
@@ -1003,11 +1923,11 @@ func _catalog_identity_matches(job):
 func _read_current_catalog_identity():
 	var pointer = _read_bounded_dictionary(MAILBOX_ROOT + "/catalog/current.json")
 	var pointer_shape_ok = _dictionary_has_exact_keys(pointer, ["session_id", "manifest"]) or _dictionary_has_exact_keys(pointer, ["session_id", "manifest", "catalog_revision"])
-	if not pointer_shape_ok or pointer.session_id != _session_id or not _is_safe_relative_catalog_path(pointer.manifest):
+	if not pointer_shape_ok or not _is_safe_request_id(pointer.session_id) or not _is_safe_relative_catalog_path(pointer.manifest):
 		return {"ok": false}
 	var manifest_path = MAILBOX_ROOT + "/catalog/snapshots/" + pointer.manifest
 	var manifest = _read_bounded_dictionary(manifest_path)
-	if not _catalog_manifest_is_valid(manifest) or manifest.session_id != _session_id:
+	if not _catalog_manifest_is_valid(manifest) or manifest.session_id != pointer.session_id:
 		return {"ok": false}
 	if pointer.has("catalog_revision") and (not _is_nonnegative_json_safe_integer(pointer.catalog_revision) or int(pointer.catalog_revision) != int(manifest.catalog_revision)):
 		return {"ok": false}
@@ -1192,13 +2112,36 @@ func _universal_plan_fingerprint_input(plan):
 		text += _framed_string(prefix + ".operation_id=", operation.operation_id)
 		text += _framed_string(prefix + ".level_id=", operation.level_id)
 		text += _framed_string(prefix + ".asset_ref=", operation.asset_ref)
-		text += prefix + ".path.points_count=" + str(operation.path.points.size()) + "\n"
-		for point_index in range(operation.path.points.size()):
-			var point = operation.path.points[point_index]
-			text += prefix + ".path.point[" + str(point_index) + "].x=" + _double_fingerprint_text(float(point.x)) + "\n"
-			text += prefix + ".path.point[" + str(point_index) + "].y=" + _double_fingerprint_text(float(point.y)) + "\n"
-		text += prefix + ".closed=" + ("true" if operation.closed else "false") + "\n"
-		text += _framed_string(prefix + ".color_rgba=", operation.color_rgba)
+		if operation.operation_type in ["terrain_stroke", "wall_polyline"]:
+			text += _universal_geometry_fingerprint(prefix, "path", operation.path)
+		else:
+			text += _universal_geometry_fingerprint(prefix, "region", operation.region)
+		if operation.operation_type == "terrain_stroke":
+			text += prefix + ".width=" + _double_fingerprint_text(float(operation.width)) + "\n"
+			text += prefix + ".strength=" + _double_fingerprint_text(float(operation.strength)) + "\n"
+		elif operation.operation_type in ["pattern_region", "colorable_pattern_region"]:
+			if operation.operation_type == "colorable_pattern_region":
+				text += _framed_string(prefix + ".color_rgba=", operation.color_rgba)
+			text += prefix + ".rotation_degrees=" + _double_fingerprint_text(float(operation.rotation_degrees)) + "\n"
+			text += prefix + ".layer=" + str(int(operation.layer)) + "\n"
+		elif operation.operation_type == "cave_region":
+			text += _framed_string(prefix + ".floor_color_rgba=", operation.floor_color_rgba)
+			text += _framed_string(prefix + ".wall_color_rgba=", operation.wall_color_rgba)
+		elif operation.operation_type == "roof_region":
+			text += prefix + ".width=" + _double_fingerprint_text(float(operation.width)) + "\n"
+			text += prefix + ".shade=" + _double_fingerprint_text(float(operation.shade)) + "\n"
+		elif operation.operation_type == "wall_polyline":
+			text += prefix + ".closed=" + ("true" if operation.closed else "false") + "\n"
+			text += _framed_string(prefix + ".color_rgba=", operation.color_rgba)
+	return text
+
+
+func _universal_geometry_fingerprint(prefix, geometry_name, geometry):
+	var text = prefix + "." + geometry_name + ".points_count=" + str(geometry.points.size()) + "\n"
+	for point_index in range(geometry.points.size()):
+		var point = geometry.points[point_index]
+		text += prefix + "." + geometry_name + ".point[" + str(point_index) + "].x=" + _double_fingerprint_text(float(point.x)) + "\n"
+		text += prefix + "." + geometry_name + ".point[" + str(point_index) + "].y=" + _double_fingerprint_text(float(point.y)) + "\n"
 	return text
 
 
@@ -1239,6 +2182,22 @@ func _is_bounded_grid_point(point, canvas):
 		if typeof(coordinate) != TYPE_REAL or is_nan(coordinate) or is_inf(coordinate) or (coordinate != 0.0 and abs(coordinate) < MINIMUM_UNIVERSAL_NONZERO_MAGNITUDE):
 			return false
 	return point.x >= 0.0 and point.y >= 0.0 and point.x <= float(canvas.width) and point.y <= float(canvas.height)
+
+
+func _is_positive_universal_number(value):
+	return typeof(value) == TYPE_REAL and not is_nan(value) and not is_inf(value) and value >= MINIMUM_UNIVERSAL_NONZERO_MAGNITUDE
+
+
+func _is_unit_universal_number(value):
+	return typeof(value) == TYPE_REAL and not is_nan(value) and not is_inf(value) and (value == 0.0 or abs(value) >= MINIMUM_UNIVERSAL_NONZERO_MAGNITUDE) and value >= 0.0 and value <= 1.0
+
+
+func _is_rotation(value):
+	return typeof(value) == TYPE_REAL and not is_nan(value) and not is_inf(value) and (value == 0.0 or abs(value) >= MINIMUM_UNIVERSAL_NONZERO_MAGNITUDE) and value >= -360.0 and value <= 360.0
+
+
+func _is_supported_layer(value):
+	return typeof(value) == TYPE_REAL and value == floor(value) and [-400, -100, 100, 200, 300, 400, 700, 900].has(int(value))
 
 
 func _is_rgba(value):
@@ -1611,14 +2570,25 @@ func _claim_next_processing():
 	var directory = Directory.new()
 	if directory.open(MAILBOX_ROOT + "/processing") != OK:
 		return {}
+	var file_names = []
 	directory.list_dir_begin(true, true)
 	var file_name = directory.get_next()
 	while file_name != "":
 		if not directory.current_is_dir() and file_name.ends_with(".json"):
-			directory.list_dir_end()
-			return {"file_name": file_name, "path": MAILBOX_ROOT + "/processing/" + file_name}
+			file_names.append(file_name)
+			if file_names.size() > MAXIMUM_PROCESSING_CLAIMS:
+				directory.list_dir_end()
+				return {}
 		file_name = directory.get_next()
 	directory.list_dir_end()
+	file_names.sort()
+	if file_names.size() > 0:
+		_processing_claim_cursor = _processing_claim_cursor % file_names.size()
+		for offset in range(file_names.size()):
+			var index = (_processing_claim_cursor + offset) % file_names.size()
+			file_name = file_names[index]
+			_processing_claim_cursor = (index + 1) % file_names.size()
+			return {"file_name": file_name, "path": MAILBOX_ROOT + "/processing/" + file_name}
 	if directory.open(MAILBOX_ROOT + "/map-jobs") != OK:
 		return {}
 	directory.list_dir_begin(true, true)
@@ -2296,7 +3266,40 @@ func _cleanup_completed_map_job(file_name):
 		return "blocked"
 	if not directory.file_exists(response_path) or not _response_text_matches(response_path, completed.response_text):
 		return "blocked"
-	return "map_job_journal_deleted" if _remove_file(job_path) in ["removed", "missing"] else "blocked"
+	var rollback_path = MAILBOX_ROOT + "/surface-rollbacks/" + key
+	if directory.dir_exists(rollback_path) and not _remove_directory_tree_bounded(rollback_path, 4096):
+		return "blocked"
+	if not ["removed", "missing"].has(_remove_file(job_path)):
+		return "blocked"
+	return "map_job_journal_deleted"
+
+
+func _remove_directory_tree_bounded(path, remaining_entries):
+	if remaining_entries <= 0:
+		return false
+	var directory = Directory.new()
+	if not directory.dir_exists(path):
+		return true
+	if directory.open(path) != OK:
+		return false
+	directory.list_dir_begin(true, true)
+	var names = []
+	var name = directory.get_next()
+	while name != "":
+		if names.size() >= remaining_entries or name == "." or name == "..":
+			directory.list_dir_end()
+			return false
+		names.append({"name": name, "directory": directory.current_is_dir()})
+		name = directory.get_next()
+	directory.list_dir_end()
+	for entry in names:
+		var child = path + "/" + entry.name
+		if entry.directory:
+			if not _remove_directory_tree_bounded(child, remaining_entries - names.size()):
+				return false
+		elif directory.remove(child) != OK:
+			return false
+	return directory.remove(path) == OK
 
 
 func _read_standalone_mutation_intent(path, key, state, require_response):
@@ -2384,7 +3387,7 @@ func _active_mods_payload():
 
 
 func _certified_operation_types():
-	var values = _certified_operation_executors.keys()
+	var values = _runtime_certified_operation_types.duplicate()
 	values.sort()
 	return values
 
