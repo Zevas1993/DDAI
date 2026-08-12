@@ -101,6 +101,27 @@ public sealed class MapSnapshotContractTests
     }
 
     [Fact]
+    public void SnapshotPage_AcceptsAxisAlignedWallExtentsButRejectsPointBounds()
+    {
+        var horizontal = ValidPage() with
+        {
+            Items = [new MapSnapshotItem(7, "wall", new MapSnapshotBounds(1, 2, 3, 0), 3, null)],
+        };
+        var vertical = ValidPage() with
+        {
+            Items = [new MapSnapshotItem(7, "wall", new MapSnapshotBounds(1, 2, 0, 4), 3, null)],
+        };
+        var point = ValidPage() with
+        {
+            Items = [new MapSnapshotItem(7, "wall", new MapSnapshotBounds(1, 2, 0, 0), 3, null)],
+        };
+
+        Assert.Equal(0, MapSnapshotJson.DeserializePage(MapSnapshotJson.SerializePage(horizontal)).Items[0].Bounds.Height);
+        Assert.Equal(0, MapSnapshotJson.DeserializePage(MapSnapshotJson.SerializePage(vertical)).Items[0].Bounds.Width);
+        Assert.Throws<JsonException>(() => MapSnapshotJson.DeserializePage(MapSnapshotJson.SerializePage(point)));
+    }
+
+    [Fact]
     public void SnapshotPage_RejectsUnknownMissingDuplicateAndSemanticallyInvalidContent()
     {
         var valid = JsonNode.Parse(MapSnapshotJson.SerializePage(ValidPage()))!.AsObject();
@@ -224,7 +245,8 @@ public sealed class MapSnapshotContractTests
             Assert.Contains(documentedPath, inspection, StringComparison.Ordinal);
         }
 
-        Assert.Contains("GetNodeID()", inspection, StringComparison.Ordinal);
+        Assert.Contains("_node_id_metadata(node)", inspection, StringComparison.Ordinal);
+        Assert.Contains("get_meta(\"node_id\")", FunctionBody(script, "_node_id_metadata"), StringComparison.Ordinal);
         Assert.Contains("GlobalRect", inspection, StringComparison.Ordinal);
         Assert.Contains("node.Rect", inspection, StringComparison.Ordinal);
         Assert.Contains("node.Sprite.texture.resource_path", inspection, StringComparison.Ordinal);
@@ -389,6 +411,7 @@ public sealed class MapSnapshotContractTests
                          "DDAI_INSPECTION_CURSOR_VECTOR:True",
                           "DDAI_INSPECTION_MAP_IDENTITY:True",
                           "DDAI_INSPECTION_OBJECT_CORRELATION:True",
+                          "DDAI_INSPECTION_NODE_ID_DIAGNOSTIC:True",
                           "DDAI_INSPECTION_READ_ONLY:True",
                      })
             {

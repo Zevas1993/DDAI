@@ -305,6 +305,10 @@ func _advance_universal_plan_claim(claim, request, request_fingerprint, _journal
 			var operation_result = _pending_operation_results[key]
 			_pending_operation_results.erase(key)
 			if not operation_result.ok:
+				if operation_result.get("untracked_change", false):
+					job.state = "outcome_unknown"
+					job.canonical_response = null
+					return "map_job_outcome_unknown" if _write_map_job_journal(job_path, job, true) == "replaced" else "blocked"
 				if operation_result.node_ids.size() > 0:
 					if _native_ids_are_safe_for_job(job, operation_result.node_ids):
 						job.current_operation_node_ids = operation_result.node_ids.duplicate()
@@ -354,7 +358,8 @@ func _advance_universal_plan_claim(claim, request, request_fingerprint, _journal
 				_map_job_state_fingerprint = job.map_state_fingerprint
 				return "map_job_operation_observed"
 			return _begin_map_job_reversal(job_path, job, key, true)
-		_pending_observation_results[key] = _observe_operation(job.current_operation_node_ids)
+		var observation_result = _observe_operation(job.current_operation_node_ids)
+		_pending_observation_results[key] = observation_result
 		return "map_job_native_operation_observed"
 	if job.state == "operation_observed":
 		if int(job.next_operation_index) >= plan.operations.size():
@@ -503,7 +508,7 @@ func _preflight_universal_plan(plan):
 		return {"ok": false, "error": _error("map_revision_mismatch", "The open map revision changed.", "payload.base_revision")}
 	if int(Global.World.Width) != int(plan.canvas.width) or int(Global.World.Height) != int(plan.canvas.height):
 		return {"ok": false, "error": _error("canvas_mismatch", "The open canvas does not match the plan.", "payload.canvas")}
-	if Global.Editor == null or typeof(Global.Editor.Tools) != TYPE_DICTIONARY or not Global.Editor.Tools.has("WallTool") or Global.Editor.Tools["WallTool"] == null or Global.WorldUI == null:
+	if Global.Editor == null or typeof(Global.Editor.Tools) != TYPE_DICTIONARY or not Global.Editor.Tools.has("WallTool") or Global.Editor.Tools["WallTool"] == null or (Global.Editor.ActiveToolName != null and typeof(Global.Editor.ActiveToolName) != TYPE_STRING) or Global.WorldUI == null:
 		return {"ok": false, "error": _error("wall_tool_unavailable", "The documented wall editing state is unavailable.", "")}
 	var wall_tool = Global.Editor.Tools["WallTool"]
 	if wall_tool.isDrawing or Global.WorldUI.EditArcPoint or Global.WorldUI.Polyline.size() > 0:
@@ -804,34 +809,79 @@ func _execute_wall_polyline(operation, job_key):
 		return {"ok": false, "node_ids": []}
 	var texture = _texture_loader.call_func(_resolved_job_assets[job_key][operation.operation_id])
 	var level = Global.World.GetLevelByID(int(operation.level_id))
-	if texture == null or level == null or level.Walls == null:
+	if texture == null or level == null or level.Walls == null or Global.Editor == null or typeof(Global.Editor.Tools) != TYPE_DICTIONARY or not Global.Editor.Tools.has("WallTool") or Global.Editor.Tools["WallTool"] == null or Global.WorldUI == null:
 		return {"ok": false, "node_ids": []}
-	var before = {}
+	if level.Walls.get_child_count() > MAXIMUM_INSPECTION_STATE_ITEMS:
+		return {"ok": false, "node_ids": []}
+	var wall_tool = Global.Editor.Tools["WallTool"]
+	if wall_tool.isDrawing or Global.WorldUI.EditArcPoint or Global.WorldUI.Polyline.size() > 0:
+		return {"ok": false, "node_ids": []}
+	var walls_before = {}
 	for wall in level.Walls.get_children():
-		var existing_node_id = wall.GetNodeID()
-		if _is_runtime_nonnegative_safe_integer(existing_node_id):
-			before[int(existing_node_id)] = true
+		walls_before[wall] = true
 	var points = []
 	for point in operation.path.points:
 		points.append(Vector2(float(point.x) * float(Global.World.GridSize), float(point.y) * float(Global.World.GridSize)))
-	level.Walls.AddWall(points, texture, _rgba_color(operation.color_rgba), operation.closed)
-	var created = []
+	var wall_tool_was_active = Global.Editor.ActiveToolName == "WallTool"
+	var prior_texture = wall_tool.Texture
+	var prior_color = wall_tool.get("Color")
+	wall_tool.Texture = texture
+	wall_tool.set("Color", _rgba_color(operation.color_rgba))
+	if not wall_tool_was_active:
+		wall_tool.Enable()
+	Global.WorldUI.ClearPolyline()
+	for point in points:
+		Global.WorldUI.AddPolyPoint(point)
+	wall_tool.EndWall(operation.closed)
+	var cleanup_ok = _cleanup_wall_tool(wall_tool, not wall_tool_was_active)
+	wall_tool.Texture = prior_texture
+	wall_tool.set("Color", prior_color)
+	if not cleanup_ok or level.Walls.get_child_count() > MAXIMUM_INSPECTION_STATE_ITEMS:
+		return {"ok": false, "node_ids": [], "untracked_change": true}
+	var created_walls = []
 	for wall in level.Walls.get_children():
-		var raw_node_id = wall.GetNodeID()
-		if _is_runtime_nonnegative_safe_integer(raw_node_id):
-			var node_id = int(raw_node_id)
-			if node_id > 0 and not before.has(node_id):
-				created.append(node_id)
-	if created.size() != 1:
-		return {"ok": false, "node_ids": created}
-	return {"ok": true, "node_ids": created}
+		if not walls_before.has(wall):
+			created_walls.append(wall)
+	if created_walls.size() != 1:
+		return {"ok": false, "node_ids": [], "untracked_change": true}
+	var created_wall = created_walls[0]
+	var normalized_node_id = _node_id_metadata(created_wall)
+	if not normalized_node_id.ok or not Global.World.HasNodeID(int(normalized_node_id.value)) or Global.World.GetNodeByID(int(normalized_node_id.value)) != created_wall:
+		normalized_node_id = _runtime_node_id(Global.World.AssignNodeID(created_wall))
+	var persisted_node_id = _node_id_metadata(created_wall)
+	if not normalized_node_id.ok or normalized_node_id.value <= 0 or not persisted_node_id.ok or persisted_node_id.value != normalized_node_id.value or not Global.World.HasNodeID(int(normalized_node_id.value)) or Global.World.GetNodeByID(int(normalized_node_id.value)) != created_wall:
+		return {"ok": false, "node_ids": [], "untracked_change": true}
+	return {"ok": true, "node_ids": [normalized_node_id.value]}
 
 
 func _observe_operation(native_node_ids):
 	if typeof(native_node_ids) != TYPE_ARRAY or native_node_ids.size() == 0:
 		return false
+	if typeof(Global.World.levels) != TYPE_ARRAY or Global.World.levels.size() > MAXIMUM_INSPECTION_LEVELS:
+		return false
+	var inspected_wall_count = 0
+	var registered_node_ids = {}
 	for node_id in native_node_ids:
-		if not Global.World.HasNodeID(int(node_id)) or Global.World.GetNodeByID(int(node_id)) == null:
+		if not Global.World.HasNodeID(int(node_id)):
+			return false
+		registered_node_ids[int(node_id)] = true
+	var observed_node_counts = {}
+	for level in Global.World.levels:
+		if level == null or level.Walls == null:
+			return false
+		var wall_count = level.Walls.get_child_count()
+		if wall_count < 0 or inspected_wall_count > MAXIMUM_INSPECTION_STATE_ITEMS - wall_count:
+			return false
+		var walls = level.Walls.get_children()
+		if walls.size() != wall_count:
+			return false
+		inspected_wall_count += wall_count
+		for wall in walls:
+			var wall_id = _node_id_metadata(wall)
+			if wall_id.ok and registered_node_ids.has(wall_id.value):
+				observed_node_counts[wall_id.value] = int(observed_node_counts.get(wall_id.value, 0)) + 1
+	for node_id in native_node_ids:
+		if observed_node_counts.get(int(node_id), 0) != 1:
 			return false
 	return true
 
@@ -867,8 +917,8 @@ func _observe_reversal(native_node_ids):
 		if level == null or level.Walls == null or level.Walls.get_child_count() > MAXIMUM_INSPECTION_STATE_ITEMS:
 			return false
 		for wall in level.Walls.get_children():
-			var wall_id = wall.GetNodeID()
-			if _is_runtime_nonnegative_safe_integer(wall_id) and targets.has(int(wall_id)):
+			var wall_id = _node_id_metadata(wall)
+			if wall_id.ok and targets.has(wall_id.value):
 				return false
 	return true
 
@@ -1409,9 +1459,10 @@ func _execute_rectangular_room(request, plan, plan_fingerprint):
 	}
 
 
-func _cleanup_wall_tool(wall_tool):
+func _cleanup_wall_tool(wall_tool, disable_tool = true):
 	Global.WorldUI.ClearPolyline()
-	wall_tool.Disable()
+	if disable_tool:
+		wall_tool.Disable()
 	return true
 
 
@@ -1941,10 +1992,12 @@ func _inspection_item(node, kind, level_id, grid_size):
 		return {"ok": false, "error": _error("inspection_state_invalid", "Inspection item kind is not supported.", "")}
 	if typeof(global_rect) != TYPE_RECT2 or not _inspection_rect_is_finite_positive(global_rect):
 		return {"ok": false, "error": _error("inspection_state_invalid", "A native inspection item has invalid global bounds.", "")}
-	var raw_node_id = node.GetNodeID()
-	if not _is_runtime_nonnegative_safe_integer(raw_node_id):
-		return {"ok": false, "error": _error("inspection_state_invalid", "A native inspection item has an invalid node ID.", "")}
-	var node_id = int(raw_node_id)
+	var normalized_node_id = _node_id_metadata(node)
+	if not normalized_node_id.ok:
+		var reason = normalized_node_id.get("reason", "invalid_value")
+		var message = "A native %s has an invalid node ID (type_code=%d, reason=%s)." % [kind, normalized_node_id.type_code, reason]
+		return {"ok": false, "error": _error("inspection_state_invalid", message, "")}
+	var node_id = normalized_node_id.value
 	var resource_fingerprint = null
 	var correlation_unavailable = false
 	if kind == "object":
@@ -1974,11 +2027,22 @@ func _inspection_rect_is_finite_positive(rect):
 	for value in [rect.position.x, rect.position.y, rect.size.x, rect.size.y]:
 		if is_nan(float(value)) or is_inf(float(value)):
 			return false
-	return rect.size.x > 0.0 and rect.size.y > 0.0
+	return rect.size.x >= 0.0 and rect.size.y >= 0.0 and (rect.size.x > 0.0 or rect.size.y > 0.0)
 
 
 func _is_runtime_nonnegative_safe_integer(value):
 	return (typeof(value) == TYPE_INT or typeof(value) == TYPE_REAL) and not is_nan(float(value)) and not is_inf(float(value)) and float(value) == floor(float(value)) and float(value) >= 0.0 and float(value) <= 9007199254740991.0
+
+
+func _runtime_node_id(value):
+	var type_code = typeof(value)
+	if type_code == TYPE_INT and value >= 0 and value <= 9007199254740991:
+		return {"ok": true, "value": int(value)}
+	return {"ok": false, "type_code": type_code, "reason": "unsupported_type" if type_code != TYPE_INT else "outside_safe_range"}
+
+
+func _node_id_metadata(node):
+	return _runtime_node_id(node.get_meta("node_id") if node != null and node.has_meta("node_id") else null)
 
 
 func _is_runtime_nonnegative_int32(value):

@@ -122,8 +122,29 @@ public sealed class DungeondraftUniversalPlanScriptTests
         Assert.Contains("Global.World.HasNodeID", reversalObservation, StringComparison.Ordinal);
         Assert.Contains("Global.World.GetNodeByID", reversalObservation, StringComparison.Ordinal);
         var wallExecutor = FunctionBody(script, "_execute_wall_polyline");
-        Assert.Contains("wall.GetNodeID()", wallExecutor, StringComparison.Ordinal);
-        Assert.DoesNotContain("has_meta(\"node_id\")", wallExecutor, StringComparison.Ordinal);
+        Assert.Contains("Global.WorldUI.AddPolyPoint", wallExecutor, StringComparison.Ordinal);
+        Assert.Contains("wall_tool.EndWall(operation.closed)", wallExecutor, StringComparison.Ordinal);
+        Assert.Contains("Global.Editor.ActiveToolName == \"WallTool\"", wallExecutor, StringComparison.Ordinal);
+        Assert.Contains("_cleanup_wall_tool(wall_tool, not wall_tool_was_active)", wallExecutor, StringComparison.Ordinal);
+        Assert.DoesNotContain("level.Walls.AddWall", wallExecutor, StringComparison.Ordinal);
+        Assert.DoesNotContain("GetNodeID()", wallExecutor, StringComparison.Ordinal);
+        var observation = FunctionBody(script, "_observe_operation");
+        Assert.Contains("level.Walls.get_children()", observation, StringComparison.Ordinal);
+        Assert.Contains("inspected_wall_count > MAXIMUM_INSPECTION_STATE_ITEMS", observation, StringComparison.Ordinal);
+        Assert.Contains("observed_node_counts[wall_id.value]", observation, StringComparison.Ordinal);
+        Assert.Contains("observed_node_counts.get(int(node_id), 0) != 1", observation, StringComparison.Ordinal);
+        Assert.Contains("registered_node_ids[int(node_id)] = true", observation, StringComparison.Ordinal);
+        Assert.DoesNotContain("wall == registered_node", observation, StringComparison.Ordinal);
+        Assert.DoesNotContain("registered_nodes[int(node_id)] = registered_node", observation, StringComparison.Ordinal);
+        Assert.DoesNotContain("Global.World.GetNodeByID", observation, StringComparison.Ordinal);
+        var stateMachine = FunctionBody(script, "_advance_universal_plan_claim");
+        Assert.Contains("var observation_result = _observe_operation(job.current_operation_node_ids)", stateMachine, StringComparison.Ordinal);
+        Assert.Contains("_pending_observation_results[key] = observation_result", stateMachine, StringComparison.Ordinal);
+        Assert.DoesNotContain("_pending_observation_results[key] = _observe_operation", stateMachine, StringComparison.Ordinal);
+        Assert.DoesNotContain("registered_node.get_parent()", observation, StringComparison.Ordinal);
+        Assert.True(
+            observation.IndexOf("level.Walls.get_child_count()", StringComparison.Ordinal) <
+            observation.IndexOf("level.Walls.get_children()", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -231,7 +252,9 @@ public sealed class DungeondraftUniversalPlanScriptTests
                          "DDAI_UNIVERSAL_OBSERVE_FAILURE_REVERSED:True",
                          "DDAI_UNIVERSAL_DUPLICATE_AFTER_CLEANUP:True",
                          "DDAI_UNIVERSAL_REVERSAL_REVISION_STABLE:True",
-                         "DDAI_UNIVERSAL_MULTIPLE_CREATED_REVERSED:True",
+                         "DDAI_UNIVERSAL_PARTIAL_REGISTRATION_UNKNOWN:True",
+                         "DDAI_UNIVERSAL_WALL_TOOL_STATE_RESTORED:True",
+                         "DDAI_UNIVERSAL_NODE_ID_COLLISION_RECOVERED:True",
                          "DDAI_UNIVERSAL_PREPARED_RECOVERY:True",
                          "DDAI_UNIVERSAL_STRICT_FAILURES:True",
                          "DDAI_UNIVERSAL_CATALOG_MANIFEST_INTEGRITY:True",

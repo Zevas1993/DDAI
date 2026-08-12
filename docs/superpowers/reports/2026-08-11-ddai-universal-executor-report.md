@@ -4,7 +4,7 @@ Recorded: 2026-08-11
 
 ## Outcome and boundary
 
-Task 5 implements the first revision-locked universal-plan executor in the Dungeondraft bridge: `wall_polyline`. It is automated and pinned-Godot tested, but it is **not yet live-certified in Dungeondraft**. The mod manifest therefore calls it test-gated, not certified. No live map was modified during implementation or review.
+Task 5 implements the first revision-locked universal-plan executor in the Dungeondraft bridge: `wall_polyline`. It is now live-certified on the disposable saved test map in Dungeondraft 1.2.0.1 through the installed MCP executable. The live run added one unsaved test wall; no user-authored saved map existed or was modified.
 
 The bridge accepts strict schema-2 plans before the legacy schema-1 room route, validates exact plan and operation shapes, binds the plan to the open map revision, accepted asset-catalog revision/fingerprint, documented current level, idle WallTool state, and uniquely resolved live wall texture. Only an explicit `wall_polyline` function is dispatchable.
 
@@ -46,10 +46,18 @@ An earlier full App run had two timing-sensitive test failures outside this chan
 
 ## Public API route
 
-The wall executor uses the documented `Level.Walls.AddWall(...)` route, `Wall.GetNodeID()`, `Global.World.HasNodeID`, `Global.World.GetNodeByID`, and `Wall.Clear()` followed by deferred free. The exact Godot harness mirrors those public method shapes; only a live disposable-map test can certify that route in Dungeondraft 1.2.0.1.
+The wall executor uses the documented `WallTool.Enable`, `Global.WorldUI.AddPolyPoint`, `WallTool.EndWall`, `Global.World.HasNodeID`, and persisted `node_id` metadata routes. It preserves the prior wall texture/color and active-tool state. Observation scans only the bounded documented `Level.Walls` containers and correlates persisted IDs exactly once.
 
 ## Remaining acceptance
 
-Independent final review is clean with no remaining Critical or Important findings. After the final build/parser/listener/format gates, install only the owned DDAI mod files, normally reload the disposable 40 by 30 test map, confirm a fresh runtime/catalog session, submit one revision-locked wall plan through the installed MCP executable, inspect the resulting wall and revision, then run a separately approved reversal/undo path. Until that live round trip succeeds, the overall connector is not claimed ready for map construction.
+Independent final review is clean with no remaining Critical or Important findings. The owned mod was installed at `C:\Users\ChrisBoyd\AppData\Local\DDAI\DungeondraftMods\DDAI`; source and installed script SHA-256 were both `D4ED513265ED6F727AE5575639D5F1906BC3C8EA4012CD7D69B66A89B31D8580`.
+
+Live acceptance used Dungeondraft PID 72160 and the saved disposable 40 by 30 map. After a fresh 1,947-entry catalog was accepted at revision `1786510365298`, the installed MCP server validated request `live-wall-final-proof-20260812-0053` and returned `success:true`, `outcome_unknown:false`, and map-job revision 1 from `ddai_apply_plan`. A subsequent native `inspect_map` response found exactly two walls: the pre-existing fixture wall and node 2 at grid bounds `x=5,y=25,width=7,height=0`. Replaying the identical MCP request returned the byte-equivalent successful result, and a second inspection still found exactly two walls, proving no duplicate mutation. Dungeondraft remained responsive and the new test wall remained visibly unsaved.
+
+The live run exposed and fixed the final cross-language issue: map inspection previously rejected an axis-aligned wall because its native `GlobalRect` has one zero extent. Godot and .NET now require finite non-negative extents with at least one positive dimension; horizontal and vertical lines are accepted while a zero-by-zero point remains invalid. The focused exact-Godot and .NET regression set passed 23/23, and an independent reviewer returned CLEAN on this bounds delta.
+
+Fresh post-live verification passed all 755 Release tests (406 Core and 349 App). The Release build completed with zero warnings and zero errors; changed-file formatting and staged diff checks were clean. GitNexus classified the seven-file staged delta as medium risk with one affected map-validation flow.
+
+This certifies the current `wall_polyline` path, not every planned Dungeondraft operation category. Object placement, portals/doors, paths, roofs, terrain/material painting, text/lights, save/export, and explicit undo still require their own native executors and live certification before the connector can build arbitrary complete maps autonomously.
 
 The final staged GitNexus scan covers 16 files and 78 changed symbols, reports one affected validation flow, and assigns medium risk. The full Core/App, exact-Godot, build, and independent-review gates above are the controlling evidence for that cross-language surface.

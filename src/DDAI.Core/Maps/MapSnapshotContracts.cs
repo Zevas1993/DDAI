@@ -436,9 +436,10 @@ public static class MapSnapshotJson
     private static void ValidateBounds(MapSnapshotBounds bounds)
     {
         if (bounds is null || !IsFinite(bounds.X) || !IsFinite(bounds.Y) ||
-            !IsFinite(bounds.Width) || !IsFinite(bounds.Height) || bounds.Width <= 0 || bounds.Height <= 0)
+            !IsFinite(bounds.Width) || !IsFinite(bounds.Height) || bounds.Width < 0 || bounds.Height < 0 ||
+            (bounds.Width == 0 && bounds.Height == 0))
         {
-            throw new JsonException("Map snapshot bounds must be finite and have positive size.");
+            throw new JsonException("Map snapshot bounds must be finite, non-negative, and span at least one dimension.");
         }
     }
 

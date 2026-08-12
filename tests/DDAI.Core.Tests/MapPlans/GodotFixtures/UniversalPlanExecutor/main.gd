@@ -12,26 +12,25 @@ var _accepted_catalog_fingerprint = ""
 class MockWall:
 	extends Node
 	var native_id = 0
-	var GlobalRect = Rect2(70, 70, 490, 1)
+	var GlobalRect = Rect2(70, 70, 490, 0)
 
 	func _init(value):
 		native_id = value
-		set_meta("node_id", value)
 
 	func Clear():
 		Global.World.remove_node_id(native_id)
 
 	func GetNodeID():
-		return native_id
+		return null
 
 
 class MockWalls:
 	extends Node
 
 	func AddWall(_points, _texture, _color, _closed):
-		for _index in range(Global.World.create_count):
-			Global.World.create_wall()
-		Global.World.create_count = 1
+		var wall = Global.World.create_wall()
+		Global.World.attach_wall(wall)
+		return wall
 
 
 class MockLevel:
@@ -63,8 +62,12 @@ class MockWorld:
 	var registry = {}
 	var next_id = 100
 	var last_created_id = 0
-	var fail_next_observation = false
+	var fail_has_node_call = -1
+	var has_node_calls = 0
 	var create_count = 1
+	var fail_assignment_after = -1
+	var assignment_calls = 0
+	var preset_created_meta_id = 0
 
 	func _init():
 		add_child(level.Walls)
@@ -76,8 +79,8 @@ class MockWorld:
 		return level if int(level_id) == 0 else null
 
 	func HasNodeID(node_id):
-		if fail_next_observation:
-			fail_next_observation = false
+		has_node_calls += 1
+		if fail_has_node_call > 0 and has_node_calls == fail_has_node_call:
 			return false
 		return registry.has(int(node_id))
 
@@ -88,8 +91,25 @@ class MockWorld:
 		next_id += 1
 		last_created_id = next_id
 		var wall = MockWall.new(next_id)
-		level.Walls.add_child(wall)
-		registry[next_id] = wall
+		if preset_created_meta_id > 0:
+			wall.set_meta("node_id", preset_created_meta_id)
+			preset_created_meta_id = 0
+		return wall
+
+	func attach_wall(wall):
+		if wall.get_parent() == null:
+			level.Walls.add_child(wall)
+
+	func AssignNodeID(node):
+		assignment_calls += 1
+		if fail_assignment_after >= 0 and assignment_calls > fail_assignment_after:
+			return null
+		if registry.has(node.native_id) and registry[node.native_id] != node:
+			next_id += 1
+			node.native_id = next_id
+		node.set_meta("node_id", node.native_id)
+		registry[node.native_id] = node
+		return node.native_id
 
 	func remove_node_id(node_id):
 		registry.erase(int(node_id))
@@ -98,10 +118,36 @@ class MockWorld:
 class MockWallTool:
 	extends Reference
 	var isDrawing = false
+	var Texture = null
+	var wall_color = null
+	var enabled = false
+
+	func _get(property):
+		if property == "Color":
+			return wall_color
+		return null
+
+	func _set(property, value):
+		if property == "Color":
+			wall_color = value
+			return true
+		return false
+
+	func Enable():
+		enabled = true
+
+	func Disable():
+		enabled = false
+
+	func EndWall(_closed):
+		var wall = Global.World.create_wall()
+		Global.World.attach_wall(wall)
+		Global.World.AssignNodeID(wall)
 
 
 class MockEditor:
 	extends Reference
+	var ActiveToolName = "WallTool"
 	var Tools = {"WallTool": MockWallTool.new()}
 
 
@@ -109,6 +155,12 @@ class MockWorldUI:
 	extends Reference
 	var EditArcPoint = false
 	var Polyline = []
+
+	func ClearPolyline():
+		Polyline.clear()
+
+	func AddPolyPoint(point):
+		Polyline.append(point)
 
 
 func _ready():
@@ -125,16 +177,27 @@ func _ready():
 	_clear_request_state("universal-wall-success")
 	_clear_request_state("universal-wall-crash")
 	_clear_request_state("universal-wall-observe-fail")
-	_clear_request_state("universal-wall-multiple")
+	_clear_request_state("universal-wall-registration-fail")
 	_publish_catalog(bridge)
 	bridge._status_payload()
 
+	var initial_wall_texture = ImageTexture.new()
+	var initial_wall_color = Color("#12345678")
+	Global.Editor.Tools["WallTool"].Texture = initial_wall_texture
+	Global.Editor.Tools["WallTool"].wall_color = initial_wall_color
+	Global.Editor.Tools["WallTool"].enabled = true
 	var plan = _plan(bridge, "universal-wall-success", 0)
 	var plan_fingerprint = bridge._universal_plan_fingerprint_input(plan).sha256_text()
 	var fingerprint_ok = plan_fingerprint.length() == 64
 	var validation_ok = bridge._validate_universal_plan(plan, plan.request_id).ok
 	var preflight_ok = bridge._preflight_universal_plan(plan).ok
+	Global.Editor.ActiveToolName = ""
+	var unnamed_inactive_tool_preflight_ok = bridge._preflight_universal_plan(plan).ok
+	Global.Editor.ActiveToolName = null
+	var null_inactive_tool_preflight_ok = bridge._preflight_universal_plan(plan).ok
+	Global.Editor.ActiveToolName = "WallTool"
 	var result = yield(_run_job(bridge, plan), "completed")
+	var active_tool_success_restored = Global.Editor.Tools["WallTool"].enabled and Global.Editor.Tools["WallTool"].Texture == initial_wall_texture and Global.Editor.Tools["WallTool"].wall_color == initial_wall_color
 	var native_id = Global.World.last_created_id
 	var observed_ok = result.success and Global.World.HasNodeID(native_id) and bridge._map_job_revision == 1
 	var success_key = plan.request_id.sha256_text()
@@ -152,8 +215,10 @@ func _ready():
 
 	bridge._status_payload()
 	var observe_fail_plan = _plan(bridge, "universal-wall-observe-fail", bridge._map_job_revision)
-	Global.World.fail_next_observation = true
+	Global.World.has_node_calls = 0
+	Global.World.fail_has_node_call = 3
 	var observe_fail_result = yield(_run_job(bridge, observe_fail_plan), "completed")
+	Global.World.fail_has_node_call = -1
 	var failed_native_id = Global.World.last_created_id
 	var observe_failure_reversed = not observe_fail_result.success and not observe_fail_result.payload.outcome_unknown and observe_fail_result.error.code == "operation_failed_reversed" and not Global.World.HasNodeID(failed_native_id)
 	var observe_fail_key = observe_fail_plan.request_id.sha256_text()
@@ -170,10 +235,43 @@ func _ready():
 	yield(get_tree(), "idle_frame")
 	var stable_status_after_frame = bridge._status_payload()
 	var reversal_revision_stable = int(stable_status.map_job_revision) == int(stable_status_after_frame.map_job_revision)
-	var multiple_plan = _plan(bridge, "universal-wall-multiple", bridge._map_job_revision)
-	Global.World.create_count = 2
-	var multiple_result = yield(_run_job(bridge, multiple_plan), "completed")
-	var multiple_created_reversed = not multiple_result.success and not multiple_result.payload.outcome_unknown and multiple_result.error.code == "operation_failed_reversed" and Global.World.registry.size() == 0
+	var registration_fail_plan = _plan(bridge, "universal-wall-registration-fail", bridge._map_job_revision)
+	var failure_wall_texture = ImageTexture.new()
+	var failure_wall_color = Color("#87654321")
+	Global.Editor.ActiveToolName = "ObjectTool"
+	Global.Editor.Tools["WallTool"].Texture = failure_wall_texture
+	Global.Editor.Tools["WallTool"].wall_color = failure_wall_color
+	Global.Editor.Tools["WallTool"].enabled = false
+	Global.World.fail_assignment_after = 0
+	var registration_fail_result = yield(_run_job(bridge, registration_fail_plan), "completed")
+	var partial_registration_is_unknown = not registration_fail_result.success and registration_fail_result.payload.outcome_unknown and registration_fail_result.error.code == "outcome_unknown"
+	var inactive_tool_failure_restored = not Global.Editor.Tools["WallTool"].enabled and Global.Editor.Tools["WallTool"].Texture == failure_wall_texture and Global.Editor.Tools["WallTool"].wall_color == failure_wall_color
+	Global.World.fail_assignment_after = -1
+	# The production contract deliberately retains untrackable native state for
+	# user inspection. Isolate the remaining recovery scenarios in this harness.
+	for wall in Global.World.level.Walls.get_children():
+		wall.free()
+	Global.World.registry.clear()
+	bridge._status_payload()
+
+	Global.World.next_id = 400
+	var existing_collision_wall = MockWall.new(401)
+	existing_collision_wall.set_meta("node_id", 401)
+	Global.World.level.Walls.add_child(existing_collision_wall)
+	Global.World.registry[401] = existing_collision_wall
+	Global.World.preset_created_meta_id = 401
+	bridge._resolved_job_assets["collision-probe"] = {"wall-a": RESOURCE_IDENTITY}
+	var collision_result = bridge._execute_wall_polyline(_plan(bridge, "universal-wall-id-collision", bridge._map_job_revision).operations[0], "collision-probe")
+	var collision_created_wall = null
+	for candidate in Global.World.level.Walls.get_children():
+		if candidate != existing_collision_wall:
+			collision_created_wall = candidate
+			break
+	var collision_created_id = collision_created_wall.get_meta("node_id") if collision_created_wall != null and collision_created_wall.has_meta("node_id") else 0
+	var node_id_collision_recovered = collision_result.ok and collision_result.node_ids.size() == 1 and collision_result.node_ids[0] == collision_created_id and Global.World.GetNodeByID(401) == existing_collision_wall and collision_created_wall != null and collision_created_wall != existing_collision_wall and collision_created_wall.get_parent() == Global.World.level.Walls and collision_created_id > 0 and Global.World.GetNodeByID(collision_created_id) == collision_created_wall
+	for wall in Global.World.level.Walls.get_children():
+		wall.free()
+	Global.World.registry.clear()
 	bridge._status_payload()
 
 	bridge._status_payload()
@@ -275,14 +373,16 @@ func _ready():
 	print("DDAI_UNIVERSAL_FINGERPRINT:", fingerprint_ok)
 	print("DDAI_UNIVERSAL_PLAN_JSON:", to_json(plan))
 	print("DDAI_UNIVERSAL_PLAN_FINGERPRINT:", plan_fingerprint)
-	print("DDAI_UNIVERSAL_VALIDATION_PREFLIGHT:", validation_ok and preflight_ok)
+	print("DDAI_UNIVERSAL_VALIDATION_PREFLIGHT:", validation_ok and preflight_ok and unnamed_inactive_tool_preflight_ok and null_inactive_tool_preflight_ok)
 	print("DDAI_UNIVERSAL_APPLY_OBSERVE:", observed_ok)
 	print("DDAI_UNIVERSAL_COMPLETION_TAMPER_BLOCKED:", completion_tamper_blocked)
 	print("DDAI_UNIVERSAL_REVERSAL:", reversal_ok)
 	print("DDAI_UNIVERSAL_OBSERVE_FAILURE_REVERSED:", observe_failure_reversed)
 	print("DDAI_UNIVERSAL_DUPLICATE_AFTER_CLEANUP:", duplicate_after_cleanup_ok)
 	print("DDAI_UNIVERSAL_REVERSAL_REVISION_STABLE:", reversal_revision_stable)
-	print("DDAI_UNIVERSAL_MULTIPLE_CREATED_REVERSED:", multiple_created_reversed)
+	print("DDAI_UNIVERSAL_PARTIAL_REGISTRATION_UNKNOWN:", partial_registration_is_unknown)
+	print("DDAI_UNIVERSAL_WALL_TOOL_STATE_RESTORED:", active_tool_success_restored and inactive_tool_failure_restored)
+	print("DDAI_UNIVERSAL_NODE_ID_COLLISION_RECOVERED:", node_id_collision_recovered)
 	print("DDAI_UNIVERSAL_PREPARED_RECOVERY:", recovery_ok)
 	print("DDAI_UNIVERSAL_STRICT_FAILURES:", strict_failure_ok)
 	print("DDAI_UNIVERSAL_CATALOG_MANIFEST_INTEGRITY:", catalog_manifest_integrity_ok)
@@ -295,7 +395,7 @@ func _ready():
 	restarted = null
 	Global.Editor = null
 	Global.WorldUI = null
-	get_tree().quit(0 if fingerprint_ok and validation_ok and preflight_ok and observed_ok and completion_tamper_blocked and reversal_ok and observe_failure_reversed and duplicate_after_cleanup_ok and reversal_revision_stable and multiple_created_reversed and recovery_ok and strict_failure_ok and catalog_manifest_integrity_ok and repeated_preflight_ok and preflight_correlation_ok and catalog_race_correlation_ok and journal_invariants_ok else 1)
+	get_tree().quit(0 if fingerprint_ok and validation_ok and preflight_ok and unnamed_inactive_tool_preflight_ok and null_inactive_tool_preflight_ok and observed_ok and completion_tamper_blocked and reversal_ok and observe_failure_reversed and duplicate_after_cleanup_ok and reversal_revision_stable and partial_registration_is_unknown and active_tool_success_restored and inactive_tool_failure_restored and node_id_collision_recovered and recovery_ok and strict_failure_ok and catalog_manifest_integrity_ok and repeated_preflight_ok and preflight_correlation_ok and catalog_race_correlation_ok and journal_invariants_ok else 1)
 
 
 func _plan(bridge, request_id, revision):

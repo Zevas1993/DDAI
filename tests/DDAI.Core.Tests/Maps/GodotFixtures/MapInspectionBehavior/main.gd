@@ -15,9 +15,10 @@ class FakeItem:
 	func _init(node_id, global_rect):
 		_node_id = node_id
 		_global_rect = global_rect
+		set_meta("node_id", int(node_id))
 
 	func GetNodeID():
-		return _node_id
+		return null
 
 	func _get_global_rect():
 		return _global_rect
@@ -81,9 +82,10 @@ class FakeProp:
 		_node_id = node_id
 		_rect = rect
 		Sprite = FakeSprite.new(texture)
+		set_meta("node_id", int(node_id))
 
 	func GetNodeID():
-		return _node_id
+		return null
 
 	func _get_rect():
 		return _rect
@@ -150,6 +152,7 @@ func _ready():
 	var cursor_vector = _test_cross_runtime_cursor_vector()
 	var map_identity = _test_runtime_world_identity_prevents_map_id_collision()
 	var object_correlation = _test_documented_object_fingerprint_is_internal_and_read_only()
+	var node_id_diagnostic = _test_node_id_boundary_diagnostic_is_bounded()
 	var read_only = _mutation_count() == 0
 	print("DDAI_INSPECTION_PAGINATION:", pagination)
 	print("DDAI_INSPECTION_STALE_CURSOR:", stale)
@@ -157,8 +160,9 @@ func _ready():
 	print("DDAI_INSPECTION_CURSOR_VECTOR:", cursor_vector)
 	print("DDAI_INSPECTION_MAP_IDENTITY:", map_identity)
 	print("DDAI_INSPECTION_OBJECT_CORRELATION:", object_correlation)
+	print("DDAI_INSPECTION_NODE_ID_DIAGNOSTIC:", node_id_diagnostic)
 	print("DDAI_INSPECTION_READ_ONLY:", read_only)
-	var exit_code = 0 if pagination and stale and bounds and cursor_vector and map_identity and object_correlation and read_only else 1
+	var exit_code = 0 if pagination and stale and bounds and cursor_vector and map_identity and object_correlation and node_id_diagnostic and read_only else 1
 	Global.World = null
 	for node in nodes:
 		if is_instance_valid(node) and node.get_parent() == null:
@@ -219,6 +223,25 @@ func _test_documented_object_fingerprint_is_internal_and_read_only():
 	prop.test_move(Rect2(10, 20, 20, 10))
 	level.Objects.remove_child(prop)
 	return moved.ok and moved.payload.map_revision != first.payload.map_revision
+
+
+func _test_node_id_boundary_diagnostic_is_bounded():
+	var hostile = FakeItem.new(8, Rect2(0, 0, 10, 10))
+	hostile.set_meta("node_id", {"private_path": "C:/Users/secret/map"})
+	var result = bridge._inspection_item(hostile, "wall", 3, 10.0)
+	hostile.free()
+	if result.ok or result.error.code != "inspection_state_invalid":
+		return false
+	if result.error.message != "A native wall has an invalid node ID (type_code=18, reason=unsupported_type)." or result.error.message.find("private_path") >= 0 or result.error.message.length() > 128:
+		return false
+	for value in [1.0, "1", "+1", "-1", " 1", "1 ", "01", "１", -1, 9007199254740992]:
+		if bridge._runtime_node_id(value).ok:
+			return false
+	for value in [0, 1, 9007199254740991]:
+		var normalized = bridge._runtime_node_id(value)
+		if not normalized.ok or normalized.value != value:
+			return false
+	return true
 
 
 func _query(limit, cursor = null, region = null):
@@ -291,7 +314,7 @@ func _test_bounds_and_response_size_fail_closed():
 		return false
 
 	var original_rect = nodes[0]._global_rect
-	nodes[0].test_move(Rect2(0, 0, 0, 10))
+	nodes[0].test_move(Rect2(0, 0, 0, 0))
 	var invalid_bounds = bridge._inspect_map_payload(_query(2))
 	nodes[0].test_move(original_rect)
 	if invalid_bounds.ok or invalid_bounds.error.code != "inspection_state_invalid":
