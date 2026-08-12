@@ -24,4 +24,4 @@ The screenshot warning was caused by a timestamped DDAI backup under the active 
 
 ## Live boundary
 
-Three Dungeondraft processes were still open at verification time: one clean saved `test` map, one unsaved `test*` sacrificial map, and one blank window. No force-close or live overwrite was performed. Source and published-artifact acceptance are complete; ownership-proven installation and live undo are deferred until those windows can be closed normally without risking the user's saved map.
+Three Dungeondraft processes were still open at verification time: one clean saved `test` map, one unsaved `test*` sacrificial map, and one blank window. No force-close was performed. The ownership-proven setup installed the exact verified executable and mod bytes while correctly returning `activation_pending_dungeondraft_running`; installed/source hashes match and the Mods root still contains only one `DDAI` directory. Runtime activation and live undo remain deferred until those windows can be closed normally and Dungeondraft reloaded without risking user state.
