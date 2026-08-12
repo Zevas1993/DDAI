@@ -1,6 +1,7 @@
 using System.Reflection;
 using System.Text.Json;
 using DDAI.App;
+using DDAI.App.Mcp;
 using DDAI.Core.Assets;
 using DDAI.Core.Mailbox;
 using DDAI.Core.MapPlans;
@@ -26,6 +27,19 @@ public sealed class McpPlanToolTests
         Assert.Equal(toolName, attribute.Name);
         Assert.Equal(readOnly, attribute.ReadOnly);
         Assert.Equal(destructive, attribute.Destructive);
+        Assert.True(attribute.Idempotent);
+        Assert.False(attribute.OpenWorld);
+    }
+
+    [Fact]
+    public void UndoTool_IsExplicitlyDestructiveAndIdempotent()
+    {
+        var method = typeof(DdaiMapTools).GetMethod("UndoLastJobAsync", BindingFlags.Public | BindingFlags.Static);
+        var attribute = Assert.Single(method!.GetCustomAttributes<McpServerToolAttribute>());
+
+        Assert.Equal("ddai_undo_last_job", attribute.Name);
+        Assert.False(attribute.ReadOnly);
+        Assert.True(attribute.Destructive);
         Assert.True(attribute.Idempotent);
         Assert.False(attribute.OpenWorld);
     }

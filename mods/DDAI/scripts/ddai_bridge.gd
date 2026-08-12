@@ -8,7 +8,7 @@ const MAILBOX_ROOT = "user://ddai"
 const MAXIMUM_MESSAGE_BYTES = 1048576
 const POLL_INTERVAL_SECONDS = 0.25
 const HEARTBEAT_INTERVAL_SECONDS = 10.0
-const SUPPORTED_COMMANDS = ["status", "apply_plan", "inspect_map"]
+const SUPPORTED_COMMANDS = ["status", "apply_plan", "inspect_map", "undo_last_job"]
 const MAXIMUM_INSPECTION_LIMIT = 500
 const MAXIMUM_INSPECTION_CURSOR_OFFSET = 10000
 const MAXIMUM_INSPECTION_STATE_ITEMS = 10000
@@ -119,7 +119,7 @@ func update(delta):
 
 func _ensure_mailbox_directories():
 	var directory = Directory.new()
-	for name in ["requests", "processing", "responses", "failed", "journal", "mutation-intents", "map-jobs", "map-completed", "surface-rollbacks", "runtime-receipts", "runtime-heartbeats"]:
+	for name in ["requests", "processing", "responses", "failed", "journal", "mutation-intents", "map-jobs", "map-completed", "map-undoable", "map-undone", "undo-jobs", "surface-rollbacks", "runtime-receipts", "runtime-heartbeats"]:
 		directory.make_dir_recursive(MAILBOX_ROOT + "/" + name)
 
 
@@ -137,7 +137,7 @@ func _run_claim_state_machine(claim):
 	# boundary follows the same route during ordinary polling and startup recovery.
 	for _step in range(8):
 		var transition = _advance_claim_state(claim)
-		if str(transition).begins_with("map_job_"):
+		if str(transition).begins_with("map_job_") or str(transition).begins_with("undo_job_"):
 			return transition
 		if transition == "blocked" or transition == "no_work" or transition == "invalid_claim_failed":
 			return transition
@@ -170,6 +170,8 @@ func _advance_claim_state(claim):
 	var request_fingerprint = canonical_request_text.sha256_text()
 	if request.command == "apply_plan":
 		return _advance_apply_plan_claim(claim, request, request_fingerprint, journal_path, response_path, key)
+	if request.command == "undo_last_job":
+		return _advance_undo_last_job_claim(claim, request, request_fingerprint, response_path, key)
 	if not directory.file_exists(journal_path):
 		var response = _prepare_response(request)
 		var response_text = to_json(response)
@@ -465,6 +467,29 @@ func _advance_universal_plan_claim(claim, request, request_fingerprint, _journal
 	if job.state == "committed":
 		if typeof(job.canonical_response) != TYPE_STRING or job.canonical_response.to_utf8().size() > MAXIMUM_MESSAGE_BYTES or not _validate_universal_job_response(job.canonical_response, request, job, plan_fingerprint):
 			return "blocked"
+		var committed_response = JSON.parse(job.canonical_response)
+		if committed_response.error != OK or typeof(committed_response.result) != TYPE_DICTIONARY:
+			return "blocked"
+		if committed_response.result.success:
+			var undoable_path = MAILBOX_ROOT + "/map-undoable/" + key + ".json"
+			var undoable_record = {
+				"schema_version": MAILBOX_SCHEMA_VERSION,
+				"target_request_id": request.request_id,
+				"target_key": key,
+				"map_id": job.map_id,
+				"map_revision": int(committed_response.result.payload.map_revision),
+				"map_state_fingerprint": job.map_state_fingerprint,
+				"plan_fingerprint": plan_fingerprint,
+				"plan_fingerprint_text": _universal_plan_fingerprint_input(request.payload),
+				"plan": request.payload,
+				"operation_observations": job.operation_observations,
+			}
+			var undoable_directory = Directory.new()
+			if not undoable_directory.file_exists(undoable_path):
+				return "map_job_undoable_recorded" if _write_text_atomically(undoable_path, to_json(undoable_record)) == "created" else "blocked"
+			var existing_undoable = _read_bounded_dictionary(undoable_path)
+			if existing_undoable == null or to_json(existing_undoable) != to_json(undoable_record):
+				return "blocked"
 		if not directory.file_exists(response_path):
 			return "map_job_response_published" if _write_text_atomically(response_path, job.canonical_response) == "created" else "blocked"
 		if not _response_text_matches(response_path, job.canonical_response):
@@ -486,6 +511,235 @@ func _advance_universal_plan_claim(claim, request, request_fingerprint, _journal
 			return "map_job_completion_recorded"
 		return "blocked"
 	return "blocked"
+
+
+func _advance_undo_last_job_claim(claim, request, request_fingerprint, response_path, key):
+	var validation = _validate_undo_last_job_payload(request.payload)
+	if not validation.ok:
+		return _fail_claim_without_loss(claim, validation.error)
+	var payload = validation.payload
+	var undo_path = MAILBOX_ROOT + "/undo-jobs/" + key + ".json"
+	var undone_path = MAILBOX_ROOT + "/map-undone/" + payload.target_request_id.sha256_text() + ".json"
+	var directory = Directory.new()
+	if directory.file_exists(undone_path):
+		var completed_undo = _read_bounded_dictionary(undone_path)
+		if completed_undo == null or not _undo_completion_is_valid(completed_undo, request, request_fingerprint, payload):
+			return "blocked"
+		if not directory.file_exists(response_path):
+			return "undo_job_response_published" if _write_text_atomically(response_path, completed_undo.response_text) == "created" else "blocked"
+		if not _response_text_matches(response_path, completed_undo.response_text):
+			return "blocked"
+		return "undo_job_claim_deleted" if _remove_file(claim.path) in ["removed", "missing"] else "blocked"
+	if not directory.file_exists(undo_path):
+		var prepared = _prepare_undo_job(request, request_fingerprint, payload)
+		if not prepared.ok:
+			var failure = _undo_last_job_failure(request, payload, prepared.error.code, prepared.error.message, prepared.error.path, false)
+			return _advance_journaled_response(claim, request, request_fingerprint, MAILBOX_ROOT + "/journal/" + claim.file_name, response_path, key, to_json(failure))
+		if _write_undo_job(undo_path, prepared.job, false) != "replaced":
+			return "blocked"
+		return "undo_job_prepared"
+	var job = _read_undo_job(undo_path, request, request_fingerprint, payload)
+	if job == null:
+		return "blocked"
+	if job.state == "prepared" and (job.map_id != _current_map_id() or _capture_map_job_state_fingerprint() != job.map_state_fingerprint or _map_job_revision != int(job.starting_map_revision)):
+		job.state = "outcome_unknown"
+		job.canonical_response = null
+		return "undo_job_outcome_unknown" if _write_undo_job(undo_path, job, true) == "replaced" else "blocked"
+	if job.state == "prepared":
+		job.state = "reversing"
+		job.reversal_operation_index = job.plan.operations.size() - 1
+		job.current_operation_node_ids = job.operation_observations[int(job.reversal_operation_index)].native_node_ids.duplicate()
+		if _write_undo_job(undo_path, job, true) != "replaced":
+			return "blocked"
+		_newly_reversing_job_keys[key] = true
+		return "undo_job_reversing"
+	if job.state == "reversing":
+		if _pending_reversal_results.has(key):
+			var pending = _pending_reversal_results[key]
+			if _observe_reversal(job.plan.operations[int(job.reversal_operation_index)], pending.node_ids, job.target_key):
+				_pending_reversal_results.erase(key)
+				if int(job.reversal_operation_index) == 0:
+					job.state = "committed"
+					job.current_operation_node_ids = []
+					job.reversal_operation_index = null
+					job.map_state_fingerprint = _capture_map_job_state_fingerprint()
+					if not _is_sha256(job.map_state_fingerprint):
+						return "blocked"
+					_map_job_revision += 1
+					_map_job_state_fingerprint = job.map_state_fingerprint
+					job.canonical_response = to_json(_undo_last_job_success(request, payload, job))
+					return "undo_job_committed" if _write_undo_job(undo_path, job, true) == "replaced" else "blocked"
+				job.reversal_operation_index = int(job.reversal_operation_index) - 1
+				job.current_operation_node_ids = job.operation_observations[int(job.reversal_operation_index)].native_node_ids.duplicate()
+				if _write_undo_job(undo_path, job, true) != "replaced":
+					return "blocked"
+				_newly_reversing_job_keys[key] = true
+				return "undo_job_reversal_progressed"
+			pending.attempts = int(pending.attempts) + 1
+			if int(pending.attempts) >= 8:
+				_pending_reversal_results.erase(key)
+				job.state = "outcome_unknown"
+				job.canonical_response = null
+				return "undo_job_outcome_unknown" if _write_undo_job(undo_path, job, true) == "replaced" else "blocked"
+			_pending_reversal_results[key] = pending
+			return "undo_job_native_reversal_observed"
+		if not _newly_reversing_job_keys.has(key):
+			job.state = "outcome_unknown"
+			job.canonical_response = null
+			return "undo_job_outcome_unknown" if _write_undo_job(undo_path, job, true) == "replaced" else "blocked"
+		_newly_reversing_job_keys.erase(key)
+		if not _reverse_operation(job.plan.operations[int(job.reversal_operation_index)], job.current_operation_node_ids, job.target_key):
+			job.state = "outcome_unknown"
+			job.canonical_response = null
+			return "undo_job_outcome_unknown" if _write_undo_job(undo_path, job, true) == "replaced" else "blocked"
+		_pending_reversal_results[key] = {"node_ids": job.current_operation_node_ids.duplicate(), "attempts": 0}
+		return "undo_job_native_reversal_called"
+	if job.state == "outcome_unknown":
+		job.state = "committed"
+		job.canonical_response = to_json(_undo_last_job_failure(request, payload, "outcome_unknown", "The exact DDAI job reversal could not be proven after interruption.", "target_request_id", true, job))
+		return "undo_job_committed" if _write_undo_job(undo_path, job, true) == "replaced" else "blocked"
+	if job.state == "committed":
+		if typeof(job.canonical_response) != TYPE_STRING or not _validate_undo_response(job.canonical_response, request, payload, job):
+			return "blocked"
+		if not directory.file_exists(response_path):
+			return "undo_job_response_published" if _write_text_atomically(response_path, job.canonical_response) == "created" else "blocked"
+		if not _response_text_matches(response_path, job.canonical_response):
+			return "blocked"
+		var completion = {
+			"schema_version": MAILBOX_SCHEMA_VERSION,
+			"request_id": request.request_id,
+			"request_fingerprint": request_fingerprint,
+			"target_request_id": payload.target_request_id,
+			"response_fingerprint": job.canonical_response.sha256_text(),
+			"response_text": job.canonical_response,
+		}
+		if _write_text_atomically(undone_path, to_json(completion)) != "created":
+			return "blocked"
+		if job.canonical_response.find("\"success\":true") != -1:
+			_remove_file(MAILBOX_ROOT + "/map-undoable/" + payload.target_request_id.sha256_text() + ".json")
+			_remove_directory_tree_bounded(MAILBOX_ROOT + "/surface-rollbacks/" + payload.target_request_id.sha256_text(), 4096)
+		return "undo_job_completion_recorded"
+	return "blocked"
+
+
+func _validate_undo_last_job_payload(payload):
+	if typeof(payload) != TYPE_DICTIONARY or not _dictionary_has_exact_keys(payload, ["target_request_id", "expected_map_id", "expected_map_revision"]):
+		return {"ok": false, "error": _error("invalid_request", "Undo requires exact target job and map correlation fields.", "payload")}
+	if typeof(payload.target_request_id) != TYPE_STRING or not _is_safe_request_id(payload.target_request_id):
+		return {"ok": false, "error": _error("invalid_request", "target_request_id is invalid.", "payload.target_request_id")}
+	if typeof(payload.expected_map_id) != TYPE_STRING or not _is_safe_request_id(payload.expected_map_id):
+		return {"ok": false, "error": _error("invalid_request", "expected_map_id is invalid.", "payload.expected_map_id")}
+	if not _is_runtime_nonnegative_safe_integer(payload.expected_map_revision):
+		return {"ok": false, "error": _error("invalid_request", "expected_map_revision is invalid.", "payload.expected_map_revision")}
+	return {"ok": true, "payload": payload}
+
+
+func _prepare_undo_job(request, request_fingerprint, payload):
+	if _current_map_id() != payload.expected_map_id:
+		return {"ok": false, "error": _error("map_id_mismatch", "The open map identity changed.", "expected_map_id")}
+	if _map_job_revision != int(payload.expected_map_revision) or _capture_map_job_state_fingerprint() != _map_job_state_fingerprint:
+		return {"ok": false, "error": _error("map_revision_mismatch", "The map changed after the target DDAI job.", "expected_map_revision")}
+	var target_key = payload.target_request_id.sha256_text()
+	var record = _read_bounded_dictionary(MAILBOX_ROOT + "/map-undoable/" + target_key + ".json")
+	if record == null or not _undoable_record_is_valid(record, payload, target_key):
+		return {"ok": false, "error": _error("undo_job_unavailable", "The exact completed DDAI job is not durably undoable.", "target_request_id")}
+	for index in range(record.operation_observations.size()):
+		if _observe_operation(record.plan.operations[index], record.operation_observations[index].native_node_ids, target_key) != "observed":
+			return {"ok": false, "error": _error("undo_evidence_missing", "A recorded native node is missing or no longer belongs to the completed DDAI job.", "target_request_id")}
+	return {"ok": true, "job": {
+		"schema_version": MAILBOX_SCHEMA_VERSION,
+		"request_id": request.request_id,
+		"request_fingerprint": request_fingerprint,
+		"target_request_id": payload.target_request_id,
+		"target_key": target_key,
+		"map_id": record.map_id,
+		"starting_map_revision": payload.expected_map_revision,
+		"map_state_fingerprint": record.map_state_fingerprint,
+		"state": "prepared",
+		"plan": record.plan,
+		"operation_observations": record.operation_observations,
+		"current_operation_node_ids": [],
+		"reversal_operation_index": null,
+		"canonical_response": null,
+	}}
+
+
+func _undoable_record_is_valid(record, payload, target_key):
+	if not _dictionary_has_exact_keys(record, ["schema_version", "target_request_id", "target_key", "map_id", "map_revision", "map_state_fingerprint", "plan_fingerprint", "plan_fingerprint_text", "plan", "operation_observations"]):
+		return false
+	if record.schema_version != MAILBOX_SCHEMA_VERSION or record.target_request_id != payload.target_request_id or record.target_key != target_key or record.map_id != payload.expected_map_id or int(record.map_revision) != int(payload.expected_map_revision) or not _is_sha256(record.map_state_fingerprint) or not _is_sha256(record.plan_fingerprint):
+		return false
+	if typeof(record.plan_fingerprint_text) != TYPE_STRING or record.plan_fingerprint_text.to_utf8().size() > MAXIMUM_MESSAGE_BYTES or record.plan_fingerprint_text.sha256_text() != record.plan_fingerprint or typeof(record.operation_observations) != TYPE_ARRAY or record.operation_observations.size() != record.plan.operations.size():
+		return false
+	var observed_operation_ids = {}
+	for operation in record.plan.operations:
+		if typeof(operation) != TYPE_DICTIONARY or typeof(operation.get("operation_id", null)) != TYPE_STRING or not _is_safe_request_id(operation.operation_id) or observed_operation_ids.has(operation.operation_id) or typeof(operation.get("operation_type", null)) != TYPE_STRING or not _certified_operation_executors.has(operation.operation_type):
+			return false
+		observed_operation_ids[operation.operation_id] = true
+	for index in range(record.operation_observations.size()):
+		var observation = record.operation_observations[index]
+		if typeof(observation) != TYPE_DICTIONARY or not _dictionary_has_exact_keys(observation, ["operation_index", "operation_id", "native_node_ids"]) or int(observation.operation_index) != index or observation.operation_id != record.plan.operations[index].operation_id or typeof(observation.native_node_ids) != TYPE_ARRAY or observation.native_node_ids.size() == 0:
+			return false
+		for node_id in observation.native_node_ids:
+			if not _is_positive_json_safe_integer(node_id):
+				return false
+	return true
+
+
+func _write_undo_job(path, job, replace):
+	var text = to_json(job)
+	if text.to_utf8().size() > MAXIMUM_MESSAGE_BYTES:
+		return "write_failed"
+	return _replace_json_recoverably(path, job) if replace else ("replaced" if _write_text_atomically(path, text) == "created" else "write_failed")
+
+
+func _read_undo_job(path, request, request_fingerprint, payload):
+	var job = _read_bounded_dictionary(path)
+	if job == null or not _dictionary_has_exact_keys(job, ["schema_version", "request_id", "request_fingerprint", "target_request_id", "target_key", "map_id", "starting_map_revision", "map_state_fingerprint", "state", "plan", "operation_observations", "current_operation_node_ids", "reversal_operation_index", "canonical_response"]):
+		return null
+	if job.schema_version != MAILBOX_SCHEMA_VERSION or job.request_id != request.request_id or job.request_fingerprint != request_fingerprint or job.target_request_id != payload.target_request_id or job.target_key != payload.target_request_id.sha256_text() or job.map_id != payload.expected_map_id or int(job.starting_map_revision) != int(payload.expected_map_revision) or not _is_sha256(job.request_fingerprint) or not _is_sha256(job.map_state_fingerprint):
+		return null
+	if not ["prepared", "reversing", "outcome_unknown", "committed"].has(job.state) or typeof(job.plan) != TYPE_DICTIONARY or typeof(job.operation_observations) != TYPE_ARRAY or typeof(job.current_operation_node_ids) != TYPE_ARRAY:
+		return null
+	if job.state == "prepared" and (job.current_operation_node_ids.size() != 0 or job.reversal_operation_index != null or job.canonical_response != null):
+		return null
+	if job.state == "reversing":
+		if not _is_nonnegative_json_int32(job.reversal_operation_index) or int(job.reversal_operation_index) >= job.operation_observations.size() or job.current_operation_node_ids != job.operation_observations[int(job.reversal_operation_index)].native_node_ids or job.canonical_response != null:
+			return null
+	if job.state == "committed" and (typeof(job.canonical_response) != TYPE_STRING or not _validate_undo_response(job.canonical_response, request, payload, job)):
+		return null
+	return job
+
+
+func _undo_last_job_success(request, payload, job):
+	return {"schema_version": MAILBOX_SCHEMA_VERSION, "request_id": request.request_id, "command": "undo_last_job", "timestamp": _iso_timestamp(), "success": true, "payload": {"target_request_id": payload.target_request_id, "map_id": job.map_id, "starting_map_revision": payload.expected_map_revision, "map_revision": _map_job_revision, "outcome_unknown": false}}
+
+
+func _undo_last_job_failure(request, payload, code, message, path, outcome_unknown, context = null):
+	var map_id = payload.expected_map_id
+	var revision = payload.expected_map_revision
+	if context != null:
+		map_id = context.map_id
+		revision = context.starting_map_revision
+	return {"schema_version": MAILBOX_SCHEMA_VERSION, "request_id": request.request_id, "command": "undo_last_job", "timestamp": _iso_timestamp(), "success": false, "payload": {"target_request_id": payload.target_request_id, "map_id": map_id, "starting_map_revision": revision, "map_revision": _map_job_revision if _map_job_revision >= int(revision) else revision, "outcome_unknown": outcome_unknown}, "error": _error(code, message, path)}
+
+
+func _validate_undo_response(text, request, payload, job):
+	var parsed = JSON.parse(text)
+	if parsed.error != OK or typeof(parsed.result) != TYPE_DICTIONARY or not _validate_response(parsed.result, request.request_id, "undo_last_job"):
+		return false
+	var response = parsed.result
+	var response_keys = ["schema_version", "request_id", "command", "timestamp", "success", "payload"] if response.success else ["schema_version", "request_id", "command", "timestamp", "success", "payload", "error"]
+	if not _dictionary_has_exact_keys(response, response_keys):
+		return false
+	if not response.success and (not _dictionary_has_exact_keys(response.error, ["code", "message", "path"]) or typeof(response.error.path) != TYPE_STRING):
+		return false
+	var body = response.payload
+	return typeof(body) == TYPE_DICTIONARY and _dictionary_has_exact_keys(body, ["target_request_id", "map_id", "starting_map_revision", "map_revision", "outcome_unknown"]) and body.target_request_id == payload.target_request_id and body.map_id == job.map_id and int(body.starting_map_revision) == int(payload.expected_map_revision) and _is_nonnegative_json_safe_integer(body.map_revision) and int(body.map_revision) >= int(payload.expected_map_revision) and typeof(body.outcome_unknown) == TYPE_BOOL and (not response.success or (not body.outcome_unknown and int(body.map_revision) > int(payload.expected_map_revision)))
+
+
+func _undo_completion_is_valid(completion, request, request_fingerprint, payload):
+	return _dictionary_has_exact_keys(completion, ["schema_version", "request_id", "request_fingerprint", "target_request_id", "response_fingerprint", "response_text"]) and completion.schema_version == MAILBOX_SCHEMA_VERSION and completion.request_id == request.request_id and completion.request_fingerprint == request_fingerprint and completion.target_request_id == payload.target_request_id and _is_sha256(completion.response_fingerprint) and typeof(completion.response_text) == TYPE_STRING and completion.response_text.sha256_text() == completion.response_fingerprint
 
 
 func _validate_universal_plan(plan, expected_request_id):
@@ -3267,7 +3521,8 @@ func _cleanup_completed_map_job(file_name):
 	if not directory.file_exists(response_path) or not _response_text_matches(response_path, completed.response_text):
 		return "blocked"
 	var rollback_path = MAILBOX_ROOT + "/surface-rollbacks/" + key
-	if directory.dir_exists(rollback_path) and not _remove_directory_tree_bounded(rollback_path, 4096):
+	var undoable_path = MAILBOX_ROOT + "/map-undoable/" + key + ".json"
+	if not directory.file_exists(undoable_path) and directory.dir_exists(rollback_path) and not _remove_directory_tree_bounded(rollback_path, 4096):
 		return "blocked"
 	if not ["removed", "missing"].has(_remove_file(job_path)):
 		return "blocked"

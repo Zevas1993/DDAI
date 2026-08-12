@@ -387,6 +387,82 @@ func _ready():
 	for number in [0.0, 1e-300, 1e-18, 0.0000001, 0.00001, 0.1, 1.0000001, 1.23456789012345, 40.0, 2147483647.0]:
 		number_texts.append(bridge._double_fingerprint_text(number))
 
+	# Isolate the job-scoped undo proof from prior failure-injection scenarios.
+	for wall in Global.World.level.Walls.get_children():
+		wall.free()
+	Global.World.registry.clear()
+	_publish_catalog(bridge)
+	bridge._status_payload()
+	var undo_plan = _plan(bridge, "universal-wall-undoable", bridge._map_job_revision)
+	_clear_request_state(undo_plan.request_id)
+	var undo_apply_result = yield(_run_job(bridge, undo_plan), "completed")
+	var undo_target_id = Global.World.last_created_id
+	var undo_completion_recorded = _complete_apply_job(bridge, undo_plan)
+	var undo_request = _undo_request("undo-exact-001", undo_plan.request_id, undo_plan.expected_map_id, bridge._map_job_revision)
+	var undo_response = yield(_run_undo(bridge, undo_request), "completed")
+	yield(get_tree(), "idle_frame")
+	var exact_undo_ok = undo_apply_result.success and undo_completion_recorded and undo_response.success and not Global.World.HasNodeID(undo_target_id) and int(undo_response.payload.map_revision) == int(undo_request.payload.expected_map_revision) + 1
+	var first_undo_text = to_json(undo_response)
+	_write_claim(bridge, undo_request, undo_request.request_id.sha256_text())
+	var duplicate_undo = yield(_run_undo(bridge, undo_request, false), "completed")
+	var duplicate_undo_ok = to_json(duplicate_undo) == first_undo_text and not Global.World.HasNodeID(undo_target_id)
+
+	var stale_plan = _plan(bridge, "universal-wall-stale-undo", bridge._map_job_revision)
+	_clear_request_state(stale_plan.request_id)
+	var stale_apply_result = yield(_run_job(bridge, stale_plan), "completed")
+	var stale_completion_recorded = _complete_apply_job(bridge, stale_plan)
+	var stale_revision = bridge._map_job_revision
+	var untracked = MockWall.new(9001)
+	untracked.set_meta("node_id", 9001)
+	Global.World.level.Walls.add_child(untracked)
+	Global.World.registry[9001] = untracked
+	bridge._status_payload()
+	var stale_undo_request = _undo_request("undo-stale-001", stale_plan.request_id, stale_plan.expected_map_id, stale_revision)
+	var stale_validation = bridge._prepare_undo_job(stale_undo_request, bridge._canonical_request_text(stale_undo_request).sha256_text(), stale_undo_request.payload)
+	var intervening_edit_rejected = stale_apply_result.success and stale_completion_recorded and not stale_validation.ok and stale_validation.error.code == "map_revision_mismatch"
+
+	var missing_plan = _plan(bridge, "universal-wall-missing-node", bridge._map_job_revision)
+	_clear_request_state(missing_plan.request_id)
+	var missing_apply_result = yield(_run_job(bridge, missing_plan), "completed")
+	var missing_completion_recorded = _complete_apply_job(bridge, missing_plan)
+	var missing_target_id = Global.World.last_created_id
+	Global.World.registry.erase(missing_target_id)
+	var missing_request = _undo_request("undo-missing-001", missing_plan.request_id, missing_plan.expected_map_id, bridge._map_job_revision)
+	var missing_prepare = bridge._prepare_undo_job(missing_request, bridge._canonical_request_text(missing_request).sha256_text(), missing_request.payload)
+	var missing_node_rejected = missing_apply_result.success and missing_completion_recorded and not missing_prepare.ok and missing_prepare.error.code == "undo_evidence_missing"
+
+	for wall in Global.World.level.Walls.get_children():
+		wall.free()
+	Global.World.registry.clear()
+	bridge._status_payload()
+	var interrupted_plan = _plan(bridge, "universal-wall-interrupted-undo", bridge._map_job_revision)
+	_clear_request_state(interrupted_plan.request_id)
+	var interrupted_apply = yield(_run_job(bridge, interrupted_plan), "completed")
+	var interrupted_completion = _complete_apply_job(bridge, interrupted_plan)
+	var interrupted_target_id = Global.World.last_created_id
+	var interrupted_request = _undo_request("undo-interrupted-001", interrupted_plan.request_id, interrupted_plan.expected_map_id, bridge._map_job_revision)
+	var interrupted_key = interrupted_request.request_id.sha256_text()
+	_write_claim(bridge, interrupted_request, interrupted_key)
+	var interrupted_claim = {"file_name": interrupted_key + ".json", "path": "user://ddai/processing/" + interrupted_key + ".json"}
+	var interrupted_fingerprint = bridge._canonical_request_text(interrupted_request).sha256_text()
+	var interrupted_prepared = bridge._advance_undo_last_job_claim(interrupted_claim, interrupted_request, interrupted_fingerprint, "user://ddai/responses/" + interrupted_key + ".json", interrupted_key)
+	var interrupted_reversing = bridge._advance_undo_last_job_claim(interrupted_claim, interrupted_request, interrupted_fingerprint, "user://ddai/responses/" + interrupted_key + ".json", interrupted_key)
+	var undo_restarted = BridgeScript.new()
+	undo_restarted._session_id = bridge._session_id
+	undo_restarted._map_job_revision = bridge._map_job_revision
+	undo_restarted._map_job_state_fingerprint = bridge._map_job_state_fingerprint
+	undo_restarted._certified_operation_executors = {"wall_polyline": funcref(undo_restarted, "_execute_wall_polyline")}
+	undo_restarted._asset_list_provider = funcref(self, "_asset_list")
+	undo_restarted._texture_loader = funcref(self, "_texture")
+	var interrupted_restart = undo_restarted._advance_undo_last_job_claim(interrupted_claim, interrupted_request, interrupted_fingerprint, "user://ddai/responses/" + interrupted_key + ".json", interrupted_key)
+	var interrupted_response = null
+	for _step in range(8):
+		undo_restarted._advance_undo_last_job_claim(interrupted_claim, interrupted_request, interrupted_fingerprint, "user://ddai/responses/" + interrupted_key + ".json", interrupted_key)
+		interrupted_response = undo_restarted._read_bounded_dictionary("user://ddai/responses/" + interrupted_key + ".json")
+		if interrupted_response != null:
+			break
+	var interrupted_undo_unknown = interrupted_apply.success and interrupted_completion and interrupted_prepared == "undo_job_prepared" and interrupted_reversing == "undo_job_reversing" and interrupted_restart == "undo_job_outcome_unknown" and interrupted_response != null and not interrupted_response.success and interrupted_response.payload.outcome_unknown and Global.World.HasNodeID(interrupted_target_id)
+
 	print("DDAI_UNIVERSAL_FINGERPRINT:", fingerprint_ok)
 	print("DDAI_UNIVERSAL_PLAN_JSON:", to_json(plan))
 	print("DDAI_UNIVERSAL_PLAN_FINGERPRINT:", plan_fingerprint)
@@ -408,12 +484,17 @@ func _ready():
 	print("DDAI_UNIVERSAL_PREFLIGHT_CORRELATION:", preflight_correlation_ok)
 	print("DDAI_UNIVERSAL_CATALOG_RACE_CORRELATION:", catalog_race_correlation_ok)
 	print("DDAI_UNIVERSAL_JOURNAL_INVARIANTS:", journal_invariants_ok)
+	print("DDAI_UNDO_EXACT_COMPLETED_JOB:", exact_undo_ok)
+	print("DDAI_UNDO_INTERVENING_EDIT_REJECTED:", intervening_edit_rejected)
+	print("DDAI_UNDO_DUPLICATE_IDEMPOTENT:", duplicate_undo_ok)
+	print("DDAI_UNDO_MISSING_NODE_REJECTED:", missing_node_rejected)
+	print("DDAI_UNDO_INTERRUPTED_BEFORE_REVERSAL_UNKNOWN:", interrupted_undo_unknown)
 	print("DDAI_UNIVERSAL_DOUBLE_BITS:", PoolStringArray(number_texts).join("|"))
 	bridge = null
 	restarted = null
 	Global.Editor = null
 	Global.WorldUI = null
-	get_tree().quit(0 if fingerprint_ok and validation_ok and preflight_ok and unnamed_inactive_tool_preflight_ok and null_inactive_tool_preflight_ok and observed_ok and completion_tamper_blocked and reversal_ok and observe_failure_reversed and duplicate_after_cleanup_ok and reversal_revision_stable and partial_registration_is_unknown and active_tool_success_restored and inactive_tool_failure_restored and node_id_collision_recovered and recovery_ok and strict_failure_ok and catalog_manifest_integrity_ok and repeated_preflight_ok and preflight_correlation_ok and catalog_race_correlation_ok and journal_invariants_ok else 1)
+	get_tree().quit(0 if fingerprint_ok and validation_ok and preflight_ok and unnamed_inactive_tool_preflight_ok and null_inactive_tool_preflight_ok and observed_ok and completion_tamper_blocked and reversal_ok and observe_failure_reversed and duplicate_after_cleanup_ok and reversal_revision_stable and partial_registration_is_unknown and active_tool_success_restored and inactive_tool_failure_restored and node_id_collision_recovered and recovery_ok and strict_failure_ok and catalog_manifest_integrity_ok and repeated_preflight_ok and preflight_correlation_ok and catalog_race_correlation_ok and journal_invariants_ok and exact_undo_ok and intervening_edit_rejected and duplicate_undo_ok and missing_node_rejected and interrupted_undo_unknown else 1)
 
 
 func _plan(bridge, request_id, revision):
@@ -447,6 +528,37 @@ func _run_job(bridge, plan):
 	return {"success": false}
 
 
+func _complete_apply_job(bridge, plan):
+	var request = _request(plan)
+	var key = plan.request_id.sha256_text()
+	var claim = {"file_name": key + ".json", "path": "user://ddai/processing/" + key + ".json"}
+	var request_fingerprint = bridge._canonical_request_text(request).sha256_text()
+	for _step in range(8):
+		var transition = bridge._advance_universal_plan_claim(claim, request, request_fingerprint, "user://ddai/journal/" + key + ".json", "user://ddai/responses/" + key + ".json", key)
+		if transition == "map_job_completion_recorded" or Directory.new().file_exists("user://ddai/map-completed/" + key + ".json"):
+			return true
+	return false
+
+
+func _undo_request(request_id, target_request_id, expected_map_id, expected_revision):
+	return {"schema_version": "1.0", "request_id": request_id, "command": "undo_last_job", "timestamp": "2026-08-12T20:00:00Z", "payload": {"target_request_id": target_request_id, "expected_map_id": expected_map_id, "expected_map_revision": expected_revision}}
+
+
+func _run_undo(bridge, request, write_claim = true):
+	var key = request.request_id.sha256_text()
+	if write_claim:
+		_write_claim(bridge, request, key)
+	var claim = {"file_name": key + ".json", "path": "user://ddai/processing/" + key + ".json"}
+	var request_fingerprint = bridge._canonical_request_text(request).sha256_text()
+	for _step in range(40):
+		bridge._advance_undo_last_job_claim(claim, request, request_fingerprint, "user://ddai/responses/" + key + ".json", key)
+		yield(get_tree(), "idle_frame")
+		var response = bridge._read_bounded_dictionary("user://ddai/responses/" + key + ".json")
+		if response != null:
+			return response
+	return {"success": false}
+
+
 func _write_claim(bridge, request, key):
 	bridge._write_text_atomically("user://ddai/processing/" + key + ".json", to_json(request))
 
@@ -460,6 +572,9 @@ func _clear_request_state(request_id):
 		"user://ddai/journal/" + key + ".json",
 		"user://ddai/map-jobs/" + key + ".json",
 		"user://ddai/map-completed/" + key + ".json",
+		"user://ddai/map-undoable/" + key + ".json",
+		"user://ddai/map-undone/" + key + ".json",
+		"user://ddai/undo-jobs/" + key + ".json",
 	]:
 		directory.remove(path)
 

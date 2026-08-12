@@ -58,6 +58,36 @@ public sealed record MailboxRequest
             Payload = MapSnapshotJson.SerializeQueryToElement(query),
         };
     }
+
+    public static MailboxRequest CreateUndoLastJob(
+        string requestId,
+        string targetRequestId,
+        string expectedMapId,
+        long expectedMapRevision,
+        DateTimeOffset timestamp)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(requestId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(targetRequestId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(expectedMapId);
+        if (expectedMapRevision < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(expectedMapRevision));
+        }
+
+        return new MailboxRequest
+        {
+            SchemaVersion = CurrentSchemaVersion,
+            RequestId = requestId,
+            Command = "undo_last_job",
+            Timestamp = timestamp,
+            Payload = JsonSerializer.SerializeToElement(new
+            {
+                target_request_id = targetRequestId,
+                expected_map_id = expectedMapId,
+                expected_map_revision = expectedMapRevision,
+            }),
+        };
+    }
 }
 
 public sealed record MailboxErrorDetails(string Code, string Message, string? Path = null);

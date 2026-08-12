@@ -455,6 +455,161 @@ public sealed class DdaiUniversalPlanService
         return CorrelateResponse(response, canonical, expectedFingerprint, context);
     }
 
+    public async Task<DdaiPlanApplyResult> UndoLastJobAsync(
+        string requestId,
+        string targetRequestId,
+        string expectedMapId,
+        long expectedMapRevision,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(requestId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(targetRequestId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(expectedMapId);
+        if (expectedMapRevision < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(expectedMapRevision));
+        }
+        if (timeout < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var stopwatch = Stopwatch.StartNew();
+        var existing = TryReadExistingResponse(requestId);
+        if (existing is not null)
+        {
+            return CorrelateUndoResponse(
+                existing,
+                targetRequestId,
+                expectedMapId,
+                expectedMapRevision);
+        }
+
+        UniversalPlanContextResult contextResult;
+        try
+        {
+            var remaining = Remaining(timeout, stopwatch);
+            contextResult = await contextProvider.GetAsync(remaining, cancellationToken)
+                .WaitAsync(remaining, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            return UndoFailure("runtime_context_timeout", "The live map context was not available before the undo deadline.", targetRequestId);
+        }
+
+        if (!contextResult.Ready || contextResult.Context is null)
+        {
+            return UndoFailure(contextResult.Error?.Code ?? "runtime_context_unavailable", "The live map context is unavailable.", targetRequestId);
+        }
+        if (!StringComparer.Ordinal.Equals(contextResult.Context.Capabilities.MapId, expectedMapId))
+        {
+            return UndoFailure("map_id_mismatch", "The open map identity does not match the requested undo.", targetRequestId);
+        }
+        if (contextResult.Context.Capabilities.MapRevision != expectedMapRevision)
+        {
+            return UndoFailure("map_revision_mismatch", "The open map changed after the target DDAI job completed.", targetRequestId);
+        }
+
+        var request = MailboxRequest.CreateUndoLastJob(
+            requestId,
+            targetRequestId,
+            expectedMapId,
+            expectedMapRevision,
+            timeProvider.GetUtcNow());
+        if (Remaining(timeout, stopwatch) <= TimeSpan.Zero)
+        {
+            return UndoFailure("undo_timeout", "The undo deadline elapsed before publication.", targetRequestId);
+        }
+
+        bool published;
+        try
+        {
+            published = mailbox.PublishRequest(request);
+        }
+        catch (Exception exception) when (exception is JsonException
+            or InvalidDataException
+            or IOException
+            or UnauthorizedAccessException
+            or ArgumentException
+            or NotSupportedException)
+        {
+            return UndoFailure("request_rejected", "The undo request could not be published safely.", targetRequestId);
+        }
+
+        if (!published)
+        {
+            existing = TryReadExistingResponse(requestId);
+            if (existing is not null)
+            {
+                return CorrelateUndoResponse(existing, targetRequestId, expectedMapId, expectedMapRevision);
+            }
+            var active = mailbox.TryReadActiveRequest(requestId);
+            if (active is null ||
+                !StringComparer.Ordinal.Equals(active.Command, request.Command) ||
+                !StringComparer.Ordinal.Equals(active.Payload.GetRawText(), request.Payload.GetRawText()))
+            {
+                return UndoFailure("request_conflict", "The undo request identifier belongs to different work.", targetRequestId);
+            }
+        }
+
+        MailboxResponse? response;
+        try
+        {
+            response = await WaitForResponseAsync(
+                requestId,
+                Remaining(timeout, stopwatch),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is JsonException
+            or InvalidDataException
+            or IOException
+            or UnauthorizedAccessException
+            or ArgumentException)
+        {
+            return UndoFailure("invalid_response", "Dungeondraft returned a malformed undo response.", targetRequestId);
+        }
+        if (response is null)
+        {
+            return UndoFailure("undo_timeout", "Dungeondraft did not answer before the undo deadline.", targetRequestId, outcomeUnknown: true);
+        }
+
+        return CorrelateUndoResponse(response, targetRequestId, expectedMapId, expectedMapRevision);
+    }
+
+    private static DdaiPlanApplyResult CorrelateUndoResponse(
+        MailboxResponse response,
+        string targetRequestId,
+        string expectedMapId,
+        long expectedMapRevision)
+    {
+        var payload = response.Payload;
+        var correlated = StringComparer.Ordinal.Equals(response.Command, "undo_last_job") &&
+            payload.ValueKind == JsonValueKind.Object &&
+            !HasDuplicatePropertiesRecursive(payload) &&
+            HasExactProperties(payload,
+                "target_request_id",
+                "map_id",
+                "starting_map_revision",
+                "map_revision",
+                "outcome_unknown") &&
+            HasString(payload, "target_request_id", targetRequestId) &&
+            HasString(payload, "map_id", expectedMapId) &&
+            HasInteger(payload, "starting_map_revision", expectedMapRevision) &&
+            payload.TryGetProperty("map_revision", out var revisionProperty) &&
+            revisionProperty.ValueKind == JsonValueKind.Number &&
+            revisionProperty.TryGetInt64(out var resultRevision) &&
+            resultRevision >= expectedMapRevision &&
+            (!response.Success || resultRevision > expectedMapRevision) &&
+            payload.TryGetProperty("outcome_unknown", out var unknownProperty) &&
+            unknownProperty.ValueKind is JsonValueKind.True or JsonValueKind.False;
+        return correlated
+            ? new DdaiPlanApplyResult(response.Success, response.Command, payload.Clone(), response.Error)
+            : UndoFailure("request_conflict", "The undo response does not belong to the requested job or map revision.", targetRequestId);
+    }
+
     private MailboxResponse? TryReadExistingResponse(string requestId)
     {
         try
@@ -553,6 +708,18 @@ public sealed class DdaiUniversalPlanService
         property.TryGetInt64(out var actual) &&
         actual == expected;
 
+    private static bool HasExactProperties(JsonElement payload, params string[] expected)
+    {
+        if (payload.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        var names = payload.EnumerateObject().Select(property => property.Name).ToArray();
+        return names.Length == expected.Length &&
+            names.Order(StringComparer.Ordinal).SequenceEqual(expected.Order(StringComparer.Ordinal), StringComparer.Ordinal);
+    }
+
     private static bool TryCreateSnapshot(
         MapPlan plan,
         out CanonicalPlanSnapshot? snapshot,
@@ -649,6 +816,21 @@ public sealed class DdaiUniversalPlanService
         JsonSerializer.SerializeToElement(new
         {
             plan_fingerprint = planFingerprint,
+            outcome_unknown = outcomeUnknown,
+            retry_with_same_request_id = outcomeUnknown,
+        }, JsonOptions),
+        new MailboxErrorDetails(code, message));
+
+    private static DdaiPlanApplyResult UndoFailure(
+        string code,
+        string message,
+        string targetRequestId,
+        bool outcomeUnknown = false) => new(
+        false,
+        "undo_last_job",
+        JsonSerializer.SerializeToElement(new
+        {
+            target_request_id = targetRequestId,
             outcome_unknown = outcomeUnknown,
             retry_with_same_request_id = outcomeUnknown,
         }, JsonOptions),

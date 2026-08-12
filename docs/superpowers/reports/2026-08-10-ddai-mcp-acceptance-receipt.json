@@ -2,58 +2,1659 @@
   "schema_version": "1.0",
   "artifact": {
     "relative_path": "artifacts/task6/win-x64/ddai.exe",
-    "size_bytes": 86871226,
-    "sha256": "8a0924ab33e4700e3e5b876d6a33a446f2f949f49964fab7999c1655e35a4a87"
+    "size_bytes": 87047866,
+    "sha256": "3a1b6dc48f83699f16a6bfaff80f105d0fd034b5713b9ed26bbf3945f7e3ebf2"
   },
   "input_schemas": {
+    "ddai_get_capabilities": {
+      "type": "object",
+      "properties": {}
+    },
     "ddai_apply_plan": {
       "type": "object",
       "properties": {
         "plan": {
           "type": "object",
           "properties": {
-            "schema_version": { "type": "string" },
-            "request_id": { "type": "string" },
-            "base_revision": { "type": "integer" },
-            "mode": { "type": "string", "enum": ["Add", "Replace", "Patch"] },
+            "schema_version": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "expected_map_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "base_revision": {
+              "type": "integer"
+            },
+            "expected_catalog_revision": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "add",
+                "replace",
+                "patch"
+              ]
+            },
+            "coordinate_system": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "grid",
+                "world",
+                null
+              ]
+            },
             "canvas": {
               "type": "object",
               "properties": {
-                "width": { "type": "integer" },
-                "height": { "type": "integer" }
+                "width": {
+                  "type": "integer"
+                },
+                "height": {
+                  "type": "integer"
+                }
               },
-              "required": ["width", "height"]
+              "required": [
+                "width",
+                "height"
+              ]
             },
             "rooms": {
               "type": "array",
               "items": {
                 "type": "object",
                 "properties": {
-                  "id": { "type": "string" },
-                  "x": { "type": "integer" },
-                  "y": { "type": "integer" },
-                  "width": { "type": "integer" },
-                  "height": { "type": "integer" }
+                  "id": {
+                    "type": "string"
+                  },
+                  "x": {
+                    "type": "integer"
+                  },
+                  "y": {
+                    "type": "integer"
+                  },
+                  "width": {
+                    "type": "integer"
+                  },
+                  "height": {
+                    "type": "integer"
+                  }
                 },
-                "required": ["id", "x", "y", "width", "height"]
+                "required": [
+                  "id",
+                  "x",
+                  "y",
+                  "width",
+                  "height"
+                ]
+              }
+            },
+            "operations": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "required": [
+                  "operation_type"
+                ],
+                "anyOf": [
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "terrain_stroke"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "x": {
+                                  "type": "number"
+                                },
+                                "y": {
+                                  "type": "number"
+                                }
+                              },
+                              "required": [
+                                "x",
+                                "y"
+                              ]
+                            }
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "width": {
+                        "type": "number"
+                      },
+                      "strength": {
+                        "type": "number"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "path",
+                      "width",
+                      "strength",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "pattern_region"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "region": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "type": "array",
+                            "items": {
+                              "$ref": "#/properties/plan/properties/operations/items/anyOf/0/properties/path/properties/points/items"
+                            }
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "rotation_degrees": {
+                        "type": "number"
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "region",
+                      "rotation_degrees",
+                      "layer",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "colorable_pattern_region"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "region": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/1/properties/region/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "color_rgba": {
+                        "type": "string"
+                      },
+                      "rotation_degrees": {
+                        "type": "number"
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "region",
+                      "color_rgba",
+                      "rotation_degrees",
+                      "layer",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "cave_region"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "region": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/1/properties/region/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "floor_color_rgba": {
+                        "type": "string"
+                      },
+                      "wall_color_rgba": {
+                        "type": "string"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "region",
+                      "floor_color_rgba",
+                      "wall_color_rgba",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "roof_region"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "region": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/1/properties/region/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "width": {
+                        "type": "number"
+                      },
+                      "shade": {
+                        "type": "number"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "region",
+                      "width",
+                      "shade",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "object_placement"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "position": {
+                        "type": "object",
+                        "properties": {
+                          "x": {
+                            "type": "number"
+                          },
+                          "y": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "x",
+                          "y"
+                        ]
+                      },
+                      "rotation_degrees": {
+                        "type": "number"
+                      },
+                      "scale": {
+                        "type": "number"
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "sorting": {
+                        "type": "string",
+                        "enum": [
+                          "over",
+                          "under"
+                        ]
+                      },
+                      "shadow": {
+                        "type": "boolean"
+                      },
+                      "block_light": {
+                        "type": "boolean"
+                      },
+                      "custom_color_rgba": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "position",
+                      "rotation_degrees",
+                      "scale",
+                      "layer",
+                      "sorting",
+                      "shadow",
+                      "block_light",
+                      "custom_color_rgba",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "wall_polyline"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/0/properties/path/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "closed": {
+                        "type": "boolean"
+                      },
+                      "color_rgba": {
+                        "type": "string"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "path",
+                      "closed",
+                      "color_rgba",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "material_stroke"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/0/properties/path/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "width": {
+                        "type": "number"
+                      },
+                      "smoothness": {
+                        "type": "number"
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "path",
+                      "width",
+                      "smoothness",
+                      "layer",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "portal_placement"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "position": {
+                        "type": "object",
+                        "properties": {
+                          "x": {
+                            "type": "number"
+                          },
+                          "y": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "x",
+                          "y"
+                        ]
+                      },
+                      "wall_operation_id": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "rotation_degrees": {
+                        "type": "number"
+                      },
+                      "closed": {
+                        "type": "boolean"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "position",
+                      "wall_operation_id",
+                      "rotation_degrees",
+                      "closed",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "path_polyline"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/0/properties/path/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "width": {
+                        "type": "number"
+                      },
+                      "smoothness": {
+                        "type": "number"
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "sorting": {
+                        "type": "string",
+                        "enum": [
+                          "over",
+                          "under"
+                        ]
+                      },
+                      "fade_in": {
+                        "type": "boolean"
+                      },
+                      "fade_out": {
+                        "type": "boolean"
+                      },
+                      "loop": {
+                        "type": "boolean"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "path",
+                      "width",
+                      "smoothness",
+                      "layer",
+                      "sorting",
+                      "fade_in",
+                      "fade_out",
+                      "loop",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "light_placement"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "position": {
+                        "type": "object",
+                        "properties": {
+                          "x": {
+                            "type": "number"
+                          },
+                          "y": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "x",
+                          "y"
+                        ]
+                      },
+                      "range": {
+                        "type": "number"
+                      },
+                      "intensity": {
+                        "type": "number"
+                      },
+                      "color_rgba": {
+                        "type": "string"
+                      },
+                      "shadows": {
+                        "type": "boolean"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "position",
+                      "range",
+                      "intensity",
+                      "color_rgba",
+                      "shadows",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "simple_tile_region"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "region": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/1/properties/region/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "region",
+                      "layer",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "smart_tile_region"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "region": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/1/properties/region/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "region",
+                      "layer",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "smart_tile_double_region"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "region": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/1/properties/region/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "region",
+                      "layer",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  }
+                ]
               }
             }
           },
-          "required": ["schema_version", "request_id", "base_revision", "mode", "canvas"]
+          "required": [
+            "schema_version",
+            "request_id",
+            "base_revision",
+            "mode",
+            "canvas"
+          ]
         }
       },
-      "required": ["plan"]
+      "required": [
+        "plan"
+      ]
     },
-    "ddai_get_asset_preview": {
+    "ddai_inspect_map": {
       "type": "object",
       "properties": {
-        "assetRef": { "type": "string" }
+        "query": {
+          "type": "object",
+          "properties": {
+            "region": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "x": {
+                  "type": "number"
+                },
+                "y": {
+                  "type": "number"
+                },
+                "width": {
+                  "type": "number"
+                },
+                "height": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "x",
+                "y",
+                "width",
+                "height"
+              ],
+              "default": null
+            },
+            "level": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "default": null
+            },
+            "limit": {
+              "type": "integer",
+              "default": 100
+            },
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            }
+          }
+        }
       },
-      "required": ["assetRef"]
+      "required": [
+        "query"
+      ]
     },
-    "ddai_get_capabilities": {
+    "ddai_validate_plan": {
       "type": "object",
-      "properties": {}
+      "properties": {
+        "plan": {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "expected_map_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "base_revision": {
+              "type": "integer"
+            },
+            "expected_catalog_revision": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "add",
+                "replace",
+                "patch"
+              ]
+            },
+            "coordinate_system": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "grid",
+                "world",
+                null
+              ]
+            },
+            "canvas": {
+              "type": "object",
+              "properties": {
+                "width": {
+                  "type": "integer"
+                },
+                "height": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "width",
+                "height"
+              ]
+            },
+            "rooms": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "x": {
+                    "type": "integer"
+                  },
+                  "y": {
+                    "type": "integer"
+                  },
+                  "width": {
+                    "type": "integer"
+                  },
+                  "height": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "id",
+                  "x",
+                  "y",
+                  "width",
+                  "height"
+                ]
+              }
+            },
+            "operations": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "required": [
+                  "operation_type"
+                ],
+                "anyOf": [
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "terrain_stroke"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "x": {
+                                  "type": "number"
+                                },
+                                "y": {
+                                  "type": "number"
+                                }
+                              },
+                              "required": [
+                                "x",
+                                "y"
+                              ]
+                            }
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "width": {
+                        "type": "number"
+                      },
+                      "strength": {
+                        "type": "number"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "path",
+                      "width",
+                      "strength",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "pattern_region"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "region": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "type": "array",
+                            "items": {
+                              "$ref": "#/properties/plan/properties/operations/items/anyOf/0/properties/path/properties/points/items"
+                            }
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "rotation_degrees": {
+                        "type": "number"
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "region",
+                      "rotation_degrees",
+                      "layer",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "colorable_pattern_region"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "region": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/1/properties/region/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "color_rgba": {
+                        "type": "string"
+                      },
+                      "rotation_degrees": {
+                        "type": "number"
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "region",
+                      "color_rgba",
+                      "rotation_degrees",
+                      "layer",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "cave_region"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "region": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/1/properties/region/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "floor_color_rgba": {
+                        "type": "string"
+                      },
+                      "wall_color_rgba": {
+                        "type": "string"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "region",
+                      "floor_color_rgba",
+                      "wall_color_rgba",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "roof_region"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "region": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/1/properties/region/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "width": {
+                        "type": "number"
+                      },
+                      "shade": {
+                        "type": "number"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "region",
+                      "width",
+                      "shade",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "object_placement"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "position": {
+                        "type": "object",
+                        "properties": {
+                          "x": {
+                            "type": "number"
+                          },
+                          "y": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "x",
+                          "y"
+                        ]
+                      },
+                      "rotation_degrees": {
+                        "type": "number"
+                      },
+                      "scale": {
+                        "type": "number"
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "sorting": {
+                        "type": "string",
+                        "enum": [
+                          "over",
+                          "under"
+                        ]
+                      },
+                      "shadow": {
+                        "type": "boolean"
+                      },
+                      "block_light": {
+                        "type": "boolean"
+                      },
+                      "custom_color_rgba": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "position",
+                      "rotation_degrees",
+                      "scale",
+                      "layer",
+                      "sorting",
+                      "shadow",
+                      "block_light",
+                      "custom_color_rgba",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "wall_polyline"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/0/properties/path/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "closed": {
+                        "type": "boolean"
+                      },
+                      "color_rgba": {
+                        "type": "string"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "path",
+                      "closed",
+                      "color_rgba",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "material_stroke"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/0/properties/path/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "width": {
+                        "type": "number"
+                      },
+                      "smoothness": {
+                        "type": "number"
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "path",
+                      "width",
+                      "smoothness",
+                      "layer",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "portal_placement"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "position": {
+                        "type": "object",
+                        "properties": {
+                          "x": {
+                            "type": "number"
+                          },
+                          "y": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "x",
+                          "y"
+                        ]
+                      },
+                      "wall_operation_id": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "rotation_degrees": {
+                        "type": "number"
+                      },
+                      "closed": {
+                        "type": "boolean"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "position",
+                      "wall_operation_id",
+                      "rotation_degrees",
+                      "closed",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "path_polyline"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/0/properties/path/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "width": {
+                        "type": "number"
+                      },
+                      "smoothness": {
+                        "type": "number"
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "sorting": {
+                        "type": "string",
+                        "enum": [
+                          "over",
+                          "under"
+                        ]
+                      },
+                      "fade_in": {
+                        "type": "boolean"
+                      },
+                      "fade_out": {
+                        "type": "boolean"
+                      },
+                      "loop": {
+                        "type": "boolean"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "path",
+                      "width",
+                      "smoothness",
+                      "layer",
+                      "sorting",
+                      "fade_in",
+                      "fade_out",
+                      "loop",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "light_placement"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "position": {
+                        "type": "object",
+                        "properties": {
+                          "x": {
+                            "type": "number"
+                          },
+                          "y": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "x",
+                          "y"
+                        ]
+                      },
+                      "range": {
+                        "type": "number"
+                      },
+                      "intensity": {
+                        "type": "number"
+                      },
+                      "color_rgba": {
+                        "type": "string"
+                      },
+                      "shadows": {
+                        "type": "boolean"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "position",
+                      "range",
+                      "intensity",
+                      "color_rgba",
+                      "shadows",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "simple_tile_region"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "region": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/1/properties/region/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "region",
+                      "layer",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "smart_tile_region"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "region": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/1/properties/region/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "region",
+                      "layer",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "operation_type": {
+                        "const": "smart_tile_double_region"
+                      },
+                      "asset_ref": {
+                        "type": "string"
+                      },
+                      "region": {
+                        "type": "object",
+                        "properties": {
+                          "points": {
+                            "$ref": "#/properties/plan/properties/operations/items/anyOf/1/properties/region/properties/points",
+                            "items": {}
+                          }
+                        },
+                        "required": [
+                          "points"
+                        ]
+                      },
+                      "layer": {
+                        "type": "integer"
+                      },
+                      "operation_id": {
+                        "type": "string"
+                      },
+                      "level_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "asset_ref",
+                      "region",
+                      "layer",
+                      "operation_id",
+                      "level_id"
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          "required": [
+            "schema_version",
+            "request_id",
+            "base_revision",
+            "mode",
+            "canvas"
+          ]
+        }
+      },
+      "required": [
+        "plan"
+      ]
     },
     "ddai_import_asset": {
       "type": "object",
@@ -61,14 +1662,39 @@
         "request": {
           "type": "object",
           "properties": {
-            "idempotencyKey": { "type": "string" },
-            "category": { "type": "string" },
-            "name": { "type": "string" },
-            "tags": { "type": "array", "items": { "type": "string" } },
-            "gridWidth": { "type": "integer" },
-            "gridHeight": { "type": "integer" },
-            "contentBase64": { "type": ["string", "null"] },
-            "inboxToken": { "type": ["string", "null"] }
+            "idempotencyKey": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "gridWidth": {
+              "type": "integer"
+            },
+            "gridHeight": {
+              "type": "integer"
+            },
+            "contentBase64": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "inboxToken": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           },
           "required": [
             "idempotencyKey",
@@ -82,32 +1708,9 @@
           ]
         }
       },
-      "required": ["request"]
-    },
-    "ddai_inspect_map": {
-      "type": "object",
-      "properties": {
-        "query": {
-          "type": "object",
-          "properties": {
-            "region": {
-              "type": ["object", "null"],
-              "properties": {
-                "x": { "type": "number" },
-                "y": { "type": "number" },
-                "width": { "type": "number" },
-                "height": { "type": "number" }
-              },
-              "required": ["x", "y", "width", "height"],
-              "default": null
-            },
-            "level": { "type": ["integer", "null"], "default": null },
-            "limit": { "type": "integer", "default": 100 },
-            "cursor": { "type": ["string", "null"], "default": null }
-          }
-        }
-      },
-      "required": ["query"]
+      "required": [
+        "request"
+      ]
     },
     "ddai_search_assets": {
       "type": "object",
@@ -115,61 +1718,119 @@
         "query": {
           "type": "object",
           "properties": {
-            "query": { "type": ["string", "null"], "default": null },
-            "categories": { "type": ["array", "null"], "items": { "type": "string" }, "default": null },
-            "packIds": { "type": ["array", "null"], "items": { "type": "string" }, "default": null },
-            "generated": { "type": ["boolean", "null"], "default": null },
-            "previewRequired": { "type": ["boolean", "null"], "default": null },
-            "tags": { "type": ["array", "null"], "items": { "type": "string" }, "default": null },
-            "limit": { "type": ["integer", "null"], "default": null },
-            "cursor": { "type": ["string", "null"], "default": null },
-            "includeStagedGenerated": { "type": "boolean", "default": false }
+            "query": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "categories": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              },
+              "default": null
+            },
+            "packIds": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              },
+              "default": null
+            },
+            "generated": {
+              "type": [
+                "boolean",
+                "null"
+              ],
+              "default": null
+            },
+            "previewRequired": {
+              "type": [
+                "boolean",
+                "null"
+              ],
+              "default": null
+            },
+            "tags": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              },
+              "default": null
+            },
+            "limit": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "default": null
+            },
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "includeStagedGenerated": {
+              "type": "boolean",
+              "default": false
+            }
           }
         }
       },
-      "required": ["query"]
+      "required": [
+        "query"
+      ]
     },
     "ddai_status": {
       "type": "object",
       "properties": {}
     },
-    "ddai_validate_plan": {
+    "ddai_undo_last_job": {
       "type": "object",
       "properties": {
-        "plan": {
-          "type": "object",
-          "properties": {
-            "schema_version": { "type": "string" },
-            "request_id": { "type": "string" },
-            "base_revision": { "type": "integer" },
-            "mode": { "type": "string", "enum": ["Add", "Replace", "Patch"] },
-            "canvas": {
-              "type": "object",
-              "properties": {
-                "width": { "type": "integer" },
-                "height": { "type": "integer" }
-              },
-              "required": ["width", "height"]
-            },
-            "rooms": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "id": { "type": "string" },
-                  "x": { "type": "integer" },
-                  "y": { "type": "integer" },
-                  "width": { "type": "integer" },
-                  "height": { "type": "integer" }
-                },
-                "required": ["id", "x", "y", "width", "height"]
-              }
-            }
-          },
-          "required": ["schema_version", "request_id", "base_revision", "mode", "canvas"]
+        "requestId": {
+          "type": "string"
+        },
+        "targetRequestId": {
+          "type": "string"
+        },
+        "expectedMapId": {
+          "type": "string"
+        },
+        "expectedMapRevision": {
+          "type": "integer"
         }
       },
-      "required": ["plan"]
+      "required": [
+        "requestId",
+        "targetRequestId",
+        "expectedMapId",
+        "expectedMapRevision"
+      ]
+    },
+    "ddai_get_asset_preview": {
+      "type": "object",
+      "properties": {
+        "assetRef": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "assetRef"
+      ]
     }
   }
 }

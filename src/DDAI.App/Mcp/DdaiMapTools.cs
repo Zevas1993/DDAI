@@ -101,6 +101,31 @@ public sealed class DdaiMapTools
         }
     }
 
+    [McpServerTool(
+        Name = "ddai_undo_last_job",
+        ReadOnly = false,
+        Destructive = true,
+        Idempotent = true,
+        OpenWorld = false)]
+    [Description("Reverse exactly one completed DDAI map job when its job ID, map identity, and current revision still match durable bridge evidence.")]
+    public static async Task<string> UndoLastJobAsync(
+        string requestId,
+        string targetRequestId,
+        string expectedMapId,
+        long expectedMapRevision,
+        DdaiUniversalPlanService service,
+        DdaiMcpRuntimeOptions runtimeOptions,
+        CancellationToken cancellationToken) =>
+        JsonSerializer.Serialize(
+            await service.UndoLastJobAsync(
+                requestId,
+                targetRequestId,
+                expectedMapId,
+                expectedMapRevision,
+                runtimeOptions.RequestTimeout,
+                cancellationToken).ConfigureAwait(false),
+            JsonOptions);
+
     private static string CanonicalErrorCode(string? code) =>
         code is not null && ClosedErrorCodes.Contains(code) ? code : "inspection_unavailable";
 }

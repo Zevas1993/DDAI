@@ -47,7 +47,7 @@ TDD receipt:
 | `ddai_validate_plan` | `plan` | true | false | true | false |
 | `ddai_apply_plan` | `plan` | false | true | true | false |
 
-The committed [acceptance receipt](./2026-08-10-ddai-mcp-acceptance-receipt.json) is the canonical full-schema snapshot. The official client deep-compares every complete `inputSchema`, not selected names. It therefore locks object/array/scalar/null types, every required array, the complete canvas/room/region/import/search nesting, list item types, search/inspection defaults, and the plan-mode `Add`/`Replace`/`Patch` enum emitted by ModelContextProtocol 1.4.1. The receipt is 5,794 bytes with SHA-256 `b7559ef80225724a75956d73f8874d75368bcf84c6b7c46680b0c0f36d2a0f4b`.
+The committed [acceptance receipt](./2026-08-10-ddai-mcp-acceptance-receipt.json) is the canonical full-schema snapshot. The official client deep-compares every complete `inputSchema`, not selected names. It therefore locks object/array/scalar/null types, every required array, the complete universal-plan operation union and nested canvas/room/region/import/search shapes, list item types, search/inspection defaults, and the nine-tool public surface emitted by ModelContextProtocol 1.4.1. The receipt is 60,265 bytes with SHA-256 `370b9905ccdba4fc9bdc8606811627cd650b438b62d155fb13004977289c4278`.
 
 The exact schema shapes are:
 
@@ -109,8 +109,8 @@ Acceptance RED/GREEN history:
 - Path: `artifacts/task6/win-x64/ddai.exe`
 - Files in publish directory: 1
 - Runtime: self-contained `win-x64`
-- Size: 86,871,226 bytes
-- SHA-256: `8a0924ab33e4700e3e5b876d6a33a446f2f949f49964fab7999c1655e35a4a87`
+- Size: 87,047,866 bytes
+- SHA-256: `3a1b6dc48f83699f16a6bfaff80f105d0fd034b5713b9ed26bbf3945f7e3ebf2`
 
 One explicit `dotnet publish` invocation generated this retained executable after the final source state. Published-process acceptance never publishes or writes that directory: it resolves the existing path and rechecks path, one-file contents, size, and hash against the committed JSON receipt and this report before launch. A separate source-freshness test publishes current source only to a temporary directory and proves the retained artifact's hash and last-write time remain unchanged; no hash equality between separate publishes is assumed. The artifact directory is machine-local/ignored evidence and is not part of the source commit.
 

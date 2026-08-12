@@ -265,7 +265,7 @@ public sealed class McpPublishedIntegrationTests
             await WriteFrameAsync(process.StandardInput, new { jsonrpc = "2.0", id = 2, method = "tools/list", @params = new { } });
             var listed = await ReadResultAsync(process.StandardOutput, 2, stdoutFrames, deadline.Token);
             Assert.Equal(
-                ["ddai_apply_plan", "ddai_get_asset_preview", "ddai_get_capabilities", "ddai_import_asset", "ddai_inspect_map", "ddai_search_assets", "ddai_status", "ddai_validate_plan"],
+                ["ddai_apply_plan", "ddai_get_asset_preview", "ddai_get_capabilities", "ddai_import_asset", "ddai_inspect_map", "ddai_search_assets", "ddai_status", "ddai_undo_last_job", "ddai_validate_plan"],
                 listed.GetProperty("tools").EnumerateArray().Select(tool => tool.GetProperty("name").GetString()).Order(StringComparer.Ordinal));
 
             var status = await CallRawToolAsync(process, stdoutFrames, calledTools, 10, "ddai_status", new { }, deadline.Token);
@@ -357,11 +357,27 @@ public sealed class McpPublishedIntegrationTests
             var apply = await CallRawToolAsync(process, stdoutFrames, calledTools, 18, "ddai_apply_plan", planArguments, deadline.Token);
             Assert.True(ParseRawTextContent(apply).GetProperty("success").GetBoolean());
 
-            var invalidSearch = await CallRawToolAsync(
+            var undo = await CallRawToolAsync(
                 process,
                 stdoutFrames,
                 calledTools,
                 19,
+                "ddai_undo_last_job",
+                new Dictionary<string, object?>
+                {
+                    ["requestId"] = "raw-undo-001",
+                    ["targetRequestId"] = plan.RequestId,
+                    ["expectedMapId"] = PublishedDiscoveryBridgeHarness.MapId,
+                    ["expectedMapRevision"] = PublishedDiscoveryBridgeHarness.MapJobRevision,
+                },
+                deadline.Token);
+            Assert.True(ParseRawTextContent(undo).GetProperty("success").GetBoolean());
+
+            var invalidSearch = await CallRawToolAsync(
+                process,
+                stdoutFrames,
+                calledTools,
+                21,
                 "ddai_search_assets",
                 new Dictionary<string, object?> { ["query"] = new { limit = AssetSearchService.MaximumLimit + 1 } },
                 deadline.Token);
@@ -369,7 +385,7 @@ public sealed class McpPublishedIntegrationTests
             Assert.Equal("invalid_request", ParseRawTextContent(invalidSearch).GetProperty("error").GetString());
 
             Assert.Equal(
-                ["ddai_apply_plan", "ddai_get_asset_preview", "ddai_get_capabilities", "ddai_import_asset", "ddai_inspect_map", "ddai_search_assets", "ddai_status", "ddai_validate_plan"],
+                ["ddai_apply_plan", "ddai_get_asset_preview", "ddai_get_capabilities", "ddai_import_asset", "ddai_inspect_map", "ddai_search_assets", "ddai_status", "ddai_undo_last_job", "ddai_validate_plan"],
                 calledTools.Order(StringComparer.Ordinal));
 
             await WriteFrameAsync(process.StandardInput, new
@@ -700,6 +716,7 @@ public sealed class McpPublishedIntegrationTests
                 ["ddai_inspect_map"] = (true, false, true, ["query"]),
                 ["ddai_search_assets"] = (true, false, true, ["query"]),
                 ["ddai_status"] = (true, false, false, []),
+                ["ddai_undo_last_job"] = (false, true, true, ["expectedMapId", "expectedMapRevision", "requestId", "targetRequestId"]),
                 ["ddai_validate_plan"] = (true, false, true, ["plan"]),
             };
             Assert.Equal(expectedTools.Keys.Order(StringComparer.Ordinal), tools.Select(tool => tool.Name).Order(StringComparer.Ordinal));
@@ -832,14 +849,35 @@ public sealed class McpPublishedIntegrationTests
             Assert.Equal(asset.AssetRef, inspectionDocument.RootElement.GetProperty("items")[0].GetProperty("asset_ref").GetString());
 
             var plan = ValidPlan("published-plan-001");
-            var arguments = new Dictionary<string, object?> { ["plan"] = plan };
+            var arguments = new Dictionary<string, object?>
+            {
+                ["plan"] = JsonSerializer.Deserialize<JsonElement>(MapPlanJson.Serialize(plan)),
+            };
             var validation = await client.CallToolAsync("ddai_validate_plan", arguments, cancellationToken: deadline.Token);
+            Assert.True(
+                validation.IsError is null or false,
+                string.Join(" | ", validation.Content.OfType<TextContentBlock>().Select(block => block.Text)) +
+                Environment.NewLine + string.Join(Environment.NewLine, stderr));
             using var validationDocument = JsonDocument.Parse(Assert.IsType<TextContentBlock>(Assert.Single(validation.Content)).Text);
             Assert.True(validationDocument.RootElement.GetProperty("valid").GetBoolean());
             var apply = await client.CallToolAsync("ddai_apply_plan", arguments, cancellationToken: deadline.Token);
             using var applyDocument = JsonDocument.Parse(Assert.IsType<TextContentBlock>(Assert.Single(apply.Content)).Text);
             Assert.True(applyDocument.RootElement.GetProperty("success").GetBoolean());
             Assert.Equal("room-entrance", applyDocument.RootElement.GetProperty("payload").GetProperty("room_id").GetString());
+
+            var undo = await client.CallToolAsync(
+                "ddai_undo_last_job",
+                new Dictionary<string, object?>
+                {
+                    ["requestId"] = "published-undo-001",
+                    ["targetRequestId"] = plan.RequestId,
+                    ["expectedMapId"] = PublishedDiscoveryBridgeHarness.MapId,
+                    ["expectedMapRevision"] = PublishedDiscoveryBridgeHarness.MapJobRevision,
+                },
+                cancellationToken: deadline.Token);
+            using var undoDocument = JsonDocument.Parse(Assert.IsType<TextContentBlock>(Assert.Single(undo.Content)).Text);
+            Assert.True(undoDocument.RootElement.GetProperty("success").GetBoolean());
+            Assert.Equal(plan.RequestId, undoDocument.RootElement.GetProperty("payload").GetProperty("target_request_id").GetString());
 
             await AssertStableToolErrorAsync(
                 client.CallToolAsync(
@@ -1261,6 +1299,13 @@ public sealed class McpPublishedIntegrationTests
 
         public void WriteRuntimeReceipt()
         {
+            var operations = new[]
+            {
+                "terrain_stroke", "pattern_region", "colorable_pattern_region", "cave_region",
+                "roof_region", "object_placement", "wall_polyline", "material_stroke",
+                "portal_placement", "path_polyline", "light_placement", "simple_tile_region",
+                "smart_tile_region", "smart_tile_double_region",
+            };
             File.WriteAllText(
                 Path.Combine(MailboxDirectory, "runtime-receipt.json"),
                 JsonSerializer.Serialize(new
@@ -1272,8 +1317,64 @@ public sealed class McpPublishedIntegrationTests
                     timestamp = DateTimeOffset.UtcNow.ToString("O"),
                     session_id = "1-1",
                     supported_commands = PublishedDiscoveryBridgeHarness.Capabilities,
+                    operation_certifications = operations.Select(operation => new
+                    {
+                        operation_type = operation,
+                        tool_name = ToolName(operation),
+                        required_methods = RequiredMethods(operation),
+                        required_properties = RequiredProperties(operation),
+                        route_present = true,
+                        methods_reflectable = true,
+                        properties_readable = true,
+                        busy = false,
+                        exact_dungeondraft_version = DdaiCapabilityService.ExpectedDungeondraftVersion,
+                        runtime_certified = operation == "wall_polyline",
+                        reason = operation == "wall_polyline" ? "runtime_certified" : "executor_not_live_certified",
+                    }).ToArray(),
                 }));
         }
+
+        private static string ToolName(string operation) => operation switch
+        {
+            "terrain_stroke" => "TerrainBrush",
+            "pattern_region" or "colorable_pattern_region" => "PatternShapeTool",
+            "cave_region" => "CaveBrush",
+            "roof_region" => "RoofTool",
+            "object_placement" => "ObjectTool",
+            "wall_polyline" => "WallTool",
+            "material_stroke" => "MaterialBrush",
+            "portal_placement" => "PortalTool",
+            "path_polyline" => "PathTool",
+            "light_placement" => "LightTool",
+            _ => "FloorShapeTool",
+        };
+
+        private static string[] RequiredMethods(string operation) => operation switch
+        {
+            "terrain_stroke" => ["SetBiome", "SetSize", "UpdateBrush"],
+            "roof_region" => ["DrawRect", "FinishShape"],
+            "object_placement" => ["Confirm", "SetLayer", "SetSorting", "SetShadow", "SetBlockLight"],
+            "wall_polyline" => ["EndWall"],
+            "material_stroke" => ["SetMaterial", "SetLayer", "SetSmooth"],
+            "portal_placement" => ["SetFreestanding", "FindBestLocation", "ChangeTexture"],
+            "path_polyline" => ["StartPath", "EndPath", "SetLayer"],
+            "light_placement" => ["CreatePreview", "ChangeColor", "SetShadows"],
+            _ => [],
+        };
+
+        private static string[] RequiredProperties(string operation) => operation switch
+        {
+            "terrain_stroke" => ["IsPainting", "brush"],
+            "pattern_region" or "colorable_pattern_region" => ["Texture"],
+            "roof_region" => ["isDrawing", "Texture"],
+            "object_placement" => ["Texture", "Preview"],
+            "wall_polyline" => ["isDrawing", "Texture"],
+            "material_stroke" => ["Mesh"],
+            "portal_placement" => ["Texture"],
+            "path_polyline" => ["isDrawing", "Texture", "ActivePath"],
+            "light_placement" => ["texture", "preview"],
+            _ => [],
+        };
 
         public void WriteCatalogProgressReceipt(DateTimeOffset timestamp)
         {
@@ -1317,8 +1418,10 @@ public sealed class McpPublishedIntegrationTests
     private sealed class PublishedDiscoveryBridgeHarness(AtomicMailbox mailbox, string assetRef)
     {
         public const int UnansweredLevel = 99;
+        public const long MapJobRevision = 43;
+        public const string MapId = "published-map-session";
         public static readonly string MapRevision = new('b', 64);
-        public static readonly string[] Capabilities = ["status", "apply_plan", "inspect_map"];
+        public static readonly string[] Capabilities = ["status", "apply_plan", "inspect_map", "undo_last_job"];
 
         private readonly TaskCompletionSource<ClaimedMailboxRequest> unansweredClaim = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1357,10 +1460,15 @@ public sealed class McpPublishedIntegrationTests
                 {
                     state = "ready",
                     revision = MapRevision,
+                    map_id = MapId,
+                    map_job_revision = MapJobRevision,
+                    level_ids = new[] { "0" },
+                    certified_operation_types = new[] { "wall_polyline" },
                     supported_commands = Capabilities,
                 })),
                 "inspect_map" => Inspect(claim.Request),
                 "apply_plan" => Apply(claim.Request),
+                "undo_last_job" => Undo(claim.Request),
                 _ => Failure(claim.Request, "unsupported_command"),
             };
             mailbox.PublishResponse(claim, response);
@@ -1399,6 +1507,17 @@ public sealed class McpPublishedIntegrationTests
                 plan_fingerprint = MapPlanJson.Fingerprint(plan),
             }));
         }
+
+        private static MailboxResponse Undo(MailboxRequest request) => Success(
+            request,
+            JsonSerializer.SerializeToElement(new
+            {
+                target_request_id = request.Payload.GetProperty("target_request_id").GetString(),
+                map_id = request.Payload.GetProperty("expected_map_id").GetString(),
+                starting_map_revision = request.Payload.GetProperty("expected_map_revision").GetInt64(),
+                map_revision = request.Payload.GetProperty("expected_map_revision").GetInt64() + 1,
+                outcome_unknown = false,
+            }));
 
         private static MailboxResponse Success(MailboxRequest request, JsonElement payload) => new()
         {

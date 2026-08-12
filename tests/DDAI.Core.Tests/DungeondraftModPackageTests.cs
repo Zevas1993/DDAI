@@ -36,7 +36,7 @@ public sealed class DungeondraftModPackageTests
 
         Assert.Equal("0.2.1", manifest.RootElement.GetProperty("version").GetString());
         Assert.Equal("0.2.1", ConstantValue(script, "MOD_VERSION"));
-        Assert.Contains("const SUPPORTED_COMMANDS = [\"status\", \"apply_plan\", \"inspect_map\"]", script, StringComparison.Ordinal);
+        Assert.Contains("const SUPPORTED_COMMANDS = [\"status\", \"apply_plan\", \"inspect_map\", \"undo_last_job\"]", script, StringComparison.Ordinal);
         Assert.Contains("apply_plan", readme, StringComparison.Ordinal);
         Assert.Contains("native rectangular wall", readme, StringComparison.OrdinalIgnoreCase);
     }
