@@ -155,7 +155,8 @@ public sealed class DungeondraftUniversalPlanScriptTests
 
         Assert.Contains("\"map_id\": _current_map_id()", body, StringComparison.Ordinal);
         Assert.Contains("\"map_job_revision\": _map_job_revision", body, StringComparison.Ordinal);
-        Assert.Contains("\"certified_operation_types\": [\"wall_polyline\"]", body, StringComparison.Ordinal);
+        Assert.Contains("\"certified_operation_types\": _certified_operation_types()", body, StringComparison.Ordinal);
+        Assert.Contains("\"operation_certifications\": _operation_certifications.duplicate(true)", body, StringComparison.Ordinal);
         Assert.Contains("\"level_ids\": _current_level_ids()", body, StringComparison.Ordinal);
     }
 
@@ -217,6 +218,9 @@ public sealed class DungeondraftUniversalPlanScriptTests
             File.Copy(
                 Path.Combine(repositoryRoot, "mods", "DDAI", "scripts", "ddai_bridge.gd"),
                 Path.Combine(temporaryRoot, "ddai_bridge.gd"));
+            File.Copy(
+                Path.Combine(repositoryRoot, "mods", "DDAI", "scripts", "ddai_operation_certifier.gd"),
+                Path.Combine(temporaryRoot, "ddai_operation_certifier.gd"));
             using var process = Process.Start(new ProcessStartInfo(godotPath)
             {
                 WorkingDirectory = temporaryRoot,

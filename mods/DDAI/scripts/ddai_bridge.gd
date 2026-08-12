@@ -2,6 +2,7 @@ var script_class = "tool"
 
 const MOD_VERSION = "0.2.1"
 const TARGET_DUNGEONDRAFT_VERSION = "1.2.0.1"
+const TARGET_DUNGEONDRAFT_EXECUTABLE_SHA256 = "c14ddddbaada43610e763f73f0c2786983ca4440578acde0ac9668cda358af02"
 const MAILBOX_SCHEMA_VERSION = "1.0"
 const MAILBOX_ROOT = "user://ddai"
 const MAXIMUM_MESSAGE_BYTES = 1048576
@@ -52,6 +53,7 @@ var _pending_observation_results = {}
 var _pending_reversal_results = {}
 var _resolved_job_assets = {}
 var _certified_operation_executors = {}
+var _operation_certifications = []
 var _asset_list_provider = null
 var _texture_loader = null
 
@@ -63,6 +65,7 @@ func start():
 	_certified_operation_executors = {
 		"wall_polyline": funcref(self, "_execute_wall_polyline"),
 	}
+	_operation_certifications = _certify_operation_routes()
 	if _asset_list_provider == null:
 		_asset_list_provider = funcref(self, "_get_live_asset_list")
 	if _texture_loader == null:
@@ -2368,7 +2371,8 @@ func _status_payload():
 		"map_id": _current_map_id(),
 		"map_job_revision": _map_job_revision,
 		"level_ids": _current_level_ids(),
-		"certified_operation_types": ["wall_polyline"],
+		"certified_operation_types": _certified_operation_types(),
+		"operation_certifications": _operation_certifications.duplicate(true),
 		"active_mods": [],
 		"active_mods_available": false,
 		"supported_commands": SUPPORTED_COMMANDS,
@@ -2377,6 +2381,41 @@ func _status_payload():
 
 func _active_mods_payload():
 	return {"available": false, "values": []}
+
+
+func _certified_operation_types():
+	var values = _certified_operation_executors.keys()
+	values.sort()
+	return values
+
+
+func _certify_operation_routes():
+	var script_path = Global.Root + "scripts/ddai_operation_certifier.gd" if str(Global.Root).length() > 0 else "res://ddai_operation_certifier.gd"
+	var certifier_script = load(script_path)
+	if certifier_script == null:
+		return []
+	var certifier = certifier_script.new()
+	if certifier == null or not certifier.has_method("certify_runtime"):
+		return []
+	return certifier.certify_runtime(
+		Global.Editor,
+		Global.World,
+		Global.WorldUI,
+		_runtime_identity(),
+		_certified_operation_types())
+
+
+func _runtime_identity():
+	var executable_path = OS.get_executable_path()
+	if typeof(executable_path) != TYPE_STRING or executable_path.length() == 0:
+		return {"exact_dungeondraft_version": "unknown", "executable_sha256": ""}
+	var executable_sha256 = File.new().get_sha256(executable_path).to_lower()
+	if executable_sha256 != TARGET_DUNGEONDRAFT_EXECUTABLE_SHA256:
+		return {"exact_dungeondraft_version": "unknown", "executable_sha256": executable_sha256}
+	return {
+		"exact_dungeondraft_version": TARGET_DUNGEONDRAFT_VERSION,
+		"executable_sha256": executable_sha256,
+	}
 
 
 func _write_runtime_receipt():
@@ -2388,6 +2427,7 @@ func _write_runtime_receipt():
 		"timestamp": _iso_timestamp(),
 		"session_id": _session_id,
 		"supported_commands": SUPPORTED_COMMANDS,
+		"operation_certifications": _operation_certifications.duplicate(true),
 	}
 	_write_json_atomically(MAILBOX_ROOT + "/runtime-receipts/" + _session_id + ".json", receipt)
 	var slot_path = RUNTIME_RECEIPT_SLOT_PATHS[_select_runtime_receipt_slot()]

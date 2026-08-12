@@ -283,7 +283,8 @@ public sealed class DungeondraftModPackageTests
         Assert.Contains("\"map_loaded\": Global.World != null", statusPayload, StringComparison.Ordinal);
         Assert.Contains("\"map_id\": _current_map_id()", statusPayload, StringComparison.Ordinal);
         Assert.Contains("\"map_job_revision\": _map_job_revision", statusPayload, StringComparison.Ordinal);
-        Assert.Contains("\"certified_operation_types\": [\"wall_polyline\"]", statusPayload, StringComparison.Ordinal);
+        Assert.Contains("\"certified_operation_types\": _certified_operation_types()", statusPayload, StringComparison.Ordinal);
+        Assert.Contains("\"operation_certifications\": _operation_certifications.duplicate(true)", statusPayload, StringComparison.Ordinal);
         Assert.Contains("\"dungeondraft_version_available\": false", statusPayload, StringComparison.Ordinal);
         Assert.Contains("\"active_mods_available\": false", statusPayload, StringComparison.Ordinal);
     }
