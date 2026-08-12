@@ -19,6 +19,7 @@ public enum BridgeTransition
     MutationConfirmed,
     MutationAmbiguityRecorded,
     MutationIntentDeleted,
+    UniversalJobAdvanced,
     Blocked,
 }
 
@@ -40,18 +41,21 @@ public sealed class DungeondraftBridgeStateMachine
     private readonly string _root;
     private readonly Func<MailboxRequest, MailboxResponse> _prepareResponse;
     private readonly Func<MailboxRequest, MailboxResponse>? _executeMutation;
+    private readonly Func<MailboxRequest, BridgeTransition>? _advanceUniversalPlan;
     private readonly HashSet<string> _preparedMutationKeys = new(StringComparer.Ordinal);
 
     public DungeondraftBridgeStateMachine(
         string rootDirectory,
         Func<MailboxRequest, MailboxResponse> prepareResponse,
-        Func<MailboxRequest, MailboxResponse>? executeMutation = null)
+        Func<MailboxRequest, MailboxResponse>? executeMutation = null,
+        Func<MailboxRequest, BridgeTransition>? advanceUniversalPlan = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(rootDirectory);
         ArgumentNullException.ThrowIfNull(prepareResponse);
         _root = Path.GetFullPath(rootDirectory);
         _prepareResponse = prepareResponse;
         _executeMutation = executeMutation;
+        _advanceUniversalPlan = advanceUniversalPlan;
         foreach (var name in new[] { "requests", "processing", "responses", "failed", "journal", "mutation-intents" })
         {
             Directory.CreateDirectory(DirectoryPath(name));
@@ -84,6 +88,11 @@ public sealed class DungeondraftBridgeStateMachine
         var fingerprint = Sha256(canonicalRequestText);
         if (StringComparer.Ordinal.Equals(request.Command, "apply_plan"))
         {
+            if (IsUniversalPlanRequest(request))
+            {
+                return _advanceUniversalPlan?.Invoke(request) ?? BridgeTransition.Blocked;
+            }
+
             return AdvanceMutationClaim(
                 key,
                 canonicalFileName,
@@ -102,6 +111,21 @@ public sealed class DungeondraftBridgeStateMachine
             responsePath,
             processingPath,
             responseText: null);
+    }
+
+    internal static bool IsUniversalPlanRequest(MailboxRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        try
+        {
+            var plan = MapPlanJson.Deserialize(request.Payload.GetRawText());
+            return StringComparer.Ordinal.Equals(plan.SchemaVersion, MapPlan.CurrentSchemaVersion) &&
+                StringComparer.Ordinal.Equals(plan.RequestId, request.RequestId);
+        }
+        catch (Exception exception) when (exception is JsonException or MapPlanValidationException or ArgumentException)
+        {
+            return false;
+        }
     }
 
     private BridgeTransition AdvanceJournaledClaim(

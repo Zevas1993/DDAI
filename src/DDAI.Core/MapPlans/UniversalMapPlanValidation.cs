@@ -24,6 +24,7 @@ public sealed record UniversalMapPlanValidationResult(
 
 public static class UniversalMapPlanValidator
 {
+    public const double MinimumNonzeroMagnitude = 1e-300;
     public const int MaximumOperations = 500;
     public const int MaximumGeometryPoints = 10_000;
     private static readonly HashSet<int> SupportedLayers = [-400, -100, 100, 200, 300, 400, 700, 900];
@@ -437,8 +438,8 @@ public static class UniversalMapPlanValidator
                 continue;
             }
 
-            var finiteX = double.IsFinite(point.X);
-            var finiteY = double.IsFinite(point.Y);
+            var finiteX = double.IsFinite(point.X) && IsRepresentableMagnitude(point.X);
+            var finiteY = double.IsFinite(point.Y) && IsRepresentableMagnitude(point.Y);
             if (!finiteX || !finiteY)
             {
                 invalidCoordinate = true;
@@ -454,7 +455,7 @@ public static class UniversalMapPlanValidator
 
         if (invalidCoordinate)
         {
-            issues.Add(Issue("invalid_coordinate", path, "Geometry coordinates must be finite."));
+            issues.Add(Issue("invalid_coordinate", path, "Geometry coordinates must be finite and preserve their value in the Dungeondraft runtime."));
         }
 
         if (outOfBounds)
@@ -472,7 +473,7 @@ public static class UniversalMapPlanValidator
 
     private static void ValidateRotation(double value, string path, List<MapPlanValidationIssue> issues)
     {
-        if (!double.IsFinite(value) || value is < -360 or > 360)
+        if (!double.IsFinite(value) || !IsRepresentableMagnitude(value) || value is < -360 or > 360)
         {
             issues.Add(Issue("invalid_rotation", $"{path}.rotation_degrees", "Rotation must be between -360 and 360."));
         }
@@ -484,7 +485,7 @@ public static class UniversalMapPlanValidator
         string code,
         List<MapPlanValidationIssue> issues)
     {
-        if (!double.IsFinite(value) || value <= 0)
+        if (!double.IsFinite(value) || value < MinimumNonzeroMagnitude)
         {
             issues.Add(Issue(code, path, "The value must be finite and positive."));
         }
@@ -496,11 +497,14 @@ public static class UniversalMapPlanValidator
         string code,
         List<MapPlanValidationIssue> issues)
     {
-        if (!double.IsFinite(value) || value is < 0 or > 1)
+        if (!double.IsFinite(value) || !IsRepresentableMagnitude(value) || value is < 0 or > 1)
         {
             issues.Add(Issue(code, path, "The value must be between zero and one."));
         }
     }
+
+    private static bool IsRepresentableMagnitude(double value) =>
+        value == 0 || Math.Abs(value) >= MinimumNonzeroMagnitude;
 
     private static void ValidateLayer(int value, string path, List<MapPlanValidationIssue> issues)
     {

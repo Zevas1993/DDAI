@@ -1,0 +1,449 @@
+extends Node
+
+const BridgeScript = preload("res://ddai_bridge.gd")
+const RESOURCE_IDENTITY = "res://fixture-wall.png"
+const CATALOG_CATEGORIES = [
+	"Terrain", "Patterns", "Patterns Colorable", "Caves", "Roofs", "Objects", "Walls",
+	"Materials", "Portals", "Paths", "Lights", "Simple Tiles", "Smart Tiles", "Smart Tiles Double",
+]
+var _asset_list_calls = 0
+var _accepted_catalog_fingerprint = ""
+
+class MockWall:
+	extends Node
+	var native_id = 0
+	var GlobalRect = Rect2(70, 70, 490, 1)
+
+	func _init(value):
+		native_id = value
+		set_meta("node_id", value)
+
+	func Clear():
+		Global.World.remove_node_id(native_id)
+
+	func GetNodeID():
+		return native_id
+
+
+class MockWalls:
+	extends Node
+
+	func AddWall(_points, _texture, _color, _closed):
+		for _index in range(Global.World.create_count):
+			Global.World.create_wall()
+		Global.World.create_count = 1
+
+
+class MockLevel:
+	extends Reference
+	var ID = 0
+	var Label = "Ground"
+	var Walls = MockWalls.new()
+	var Pathways = Node.new()
+	var Roofs = Node.new()
+	var Objects = Node.new()
+	var PatternShapes = MockPatternShapes.new()
+
+
+class MockPatternShapes:
+	extends Reference
+
+	func GetShapes():
+		return []
+
+
+class MockWorld:
+	extends Node
+	var Width = 40
+	var Height = 30
+	var GridSize = 70.0
+	var CurrentLevelId = 0
+	var level = MockLevel.new()
+	var levels = [level]
+	var registry = {}
+	var next_id = 100
+	var last_created_id = 0
+	var fail_next_observation = false
+	var create_count = 1
+
+	func _init():
+		add_child(level.Walls)
+		add_child(level.Pathways)
+		add_child(level.Roofs)
+		add_child(level.Objects)
+
+	func GetLevelByID(level_id):
+		return level if int(level_id) == 0 else null
+
+	func HasNodeID(node_id):
+		if fail_next_observation:
+			fail_next_observation = false
+			return false
+		return registry.has(int(node_id))
+
+	func GetNodeByID(node_id):
+		return registry.get(int(node_id), null)
+
+	func create_wall():
+		next_id += 1
+		last_created_id = next_id
+		var wall = MockWall.new(next_id)
+		level.Walls.add_child(wall)
+		registry[next_id] = wall
+
+	func remove_node_id(node_id):
+		registry.erase(int(node_id))
+
+
+class MockWallTool:
+	extends Reference
+	var isDrawing = false
+
+
+class MockEditor:
+	extends Reference
+	var Tools = {"WallTool": MockWallTool.new()}
+
+
+class MockWorldUI:
+	extends Reference
+	var EditArcPoint = false
+	var Polyline = []
+
+
+func _ready():
+	Global.World = MockWorld.new()
+	add_child(Global.World)
+	Global.Editor = MockEditor.new()
+	Global.WorldUI = MockWorldUI.new()
+	var bridge = BridgeScript.new()
+	bridge._session_id = "executor-session"
+	bridge._certified_operation_executors = {"wall_polyline": funcref(bridge, "_execute_wall_polyline")}
+	bridge._asset_list_provider = funcref(self, "_asset_list")
+	bridge._texture_loader = funcref(self, "_texture")
+	bridge._ensure_mailbox_directories()
+	_clear_request_state("universal-wall-success")
+	_clear_request_state("universal-wall-crash")
+	_clear_request_state("universal-wall-observe-fail")
+	_clear_request_state("universal-wall-multiple")
+	_publish_catalog(bridge)
+	bridge._status_payload()
+
+	var plan = _plan(bridge, "universal-wall-success", 0)
+	var plan_fingerprint = bridge._universal_plan_fingerprint_input(plan).sha256_text()
+	var fingerprint_ok = plan_fingerprint.length() == 64
+	var validation_ok = bridge._validate_universal_plan(plan, plan.request_id).ok
+	var preflight_ok = bridge._preflight_universal_plan(plan).ok
+	var result = yield(_run_job(bridge, plan), "completed")
+	var native_id = Global.World.last_created_id
+	var observed_ok = result.success and Global.World.HasNodeID(native_id) and bridge._map_job_revision == 1
+	var success_key = plan.request_id.sha256_text()
+	var success_request = _request(plan)
+	var success_claim = {"file_name": success_key + ".json", "path": "user://ddai/processing/" + success_key + ".json"}
+	var success_request_fingerprint = bridge._canonical_request_text(success_request).sha256_text()
+	var completion_transition = bridge._advance_universal_plan_claim(success_claim, success_request, success_request_fingerprint, "user://ddai/journal/" + success_key + ".json", "user://ddai/responses/" + success_key + ".json", success_key)
+	var success_job_path = "user://ddai/map-jobs/" + success_key + ".json"
+	var tampered_completed_job = bridge._read_bounded_dictionary(success_job_path)
+	tampered_completed_job.map_state_fingerprint = "e".repeat(64)
+	bridge._replace_json_recoverably(success_job_path, tampered_completed_job)
+	var completion_tamper_blocked = completion_transition == "map_job_completion_recorded" and bridge._cleanup_completed_map_job(success_key + ".json") == "blocked" and Directory.new().file_exists(success_job_path)
+	var reversal_ok = bridge._reverse_operation(plan.operations[0], [native_id]) and not Global.World.HasNodeID(native_id)
+	yield(get_tree(), "idle_frame")
+
+	bridge._status_payload()
+	var observe_fail_plan = _plan(bridge, "universal-wall-observe-fail", bridge._map_job_revision)
+	Global.World.fail_next_observation = true
+	var observe_fail_result = yield(_run_job(bridge, observe_fail_plan), "completed")
+	var failed_native_id = Global.World.last_created_id
+	var observe_failure_reversed = not observe_fail_result.success and not observe_fail_result.payload.outcome_unknown and observe_fail_result.error.code == "operation_failed_reversed" and not Global.World.HasNodeID(failed_native_id)
+	var observe_fail_key = observe_fail_plan.request_id.sha256_text()
+	var observe_fail_request = _request(observe_fail_plan)
+	var observe_fail_claim = {"file_name": observe_fail_key + ".json", "path": "user://ddai/processing/" + observe_fail_key + ".json"}
+	var observe_fail_request_fingerprint = bridge._canonical_request_text(observe_fail_request).sha256_text()
+	var completion_recorded = bridge._advance_universal_plan_claim(observe_fail_claim, observe_fail_request, observe_fail_request_fingerprint, "user://ddai/journal/" + observe_fail_key + ".json", "user://ddai/responses/" + observe_fail_key + ".json", observe_fail_key) == "map_job_completion_recorded"
+	var original_claim_deleted = bridge._advance_universal_plan_claim(observe_fail_claim, observe_fail_request, observe_fail_request_fingerprint, "user://ddai/journal/" + observe_fail_key + ".json", "user://ddai/responses/" + observe_fail_key + ".json", observe_fail_key) == "map_job_claim_deleted"
+	var journal_deleted = bridge._cleanup_completed_map_job(observe_fail_key + ".json") == "map_job_journal_deleted"
+	_write_claim(bridge, observe_fail_request, observe_fail_key)
+	var duplicate_claim = {"file_name": observe_fail_key + ".json", "path": "user://ddai/processing/" + observe_fail_key + ".json"}
+	var duplicate_after_cleanup_ok = completion_recorded and original_claim_deleted and journal_deleted and bridge._advance_universal_plan_claim(duplicate_claim, observe_fail_request, observe_fail_request_fingerprint, "user://ddai/journal/" + observe_fail_key + ".json", "user://ddai/responses/" + observe_fail_key + ".json", observe_fail_key) == "map_job_claim_deleted"
+	var stable_status = bridge._status_payload()
+	yield(get_tree(), "idle_frame")
+	var stable_status_after_frame = bridge._status_payload()
+	var reversal_revision_stable = int(stable_status.map_job_revision) == int(stable_status_after_frame.map_job_revision)
+	var multiple_plan = _plan(bridge, "universal-wall-multiple", bridge._map_job_revision)
+	Global.World.create_count = 2
+	var multiple_result = yield(_run_job(bridge, multiple_plan), "completed")
+	var multiple_created_reversed = not multiple_result.success and not multiple_result.payload.outcome_unknown and multiple_result.error.code == "operation_failed_reversed" and Global.World.registry.size() == 0
+	bridge._status_payload()
+
+	bridge._status_payload()
+	var crash_plan = _plan(bridge, "universal-wall-crash", bridge._map_job_revision)
+	var crash_request = _request(crash_plan)
+	var crash_key = crash_plan.request_id.sha256_text()
+	_write_claim(bridge, crash_request, crash_key)
+	var crash_claim = {"file_name": crash_key + ".json", "path": "user://ddai/processing/" + crash_key + ".json"}
+	var crash_request_fingerprint = bridge._canonical_request_text(crash_request).sha256_text()
+	var first_transition = bridge._advance_universal_plan_claim(crash_claim, crash_request, crash_request_fingerprint, "", "user://ddai/responses/" + crash_key + ".json", crash_key)
+	var restarted = BridgeScript.new()
+	restarted._session_id = "executor-session-restarted"
+	restarted._map_job_revision = 0
+	restarted._certified_operation_executors = {"wall_polyline": funcref(restarted, "_execute_wall_polyline")}
+	restarted._asset_list_provider = funcref(self, "_asset_list")
+	restarted._texture_loader = funcref(self, "_texture")
+	var restart_transition = restarted._advance_universal_plan_claim(crash_claim, crash_request, crash_request_fingerprint, "", "user://ddai/responses/" + crash_key + ".json", crash_key)
+	var recovered_response = null
+	for _step in range(8):
+		restarted._advance_universal_plan_claim(crash_claim, crash_request, crash_request_fingerprint, "", "user://ddai/responses/" + crash_key + ".json", crash_key)
+		recovered_response = restarted._read_bounded_dictionary("user://ddai/responses/" + crash_key + ".json")
+		if recovered_response != null:
+			break
+	var recovery_ok = first_transition == "map_job_prepared" and restart_transition == "map_job_outcome_unknown" and recovered_response != null and not recovered_response.success and recovered_response.payload.outcome_unknown and int(recovered_response.payload.map_revision) >= int(crash_plan.base_revision) and Global.World.registry.size() == 0
+
+	var empty_plan = _plan(bridge, "universal-empty", bridge._map_job_revision)
+	empty_plan.operations = []
+	var bad_level_plan = _plan(bridge, "universal-bad-level", bridge._map_job_revision)
+	bad_level_plan.operations[0].level_id = "foo"
+	var trailing_asset_plan = _plan(bridge, "universal-trailing-asset", bridge._map_job_revision)
+	trailing_asset_plan.operations[0].asset_ref += "junk"
+	_publish_bad_catalog(bridge)
+	var bad_catalog_rejected = not bridge._read_accepted_catalog().ok
+	_publish_tampered_catalog(bridge)
+	var catalog_manifest_integrity_ok = not bridge._read_accepted_catalog().ok
+	bridge._replace_json_recoverably("user://ddai/catalog/current.json", {"session_id": bridge._session_id, "manifest": "executor-session-7-test/manifest.json", "catalog_revision": 7})
+	var strict_failure_ok = not bridge._validate_universal_plan(empty_plan, empty_plan.request_id).ok and not bridge._validate_universal_plan(trailing_asset_plan, trailing_asset_plan.request_id).ok and bad_catalog_rejected and catalog_manifest_integrity_ok and bridge._validate_universal_plan(bad_level_plan, bad_level_plan.request_id).ok and not bridge._preflight_universal_plan(bad_level_plan).ok
+	var repeated_asset_plan = _plan(bridge, "universal-repeated-asset", bridge._map_job_revision)
+	var repeated_operation = repeated_asset_plan.operations[0].duplicate(true)
+	repeated_operation.operation_id = "wall-b"
+	repeated_asset_plan.operations.append(repeated_operation)
+	var calls_before_repeated = _asset_list_calls
+	var repeated_preflight_ok = bridge._preflight_universal_plan(repeated_asset_plan).ok and _asset_list_calls - calls_before_repeated == 1
+	_clear_request_state("universal-bad-level")
+	var correlated_failure = yield(_run_job(bridge, bad_level_plan), "completed")
+	var preflight_correlation_ok = not correlated_failure.success and correlated_failure.error.code == "unsupported_level" and correlated_failure.payload.map_id == bad_level_plan.expected_map_id and int(correlated_failure.payload.starting_map_revision) == int(bad_level_plan.base_revision) and int(correlated_failure.payload.catalog_revision) == int(bad_level_plan.expected_catalog_revision) and correlated_failure.payload.catalog_fingerprint == _accepted_catalog_fingerprint
+	var catalog_race_plan = _plan(bridge, "universal-catalog-race", bridge._map_job_revision)
+	_clear_request_state("universal-catalog-race")
+	_publish_newer_catalog(bridge)
+	var catalog_race_failure = yield(_run_job(bridge, catalog_race_plan), "completed")
+	var catalog_race_correlation_ok = not catalog_race_failure.success and catalog_race_failure.error.code == "catalog_revision_mismatch" and int(catalog_race_failure.payload.catalog_revision) == 7 and catalog_race_failure.payload.catalog_fingerprint == _accepted_catalog_fingerprint
+
+	var tampered = bridge._new_map_job_journal(crash_request, crash_request_fingerprint, bridge._universal_plan_fingerprint_input(crash_plan).sha256_text(), {
+		"map_id": crash_plan.expected_map_id,
+		"starting_map_revision": crash_plan.base_revision,
+		"catalog_revision": crash_plan.expected_catalog_revision,
+		"catalog_fingerprint": _accepted_catalog_fingerprint,
+		"map_state_fingerprint": "d".repeat(64),
+	})
+	tampered.state = "operation_applied"
+	tampered.current_operation_node_ids = [201, 201]
+	var duplicate_nodes_rejected = not bridge._map_job_state_is_consistent(tampered, 1)
+	tampered.current_operation_node_ids = [201]
+	tampered.state = "reversing"
+	tampered.reversal_operation_index = 0
+	var reversing_current_accepted = bridge._map_job_state_is_consistent(tampered, 1)
+	tampered.current_operation_node_ids = []
+	var missing_reversal_nodes_rejected = not bridge._map_job_state_is_consistent(tampered, 1)
+	var observed_tamper = tampered.duplicate(true)
+	observed_tamper.state = "operation_observed"
+	observed_tamper.next_operation_index = 1
+	observed_tamper.reversal_operation_index = null
+	observed_tamper.observed_native_node_ids = [301]
+	observed_tamper.operation_observations = [{"operation_index": 0, "operation_id": "wall-a", "native_node_ids": [301]}]
+	var valid_observation_accepted = bridge._map_job_state_is_consistent(observed_tamper, 1)
+	observed_tamper.operation_observations[0].native_node_ids = []
+	var empty_observation_rejected = not bridge._map_job_state_is_consistent(observed_tamper, 1)
+	observed_tamper.operation_observations[0].native_node_ids = [301]
+	observed_tamper.state = "reversing"
+	observed_tamper.reversal_operation_index = 0
+	observed_tamper.current_operation_node_ids = [302]
+	var wrong_reversal_ids_rejected = not bridge._map_job_state_is_consistent(observed_tamper, 1)
+	observed_tamper.current_operation_node_ids = [301]
+	var exact_reversal_ids_accepted = bridge._map_job_state_is_consistent(observed_tamper, 1)
+	var committed_tamper = observed_tamper.duplicate(true)
+	committed_tamper.state = "committed"
+	committed_tamper.current_operation_node_ids = []
+	committed_tamper.reversal_operation_index = null
+	committed_tamper.canonical_response = "{}"
+	var committed_tamper_path = "user://ddai/map-jobs/committed-tamper.json"
+	bridge._replace_json_recoverably(committed_tamper_path, committed_tamper)
+	var committed_response_tamper_rejected = bridge._read_map_job_journal(committed_tamper_path, crash_request, crash_request_fingerprint, committed_tamper.plan_fingerprint) == null
+	Directory.new().remove(committed_tamper_path)
+	var journal_invariants_ok = duplicate_nodes_rejected and reversing_current_accepted and missing_reversal_nodes_rejected and valid_observation_accepted and empty_observation_rejected and wrong_reversal_ids_rejected and exact_reversal_ids_accepted and committed_response_tamper_rejected
+	var number_texts = []
+	for number in [0.0, 1e-300, 1e-18, 0.0000001, 0.00001, 0.1, 1.0000001, 1.23456789012345, 40.0, 2147483647.0]:
+		number_texts.append(bridge._double_fingerprint_text(number))
+
+	print("DDAI_UNIVERSAL_FINGERPRINT:", fingerprint_ok)
+	print("DDAI_UNIVERSAL_PLAN_JSON:", to_json(plan))
+	print("DDAI_UNIVERSAL_PLAN_FINGERPRINT:", plan_fingerprint)
+	print("DDAI_UNIVERSAL_VALIDATION_PREFLIGHT:", validation_ok and preflight_ok)
+	print("DDAI_UNIVERSAL_APPLY_OBSERVE:", observed_ok)
+	print("DDAI_UNIVERSAL_COMPLETION_TAMPER_BLOCKED:", completion_tamper_blocked)
+	print("DDAI_UNIVERSAL_REVERSAL:", reversal_ok)
+	print("DDAI_UNIVERSAL_OBSERVE_FAILURE_REVERSED:", observe_failure_reversed)
+	print("DDAI_UNIVERSAL_DUPLICATE_AFTER_CLEANUP:", duplicate_after_cleanup_ok)
+	print("DDAI_UNIVERSAL_REVERSAL_REVISION_STABLE:", reversal_revision_stable)
+	print("DDAI_UNIVERSAL_MULTIPLE_CREATED_REVERSED:", multiple_created_reversed)
+	print("DDAI_UNIVERSAL_PREPARED_RECOVERY:", recovery_ok)
+	print("DDAI_UNIVERSAL_STRICT_FAILURES:", strict_failure_ok)
+	print("DDAI_UNIVERSAL_CATALOG_MANIFEST_INTEGRITY:", catalog_manifest_integrity_ok)
+	print("DDAI_UNIVERSAL_UNIQUE_ASSET_RESOLUTION:", repeated_preflight_ok)
+	print("DDAI_UNIVERSAL_PREFLIGHT_CORRELATION:", preflight_correlation_ok)
+	print("DDAI_UNIVERSAL_CATALOG_RACE_CORRELATION:", catalog_race_correlation_ok)
+	print("DDAI_UNIVERSAL_JOURNAL_INVARIANTS:", journal_invariants_ok)
+	print("DDAI_UNIVERSAL_DOUBLE_BITS:", PoolStringArray(number_texts).join("|"))
+	bridge = null
+	restarted = null
+	Global.Editor = null
+	Global.WorldUI = null
+	get_tree().quit(0 if fingerprint_ok and validation_ok and preflight_ok and observed_ok and completion_tamper_blocked and reversal_ok and observe_failure_reversed and duplicate_after_cleanup_ok and reversal_revision_stable and multiple_created_reversed and recovery_ok and strict_failure_ok and catalog_manifest_integrity_ok and repeated_preflight_ok and preflight_correlation_ok and catalog_race_correlation_ok and journal_invariants_ok else 1)
+
+
+func _plan(bridge, request_id, revision):
+	var map_id = bridge._current_map_id()
+	var json = '{"schema_version":"2.0","request_id":"' + request_id + '","expected_map_id":"' + map_id + '","base_revision":' + str(revision) + ',"expected_catalog_revision":7,"mode":"add","coordinate_system":"grid","canvas":{"width":40,"height":30},"operations":[{"operation_type":"wall_polyline","operation_id":"wall-a","level_id":"0","asset_ref":"sha256:' + "a".repeat(64) + '","path":{"points":[{"x":1.23456789012345,"y":1.0000001},{"x":8.125,"y":1}]},"closed":false,"color_rgba":"#ffffffff"}]}'
+	return JSON.parse(json).result
+
+
+func _request(plan):
+	return {
+		"schema_version": "1.0",
+		"request_id": plan.request_id,
+		"command": "apply_plan",
+		"timestamp": "2026-08-11T20:00:00Z",
+		"payload": plan,
+	}
+
+
+func _run_job(bridge, plan):
+	var request = _request(plan)
+	var key = plan.request_id.sha256_text()
+	_write_claim(bridge, request, key)
+	var claim = {"file_name": key + ".json", "path": "user://ddai/processing/" + key + ".json"}
+	var request_fingerprint = bridge._canonical_request_text(request).sha256_text()
+	for _step in range(20):
+		bridge._advance_universal_plan_claim(claim, request, request_fingerprint, "user://ddai/journal/" + key + ".json", "user://ddai/responses/" + key + ".json", key)
+		yield(get_tree(), "idle_frame")
+		var response = bridge._read_bounded_dictionary("user://ddai/responses/" + key + ".json")
+		if response != null:
+			return response
+	return {"success": false}
+
+
+func _write_claim(bridge, request, key):
+	bridge._write_text_atomically("user://ddai/processing/" + key + ".json", to_json(request))
+
+
+func _clear_request_state(request_id):
+	var key = request_id.sha256_text()
+	var directory = Directory.new()
+	for path in [
+		"user://ddai/processing/" + key + ".json",
+		"user://ddai/responses/" + key + ".json",
+		"user://ddai/journal/" + key + ".json",
+		"user://ddai/map-jobs/" + key + ".json",
+		"user://ddai/map-completed/" + key + ".json",
+	]:
+		directory.remove(path)
+
+
+func _publish_catalog(bridge):
+	var root = "user://ddai/catalog"
+	var snapshot = root + "/snapshots/executor-session-7-test"
+	var directory = Directory.new()
+	directory.make_dir_recursive(snapshot)
+	var entry = _catalog_entry("sha256:" + "a".repeat(64))
+	var chunk_text = to_json([entry])
+	bridge._replace_json_recoverably(snapshot + "/assets-000.json", [entry])
+	var counts = _empty_category_counts()
+	counts.Walls = 1
+	var manifest = _catalog_manifest(bridge, 7, counts, [{"file_name": "assets-000.json", "sha256": chunk_text.sha256_text(), "entry_count": 1, "byte_count": chunk_text.to_utf8().size()}])
+	_accepted_catalog_fingerprint = manifest.catalog_fingerprint
+	bridge._replace_json_recoverably(snapshot + "/manifest.json", manifest)
+	bridge._replace_json_recoverably(root + "/current.json", {"session_id": bridge._session_id, "manifest": "executor-session-7-test/manifest.json", "catalog_revision": 7})
+	bridge._replace_json_recoverably(root + "/current-slot-0.json", {"session_id": bridge._session_id, "manifest": "executor-session-7-test/manifest.json", "catalog_revision": 7})
+
+
+func _publish_newer_catalog(bridge):
+	var root = "user://ddai/catalog"
+	var snapshot = root + "/snapshots/executor-session-8-test"
+	Directory.new().make_dir_recursive(snapshot)
+	bridge._replace_json_recoverably(snapshot + "/manifest.json", _catalog_manifest(bridge, 8, _empty_category_counts(), []))
+	bridge._replace_json_recoverably(root + "/current.json", {"session_id": bridge._session_id, "manifest": "executor-session-8-test/manifest.json", "catalog_revision": 8})
+
+
+func _publish_bad_catalog(bridge):
+	var root = "user://ddai/catalog"
+	var snapshot = root + "/snapshots/executor-session-7-bad"
+	Directory.new().make_dir_recursive(snapshot)
+	var entry = _catalog_entry("sha256:" + "a".repeat(64))
+	entry.asset_ref += "junk"
+	var entries = [entry]
+	var chunk_text = to_json(entries)
+	bridge._replace_json_recoverably(snapshot + "/assets-000.json", entries)
+	var counts = _empty_category_counts()
+	counts.Walls = 1
+	bridge._replace_json_recoverably(snapshot + "/manifest.json", _catalog_manifest(bridge, 7, counts, [{"file_name": "assets-000.json", "sha256": chunk_text.sha256_text(), "entry_count": 1, "byte_count": chunk_text.to_utf8().size()}]))
+	bridge._replace_json_recoverably(root + "/current.json", {"session_id": bridge._session_id, "manifest": "executor-session-7-bad/manifest.json", "catalog_revision": 7})
+
+
+func _publish_tampered_catalog(bridge):
+	var root = "user://ddai/catalog"
+	var snapshot = root + "/snapshots/executor-session-7-tampered"
+	Directory.new().make_dir_recursive(snapshot)
+	var entries = [_catalog_entry("sha256:" + "b".repeat(64))]
+	var chunk_text = to_json(entries)
+	bridge._replace_json_recoverably(snapshot + "/assets-000.json", entries)
+	var counts = _empty_category_counts()
+	counts.Walls = 1
+	var manifest = _catalog_manifest(bridge, 7, counts, [{"file_name": "assets-000.json", "sha256": chunk_text.sha256_text(), "entry_count": 1, "byte_count": chunk_text.to_utf8().size()}])
+	manifest.catalog_fingerprint = _accepted_catalog_fingerprint
+	bridge._replace_json_recoverably(snapshot + "/manifest.json", manifest)
+	bridge._replace_json_recoverably(root + "/current.json", {"session_id": bridge._session_id, "manifest": "executor-session-7-tampered/manifest.json", "catalog_revision": 7})
+
+
+func _catalog_manifest(bridge, revision, category_counts, chunks):
+	var manifest = {
+		"schema_version": "1.0",
+		"session_id": bridge._session_id,
+		"catalog_revision": revision,
+		"catalog_fingerprint": "",
+		"snapshot_at": "2026-08-11T20:00:00.0000000+00:00",
+		"complete": true,
+		"category_counts": category_counts,
+		"chunks": chunks,
+		"errors": [],
+	}
+	manifest.catalog_fingerprint = bridge._catalog_manifest_fingerprint(manifest)
+	return manifest
+
+
+func _empty_category_counts():
+	var counts = {}
+	for category in CATALOG_CATEGORIES:
+		counts[category] = 0
+	return counts
+
+
+func _catalog_entry(asset_ref):
+	return {
+		"asset_ref": asset_ref,
+		"category": "Walls",
+		"display_name": "fixture wall",
+		"resource_fingerprint": RESOURCE_IDENTITY.sha256_text(),
+		"pack_id": null,
+		"pack_name": null,
+		"search_terms": ["fixture wall"],
+		"tags": [],
+		"preview_hash": null,
+		"allow_third_party_use": false,
+		"generated": false,
+	}
+
+
+func _asset_list(category):
+	_asset_list_calls += 1
+	return [RESOURCE_IDENTITY] if category == "Walls" else []
+
+
+func _texture(_resource_identity):
+	return ImageTexture.new()

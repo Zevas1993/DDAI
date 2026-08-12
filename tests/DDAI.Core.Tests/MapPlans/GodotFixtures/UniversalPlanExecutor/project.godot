@@ -1,0 +1,15 @@
+config_version=4
+
+[application]
+config/name="DDAI Universal Executor Harness"
+run/main_scene="res://main.tscn"
+
+[autoload]
+Global="*res://global.gd"
+
+[display]
+window/size/width=320
+window/size/height=200
+
+[rendering]
+driver/driver_name="GLES2"

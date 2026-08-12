@@ -136,6 +136,27 @@ public sealed class DdaiUniversalPlanServiceTests
     }
 
     [Fact]
+    public async Task Apply_CorrelatesPostPublishPreflightRejection()
+    {
+        using var sandbox = new TestDirectory();
+        var mailbox = new AtomicMailbox(sandbox.Path);
+        var context = ValidContext();
+        var service = new DdaiUniversalPlanService(mailbox, TimeProvider.System, new FakeContextProvider(context));
+        var plan = ValidPlan("universal-preflight-rejection-001");
+        var worker = HandlePreflightRejectionAsync(mailbox, plan, context);
+
+        var result = await service.ApplyAsync(plan, TimeSpan.FromSeconds(10));
+        await worker;
+
+        Assert.False(result.Success);
+        Assert.Equal("unsupported_level", result.Error!.Code);
+        Assert.Equal(context.Capabilities.MapId, result.Payload.GetProperty("map_id").GetString());
+        Assert.Equal(context.Capabilities.MapRevision, result.Payload.GetProperty("starting_map_revision").GetInt64());
+        Assert.Equal(context.Catalog.Revision, result.Payload.GetProperty("catalog_revision").GetInt64());
+        Assert.Equal(context.Catalog.Fingerprint, result.Payload.GetProperty("catalog_fingerprint").GetString());
+    }
+
+    [Fact]
     public async Task Apply_TimeoutRetainsUnknownOutcomeEvidence()
     {
         using var sandbox = new TestDirectory();
@@ -336,6 +357,44 @@ public sealed class DdaiUniversalPlanServiceTests
                     Timestamp = DateTimeOffset.UtcNow,
                     Success = true,
                     Payload = document.RootElement.Clone(),
+                });
+                return;
+            }
+
+            await Task.Delay(10);
+        }
+
+        throw new TimeoutException("The fake bridge did not receive the universal plan.");
+    }
+
+    private static async Task HandlePreflightRejectionAsync(
+        AtomicMailbox mailbox,
+        MapPlan plan,
+        UniversalPlanRuntimeContext context)
+    {
+        for (var attempt = 0; attempt < 1_000; attempt++)
+        {
+            var claim = mailbox.ClaimNextRequest();
+            if (claim is not null)
+            {
+                mailbox.PublishResponse(claim, new MailboxResponse
+                {
+                    SchemaVersion = MailboxRequest.CurrentSchemaVersion,
+                    RequestId = plan.RequestId,
+                    Command = "apply_plan",
+                    Timestamp = DateTimeOffset.UtcNow,
+                    Success = false,
+                    Payload = JsonSerializer.SerializeToElement(new
+                    {
+                        plan_fingerprint = MapPlanJson.Fingerprint(plan),
+                        map_id = context.Capabilities.MapId,
+                        starting_map_revision = context.Capabilities.MapRevision,
+                        map_revision = context.Capabilities.MapRevision,
+                        catalog_revision = context.Catalog.Revision,
+                        catalog_fingerprint = context.Catalog.Fingerprint,
+                        outcome_unknown = false,
+                    }),
+                    Error = new MailboxErrorDetails("unsupported_level", "The requested level is unavailable.", "payload.operations.level_id"),
                 });
                 return;
             }

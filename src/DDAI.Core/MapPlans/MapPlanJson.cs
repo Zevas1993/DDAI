@@ -733,7 +733,7 @@ public static class MapPlanJson
         EnsureFinite(value, name);
         builder.Append(name);
         builder.Append('=');
-        builder.Append(value.ToString("R", CultureInfo.InvariantCulture));
+        builder.Append(unchecked((ulong)BitConverter.DoubleToInt64Bits(value)).ToString("x16", CultureInfo.InvariantCulture));
         builder.Append('\n');
     }
 

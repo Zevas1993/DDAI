@@ -10,6 +10,34 @@ namespace DDAI.Core.Tests;
 public sealed class MailboxBridgeConformanceTests
 {
     [Fact]
+    public void UniversalMapJobJournalAndDurableStatesMatchTheReferenceModel()
+    {
+        var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
+        var writer = FunctionBody(script, "_new_map_job_journal");
+        var advance = FunctionBody(script, "_advance_universal_plan_claim");
+        var reference = new MapJobJournal(
+            "1.0", "request", new string('a', 64), "map", 0, 1, new string('b', 64),
+            MapJobState.Prepared, 0, [], [], [], null, null, "{}", "{}", ["wall-a"]);
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(reference, new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+            Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower) },
+        }));
+
+        foreach (var property in document.RootElement.EnumerateObject()
+                     .Select(item => item.Name)
+                     .Except(["canonical_success_response", "canonical_reversed_response", "operation_ids"], StringComparer.Ordinal))
+        {
+            Assert.Contains("\"" + property + "\"", writer + advance, StringComparison.Ordinal);
+        }
+
+        foreach (var state in Enum.GetNames<MapJobState>().Select(JsonNamingPolicy.SnakeCaseLower.ConvertName))
+        {
+            Assert.Contains("\"" + state + "\"", advance, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
     public void GdscriptMutationIntentSchemaMatchesReferenceModel()
     {
         var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));

@@ -5,6 +5,7 @@ using System.Text.Json.Nodes;
 
 using DDAI.Core.Mailbox;
 using DDAI.Core.MapPlans;
+using DDAI.Core.MapPlans.Operations;
 
 namespace DDAI.Core.Tests;
 
@@ -13,6 +14,52 @@ public sealed class DungeondraftBridgeStateMachineTests
     private static readonly DateTimeOffset RequestTimestamp = DateTimeOffset.Parse("2026-08-09T12:00:00Z");
     private static readonly DateTimeOffset FirstResponseTimestamp = DateTimeOffset.Parse("2026-08-09T12:00:01Z");
     private static readonly DateTimeOffset RetryResponseTimestamp = DateTimeOffset.Parse("2026-08-09T12:05:00Z");
+
+    [Fact]
+    public void UniversalApplyPlan_DelegatesToTheGenericDurableJobProtocol()
+    {
+        const string RequestId = "universal-bridge-route-001";
+        var plan = new MapPlan
+        {
+            SchemaVersion = MapPlan.CurrentSchemaVersion,
+            RequestId = RequestId,
+            ExpectedMapId = "map-session-001",
+            BaseRevision = 4,
+            ExpectedCatalogRevision = 7,
+            Mode = MapOperationMode.Add,
+            CoordinateSystem = MapCoordinateSystem.Grid,
+            Canvas = new MapCanvas(40, 30),
+            Operations =
+            [
+                new WallPolylineOperation(
+                    "wall-a",
+                    "0",
+                    "sha256:" + new string('a', 64),
+                    new GridPolyline([new GridPoint(1, 1), new GridPoint(8, 1)]),
+                    false,
+                    "#ffffffff"),
+            ],
+        };
+        var request = MailboxRequest.CreateApplyPlan(plan, RequestTimestamp);
+        using var sandbox = new RawBridgeSandbox(
+            RequestId,
+            JsonSerializer.Serialize(request, BridgeWireJson.Options));
+        MailboxRequest? delegated = null;
+        var bridge = new DungeondraftBridgeStateMachine(
+            sandbox.Root,
+            candidate => SuccessResponse(candidate, FirstResponseTimestamp, "status-only"),
+            executeMutation: _ => throw new InvalidOperationException("The legacy one-shot executor must not receive v2."),
+            advanceUniversalPlan: candidate =>
+            {
+                delegated = candidate;
+                return BridgeTransition.UniversalJobAdvanced;
+            });
+
+        Assert.Equal(BridgeTransition.UniversalJobAdvanced, bridge.AdvanceClaim(sandbox.FileName));
+        Assert.NotNull(delegated);
+        Assert.Equal(RequestId, delegated.RequestId);
+        Assert.True(DungeondraftBridgeStateMachine.IsUniversalPlanRequest(delegated));
+    }
 
     [Fact]
     public void ApplyPlan_CreatesDurableIntentBeforeExecutingExactlyOnce()

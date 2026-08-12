@@ -434,16 +434,16 @@ public sealed class UniversalMapPlanValidatorTests
     }
 
     [Fact]
-    public void Validate_AcceptsInclusiveNumericBoundariesAndSmallestPositiveValues()
+    public void Validate_AcceptsInclusiveNumericBoundariesAndRuntimeRepresentableSmallValues()
     {
         var line = new GridPolyline([new GridPoint(0, 0), new GridPoint(40, 30)]);
         MapOperation[] operations =
         [
-            new ObjectPlacementOperation("negative-rotation", "level-0", "asset-Objects", new GridPoint(0, 0), -360, double.Epsilon, 100, MapSortingMode.Over, true, false, null),
-            new ObjectPlacementOperation("positive-rotation", "level-0", "asset-Objects", new GridPoint(40, 30), 360, double.Epsilon, 900, MapSortingMode.Under, false, true, "#00000000"),
-            new TerrainStrokeOperation("zero-unit", "level-0", "asset-Terrain", line, double.Epsilon, 0),
-            new TerrainStrokeOperation("one-unit", "level-0", "asset-Terrain", line, double.Epsilon, 1),
-            new LightPlacementOperation("light", "level-0", "asset-Lights", new GridPoint(1, 1), double.Epsilon, double.Epsilon, "#ffffffff", false),
+            new ObjectPlacementOperation("negative-rotation", "level-0", "asset-Objects", new GridPoint(0, 0), -360, 1e-300, 100, MapSortingMode.Over, true, false, null),
+            new ObjectPlacementOperation("positive-rotation", "level-0", "asset-Objects", new GridPoint(40, 30), 360, 1e-300, 900, MapSortingMode.Under, false, true, "#00000000"),
+            new TerrainStrokeOperation("zero-unit", "level-0", "asset-Terrain", line, 1e-300, 0),
+            new TerrainStrokeOperation("one-unit", "level-0", "asset-Terrain", line, 1e-300, 1),
+            new LightPlacementOperation("light", "level-0", "asset-Lights", new GridPoint(1, 1), 1e-300, 1e-300, "#ffffffff", false),
         ];
 
         var result = UniversalMapPlanValidator.Validate(
@@ -452,6 +452,22 @@ public sealed class UniversalMapPlanValidatorTests
             CapabilitiesFor(operations));
 
         Assert.True(result.IsValid);
+    }
+
+    [Fact]
+    public void Validate_RejectsNumbersThatUnderflowInTheTargetRuntime()
+    {
+        var operation = new WallPolylineOperation(
+            "wall", "level-0", "asset-Walls",
+            new GridPolyline([new GridPoint(double.Epsilon, 1), new GridPoint(2, 1)]),
+            false, "#ffffffff");
+
+        var result = UniversalMapPlanValidator.Validate(
+            ValidPlan() with { Operations = [operation] },
+            CatalogFor([operation]),
+            CapabilitiesFor([operation]));
+
+        Assert.Contains(result.Issues, issue => issue.Code == "invalid_coordinate");
     }
 
     [Fact]
