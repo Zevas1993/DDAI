@@ -157,10 +157,34 @@ func _is_valid_uuid(value):
 Run: `dotnet test tests/DDAI.Core.Tests/DDAI.Core.Tests.csproj -c Release --filter FullyQualifiedName~DungeondraftMapIdentityTests`
 Expected: PASS, 1 test
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Add the pinned-Godot behavioral fixture**
+
+Static substring tests cannot verify arithmetic, validator behavior, or read-only-ness. Create `tests/DDAI.Core.Tests/Executors/GodotFixtures/MapIdentity/` modeled on the existing `GodotFixtures/OperationCertifier` fixture, and drive the real `probe_map_data` with a `FakeGlobal` across these shapes:
+
+| Shape | Required record |
+|---|---|
+| `ModMapData` absent | `available` false |
+| present but a String | `available` true, `is_dictionary` false |
+| Dictionary, no DDAI key, 2 foreign keys | `foreign_key_count` 2, `ddai_key_present` false |
+| Dictionary, DDAI key + 2 foreign keys | `foreign_key_count` 2, `ddai_key_present` true |
+| DDAI value is a String | `stored_uuid_valid` false |
+| valid 64-char lowercase hex `map_uuid` | `stored_uuid_valid` true |
+| uppercase or 63-char `map_uuid` | `stored_uuid_valid` false |
+
+Prove read-only-ness structurally: snapshot with `.duplicate(true)` before the call and assert deep equality after. Grepping for forbidden call text cannot catch subscript assignment, which is the natural mutation vector for a GDScript Dictionary.
+
+Add the C# driver to `DungeondraftMapIdentityTests.cs` following the existing pinned-Godot test shape. The runtime is at `tools/godot-3.5.3/Godot_v3.5.3-stable_win64.exe`.
+
+- [ ] **Step 6: Guard against a false-negative probe**
+
+`_has_readable_property` scans `get_property_list()`. If Dungeondraft exposes `ModMapData` as a plain C# field rather than a registered Godot property, it may not enumerate even though `Global.get("ModMapData")` succeeds. Because Task 2 gates the whole design, a false `available: false` would abandon a valid design for the wrong reason.
+
+Report availability when EITHER `_has_readable_property` succeeds OR a direct `get()` returns non-null, and add a `discovery` field valued `property_list`, `direct_get`, or `none` so the live gate can distinguish the cases.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add -- mods/DDAI/scripts/ddai_operation_certifier.gd tests/DDAI.Core.Tests/Executors/DungeondraftMapIdentityTests.cs
+git add -- mods/DDAI/scripts/ddai_operation_certifier.gd tests/DDAI.Core.Tests/Executors
 git commit -m "test: probe Dungeondraft map data storage read-only"
 ```
 
