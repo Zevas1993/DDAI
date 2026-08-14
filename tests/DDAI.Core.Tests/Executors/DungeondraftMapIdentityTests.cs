@@ -24,6 +24,17 @@ public sealed class DungeondraftMapIdentityTests
             Assert.DoesNotContain(forbidden, probe, StringComparison.Ordinal);
         }
 
+        // No reflection against the host, ever. Probing Dungeondraft 1.2.0.1 with
+        // get_property_list() plus Object.get("ModMapData") crashed the application:
+        // the dump showed a repeating GDScript interpreter cycle running the stack out
+        // (access violation c0000005). Both calls can reach a host-defined _get() or
+        // _get_property_list() handler and which one recursed was never isolated, so
+        // the probe uses direct member access only -- the pattern the shipping
+        // Lievven.Snappy_Mod proves works on this exact build.
+        Assert.DoesNotContain("get_property_list", probe, StringComparison.Ordinal);
+        Assert.DoesNotMatch(@"global_object\s*\.\s*get\s*\(", probe);
+        Assert.Contains("global_object.ModMapData", probe, StringComparison.Ordinal);
+
         // GDScript Dictionaries are reference types, so the natural mutation
         // vector for Global.ModMapData is subscript/dot assignment into the
         // fetched dictionary itself ("data[...] = " or "data.foo = "), not a
@@ -110,7 +121,7 @@ public sealed class DungeondraftMapIdentityTests
             Assert.Contains("DDAI_MAP_IDENTITY_DDAI_KEY_COUNTED:True", output, StringComparison.Ordinal);
             Assert.Contains("DDAI_MAP_IDENTITY_STRING_OWNED_INVALID:True", output, StringComparison.Ordinal);
             Assert.Contains("DDAI_MAP_IDENTITY_MALFORMED_UUID_REJECTED:True", output, StringComparison.Ordinal);
-            Assert.Contains("DDAI_MAP_IDENTITY_DIRECT_GET_DISCOVERY:True", output, StringComparison.Ordinal);
+            Assert.Contains("DDAI_MAP_IDENTITY_NO_HOST_REFLECTION:True", output, StringComparison.Ordinal);
             Assert.Contains("DDAI_MAP_IDENTITY_READ_ONLY:True", output, StringComparison.Ordinal);
         }
         finally

@@ -4,6 +4,10 @@ const CertifierScript = preload("res://ddai_operation_certifier.gd")
 
 class FakeGlobalAbsent:
 	extends Reference
+	# Declared but unset. The probe reads the member directly, so "unavailable"
+	# is expressed as a null value rather than a missing property -- reaching for
+	# a missing property is exactly the reflection that crashed the host.
+	var ModMapData = null
 
 class FakeGlobalWithData:
 	extends Reference
@@ -12,20 +16,21 @@ class FakeGlobalWithData:
 	func _init(value):
 		ModMapData = value
 
-# Simulates a host that exposes ModMapData only through a plain get() (e.g. a
-# C# field), never through get_property_list(). ModMapData is deliberately
-# NOT declared as a script var here, so GDScript's automatic script-property
-# reflection never lists it; _get() is the only way to reach it.
-class FakeGlobalDirectOnly:
+# Mirrors the host that crashed Dungeondraft 1.2.0.1: a reflective property
+# lookup by name reaches a handler that never terminates. Here it merely records
+# that it was reached, so a regression fails the test instead of running the
+# stack out. ModMapData is a normal declared member, so a probe using direct
+# access never trips it.
+class FakeGlobalHostileReflection:
 	extends Reference
-	var _payload
+	var ModMapData
+	var reflection_used = false
 
 	func _init(payload):
-		_payload = payload
+		ModMapData = payload
 
-	func _get(property):
-		if property == "ModMapData":
-			return _payload
+	func _get(_property):
+		reflection_used = true
 		return null
 
 func _ready():
@@ -46,7 +51,7 @@ func _ready():
 	var string_record = certifier.probe_map_data(FakeGlobalWithData.new("not-a-dictionary"))
 	var string_ok = (
 		string_record.available
-		and string_record.discovery == "property_list"
+		and string_record.discovery == "direct_member"
 		and not string_record.is_dictionary
 		and string_record.reason == "map_data_not_dictionary")
 	all_ok = all_ok and string_ok
@@ -112,22 +117,20 @@ func _ready():
 		and _deep_equal(short_source, short_snapshot))
 	all_ok = all_ok and malformed_ok
 
-	# Fix: the false-negative scenario. ModMapData is readable via a direct
-	# get() but is NOT enumerable via get_property_list() (e.g. a plain C#
-	# field). Availability must still be reported, with discovery flagged as
-	# "direct_get" rather than "property_list".
+	# Crash regression guard. Probing this host reflectively is what took
+	# Dungeondraft down; the probe must read the declared member directly and
+	# never reach the reflection handler at all.
 	var direct_only_source = {
 		"alpha": 1,
 		CertifierScript.DDAI_MAP_DATA_KEY: {"map_uuid": valid_uuid},
 	}
 	var direct_only_snapshot = direct_only_source.duplicate(true)
-	var direct_only_global = FakeGlobalDirectOnly.new(direct_only_source)
-	var property_list_blind = not certifier._has_readable_property(direct_only_global, "ModMapData")
+	var direct_only_global = FakeGlobalHostileReflection.new(direct_only_source)
 	var direct_only_record = certifier.probe_map_data(direct_only_global)
 	var direct_only_ok = (
-		property_list_blind
+		not direct_only_global.reflection_used
 		and direct_only_record.available
-		and direct_only_record.discovery == "direct_get"
+		and direct_only_record.discovery == "direct_member"
 		and direct_only_record.ddai_key_present
 		and direct_only_record.foreign_key_count == 1
 		and _deep_equal(direct_only_source, direct_only_snapshot))
@@ -147,7 +150,7 @@ func _ready():
 	print("DDAI_MAP_IDENTITY_DDAI_KEY_COUNTED:" + str(with_key_ok))
 	print("DDAI_MAP_IDENTITY_STRING_OWNED_INVALID:" + str(string_owned_ok))
 	print("DDAI_MAP_IDENTITY_MALFORMED_UUID_REJECTED:" + str(malformed_ok))
-	print("DDAI_MAP_IDENTITY_DIRECT_GET_DISCOVERY:" + str(direct_only_ok))
+	print("DDAI_MAP_IDENTITY_NO_HOST_REFLECTION:" + str(direct_only_ok))
 	print("DDAI_MAP_IDENTITY_READ_ONLY:" + str(read_only))
 	get_tree().quit(0 if all_ok and read_only else 1)
 

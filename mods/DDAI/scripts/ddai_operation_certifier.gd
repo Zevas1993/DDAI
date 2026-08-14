@@ -141,21 +141,23 @@ func probe_map_data(global_object):
 	}
 	if global_object == null:
 		return record
-	var via_property_list = _has_readable_property(global_object, "ModMapData")
-	# get_property_list() only enumerates registered/script properties. A host
-	# that exposes ModMapData as a plain field (e.g. a C# field, not a
-	# registered Godot property) can still answer a direct get() without ever
-	# appearing there. Godot 3's Object.get() returns null for a missing
-	# property rather than throwing, so this direct attempt is safe even when
-	# the property does not exist at all. Report availability if EITHER
-	# signal succeeds so a host using only one of the two is not mistaken for
-	# absent.
-	var data = global_object.get("ModMapData")
-	var via_direct_get = data != null
-	if not via_property_list and not via_direct_get:
+	# Direct member access only, and deliberately no reflection of any kind.
+	#
+	# An earlier revision probed the host with property-list reflection and with a
+	# name-based Object lookup. Running it live against Dungeondraft 1.2.0.1 took the
+	# application down: the crash dump showed a four-frame GDScript interpreter cycle
+	# repeating until stack exhaustion (access violation c0000005). Both of those calls
+	# can reach a host-defined reflection handler, and which one recursed was never
+	# isolated, so neither is used here.
+	#
+	# Direct member access is the one pattern with positive evidence on this exact
+	# allowlisted build: the shipping Lievven.Snappy_Mod reads Global.ModMapData the
+	# same way. The connector already refuses to run against any other executable hash.
+	var data = global_object.ModMapData
+	if data == null:
 		return record
 	record.available = true
-	record.discovery = "property_list" if via_property_list else "direct_get"
+	record.discovery = "direct_member"
 	if typeof(data) != TYPE_DICTIONARY:
 		record.reason = "map_data_not_dictionary"
 		return record
