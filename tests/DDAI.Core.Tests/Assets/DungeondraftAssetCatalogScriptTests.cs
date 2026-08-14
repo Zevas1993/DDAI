@@ -33,7 +33,7 @@ public sealed class DungeondraftAssetCatalogScriptTests
         var repositoryRoot = FindRepositoryRoot();
         var godotPath = Path.Combine(
             repositoryRoot,
-            "artifacts", "rectangular-room", "tooling", "godot-3.5.3",
+            "tools", "godot-3.5.3",
             "Godot_v3.5.3-stable_win64.exe");
         Assert.True(
             File.Exists(godotPath),

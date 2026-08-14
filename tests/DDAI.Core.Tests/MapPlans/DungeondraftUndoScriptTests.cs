@@ -21,7 +21,7 @@ public sealed class DungeondraftUndoScriptTests
     public async Task ExactGodot353ReversesOnlyTheBoundCompletedJobAndRejectsInterveningEdits()
     {
         var repositoryRoot = FindRepositoryRoot();
-        var godot = Path.Combine(repositoryRoot, "artifacts", "rectangular-room", "tooling", "godot-3.5.3", "Godot_v3.5.3-stable_win64.exe");
+        var godot = Path.Combine(repositoryRoot, "tools", "godot-3.5.3", "Godot_v3.5.3-stable_win64.exe");
         var fixture = Path.Combine(repositoryRoot, "tests", "DDAI.Core.Tests", "MapPlans", "GodotFixtures", "UniversalPlanExecutor");
         var temporaryRoot = Path.Combine(Path.GetTempPath(), "ddai-undo-godot-" + Guid.NewGuid().ToString("N"));
         var userDataRoot = Path.Combine(Path.GetTempPath(), "ddai-undo-user-" + Guid.NewGuid().ToString("N"));

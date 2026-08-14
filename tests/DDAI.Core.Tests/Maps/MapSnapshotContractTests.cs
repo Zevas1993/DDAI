@@ -289,11 +289,12 @@ public sealed class MapSnapshotContractTests
         var repositoryRoot = FindRepositoryRoot();
         var godotPath = Path.Combine(
             repositoryRoot,
-            "artifacts", "rectangular-room", "tooling", "godot-3.5.3",
+            "tools", "godot-3.5.3",
             "Godot_v3.5.3-stable_win64.exe");
         Assert.True(File.Exists(godotPath), $"Pinned Godot 3.5.3 runtime not found: {godotPath}");
 
-        var fixtureRoot = Path.Combine(repositoryRoot, "artifacts", "rectangular-room", "parser-harness");
+        var fixtureRoot = Path.Combine(
+            repositoryRoot, "tests", "DDAI.Core.Tests", "Maps", "GodotFixtures", "ParserHarness");
         var temporaryRoot = Path.Combine(Path.GetTempPath(), "ddai-map-parser-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(temporaryRoot);
         try
@@ -352,7 +353,7 @@ public sealed class MapSnapshotContractTests
         var repositoryRoot = FindRepositoryRoot();
         var godotPath = Path.Combine(
             repositoryRoot,
-            "artifacts", "rectangular-room", "tooling", "godot-3.5.3",
+            "tools", "godot-3.5.3",
             "Godot_v3.5.3-stable_win64.exe");
         Assert.True(File.Exists(godotPath), $"Pinned Godot 3.5.3 runtime not found: {godotPath}");
 
