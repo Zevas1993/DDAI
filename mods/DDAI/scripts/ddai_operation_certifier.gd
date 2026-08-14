@@ -132,32 +132,50 @@ func _reason(version_matches, probe, runtime_certified):
 func probe_map_data(global_object):
 	var record = {
 		"available": false,
+		"discovery": "none",
 		"is_dictionary": false,
 		"ddai_key_present": false,
 		"stored_uuid_valid": false,
 		"foreign_key_count": 0,
 		"reason": "map_data_unavailable",
 	}
-	if global_object == null or not _has_readable_property(global_object, "ModMapData"):
+	if global_object == null:
 		return record
+	var via_property_list = _has_readable_property(global_object, "ModMapData")
+	# get_property_list() only enumerates registered/script properties. A host
+	# that exposes ModMapData as a plain field (e.g. a C# field, not a
+	# registered Godot property) can still answer a direct get() without ever
+	# appearing there. Godot 3's Object.get() returns null for a missing
+	# property rather than throwing, so this direct attempt is safe even when
+	# the property does not exist at all. Report availability if EITHER
+	# signal succeeds so a host using only one of the two is not mistaken for
+	# absent.
 	var data = global_object.get("ModMapData")
+	var via_direct_get = data != null
+	if not via_property_list and not via_direct_get:
+		return record
 	record.available = true
+	record.discovery = "property_list" if via_property_list else "direct_get"
 	if typeof(data) != TYPE_DICTIONARY:
 		record.reason = "map_data_not_dictionary"
 		return record
 	record.is_dictionary = true
-	record.foreign_key_count = data.keys().size()
+	# Keys NOT owned by DDAI: total key count minus DDAI's own key, when present.
+	record.foreign_key_count = data.size()
 	if data.has(DDAI_MAP_DATA_KEY):
 		record.ddai_key_present = true
 		record.foreign_key_count = max(0, record.foreign_key_count - 1)
 		var owned = data[DDAI_MAP_DATA_KEY]
-		if typeof(owned) == TYPE_DICTIONARY and _is_valid_uuid(owned.get("map_uuid", null)):
+		if typeof(owned) == TYPE_DICTIONARY and _is_sha256(owned.get("map_uuid", null)):
 			record.stored_uuid_valid = true
 	record.reason = "map_data_present"
 	return record
 
 
-func _is_valid_uuid(value):
+# ddai_bridge.gd (around line 2749) defines an equivalent _is_sha256. The two
+# mod scripts are loaded independently by Dungeondraft, so this is a
+# deliberate duplication rather than a shared utility.
+func _is_sha256(value):
 	if typeof(value) != TYPE_STRING or value.length() != 64:
 		return false
 	for index in range(64):
