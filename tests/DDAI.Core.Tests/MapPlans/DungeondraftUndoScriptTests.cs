@@ -29,7 +29,12 @@ public sealed class DungeondraftUndoScriptTests
         Directory.CreateDirectory(userDataRoot);
         try
         {
-            File.Copy(Path.Combine(repositoryRoot, "mods", "DDAI", "scripts", "ddai_bridge.gd"), Path.Combine(temporaryRoot, "ddai_bridge.gd"));
+            // The bridge loads the certifier from its own directory when reporting status, so the
+            // harness must supply it too or Godot writes a resource-load error to stderr.
+            foreach (var script in new[] { "ddai_bridge.gd", "ddai_operation_certifier.gd" })
+            {
+                File.Copy(Path.Combine(repositoryRoot, "mods", "DDAI", "scripts", script), Path.Combine(temporaryRoot, script));
+            }
             foreach (var name in new[] { "project.godot", "main.tscn", "global.gd", "main.gd" })
             {
                 File.Copy(Path.Combine(fixture, name), Path.Combine(temporaryRoot, name));

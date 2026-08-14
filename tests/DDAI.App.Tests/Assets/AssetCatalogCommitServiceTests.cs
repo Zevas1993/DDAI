@@ -305,7 +305,9 @@ public sealed class AssetCatalogCommitServiceTests
         public string QuarantineRoot { get; }
         public FixedTimeProvider TimeProvider { get; }
 
-        public StagedRequest Stage(string sessionId, string assetHash)
+        public StagedRequest Stage(string sessionId, string assetHash) => StageCore(sessionId, assetHash, persist: true);
+
+        private StagedRequest StageCore(string sessionId, string assetHash, bool persist)
         {
             var entry = new AssetCatalogEntry(
                 "sha256:" + assetHash,
@@ -336,22 +338,34 @@ public sealed class AssetCatalogCommitServiceTests
             var manifestText = AssetCatalogJson.SerializeManifest(manifest);
             var candidateFingerprint = Hash(Encoding.UTF8.GetBytes(manifestText));
             var candidateRoot = Path.Combine(Root, "private", "catalog-commit", "candidates", candidateFingerprint);
-            Directory.CreateDirectory(candidateRoot);
-            File.WriteAllText(Path.Combine(candidateRoot, "chunk-0000.json"), chunkText);
-            File.WriteAllText(Path.Combine(candidateRoot, "manifest.json"), manifestText);
-            return WriteRequest(sessionId, manifest.SnapshotAt, candidateFingerprint, candidateRoot, indented: false);
+            if (persist)
+            {
+                Directory.CreateDirectory(candidateRoot);
+                File.WriteAllText(Path.Combine(candidateRoot, "chunk-0000.json"), chunkText);
+                File.WriteAllText(Path.Combine(candidateRoot, "manifest.json"), manifestText);
+            }
+
+            return WriteRequest(sessionId, manifest.SnapshotAt, candidateFingerprint, candidateRoot, indented: false, persist);
         }
 
         public StagedRequest StageRequestForExistingCandidate(StagedRequest existing, bool indented) =>
             WriteRequest(existing.SessionId, existing.SnapshotAt, existing.CandidateFingerprint, existing.CandidateRoot, indented);
 
+        // Probes the request id without writing anything, then stages only the match. Writing a
+        // request file per attempt and deleting the misses left pending-delete directory entries
+        // that EnumerateFiles still returned, so ghost requests displaced real ones from the
+        // service's bounded per-pass window and vanished before they could be opened.
         public StagedRequest StageWithRequestIdPrefix(string prefix, string assetHash)
         {
             for (var index = 0; index < 10_000; index++)
             {
-                var request = Stage("session-valid-" + index, assetHash);
-                if (request.RequestId.StartsWith(prefix, StringComparison.Ordinal)) return request;
-                File.Delete(RequestPath(request));
+                var sessionId = "session-valid-" + index;
+                if (!StageCore(sessionId, assetHash, persist: false).RequestId.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                return StageCore(sessionId, assetHash, persist: true);
             }
             throw new InvalidOperationException("Could not produce the requested deterministic request hash prefix.");
         }
@@ -403,7 +417,8 @@ public sealed class AssetCatalogCommitServiceTests
             DateTimeOffset snapshotAt,
             string candidateFingerprint,
             string candidateRoot,
-            bool indented)
+            bool indented,
+            bool persist = true)
         {
             var options = AssetCatalogJson.SerializerOptions;
             options.WriteIndented = indented;
@@ -416,7 +431,11 @@ public sealed class AssetCatalogCommitServiceTests
             }, options);
             var requestId = Hash(bytes);
             var request = new StagedRequest(requestId, requestId, candidateFingerprint, candidateRoot, sessionId, snapshotAt, bytes);
-            File.WriteAllBytes(RequestPath(request), bytes);
+            if (persist)
+            {
+                File.WriteAllBytes(RequestPath(request), bytes);
+            }
+
             return request;
         }
     }

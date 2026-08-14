@@ -89,9 +89,12 @@ internal sealed class SafeLocalFileSystem
     {
         RequireBeneath(root, directory);
         RequireOrdinaryDirectory(directory);
+        // Order before bounding. Taking first would select an arbitrary filesystem-ordered subset
+        // and only then sort it, so which candidates a caller sees would vary run to run once a
+        // directory held more than maximumCandidates entries.
         var files = Directory.EnumerateFiles(directory, pattern, SearchOption.TopDirectoryOnly)
-            .Take(maximumCandidates)
             .Order(StringComparer.Ordinal)
+            .Take(maximumCandidates)
             .ToArray();
         RequireOrdinaryDirectory(directory);
         return files;
@@ -405,10 +408,17 @@ internal sealed class SafeLocalFileSystem
     {
         var nameBytes = Encoding.Unicode.GetBytes(destinationPath);
         var headerSize = IntPtr.Size == 8 ? 20 : 12;
-        var buffer = Marshal.AllocHGlobal(headerSize + nameBytes.Length);
+
+        // FILE_RENAME_INFO.FileName must be NUL-terminated and FileNameLength counts only the
+        // name itself. Allocating without room for the terminator let the kernel read past the
+        // buffer, so entries were renamed to their intended name with adjacent process memory
+        // appended. The rename then "succeeded" at a path that did not exist, and callers saw a
+        // spurious failure for work that had actually completed.
+        var bufferSize = headerSize + nameBytes.Length + sizeof(char);
+        var buffer = Marshal.AllocHGlobal(bufferSize);
         try
         {
-            for (var index = 0; index < headerSize + nameBytes.Length; index++)
+            for (var index = 0; index < bufferSize; index++)
             {
                 Marshal.WriteByte(buffer, index, 0);
             }
@@ -420,7 +430,7 @@ internal sealed class SafeLocalFileSystem
                     source,
                     FileInfoByHandleClass.FileRenameInfo,
                     buffer,
-                    (uint)(headerSize + nameBytes.Length)))
+                    (uint)bufferSize))
             {
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "A private entry could not be quarantined by handle.");
             }

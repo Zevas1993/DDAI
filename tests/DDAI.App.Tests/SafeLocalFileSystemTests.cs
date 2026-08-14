@@ -21,6 +21,34 @@ public sealed class SafeLocalFileSystemTests
     }
 
     [Fact]
+    public void QuarantineOrdinaryOrDeleteLink_RenamesToTheExactRequestedNameWithoutTrailingMemory()
+    {
+        using var sandbox = new FileSystemSandbox();
+        var fileSystem = new SafeLocalFileSystem(sandbox.Root);
+        var requests = fileSystem.EnsureDirectory("private", "requests");
+        var quarantine = fileSystem.EnsureDirectory("private", "quarantine");
+
+        // FILE_RENAME_INFO.FileName must be NUL-terminated. With no room for the terminator the
+        // kernel appended adjacent process memory to the name, so entries landed under a path the
+        // caller never requested and the caller's own verification of that path then failed. A
+        // single rename can get lucky when the neighbouring bytes happen to be zero; a batch does
+        // not, so this quarantines enough entries to make the corruption reliably visible.
+        for (var index = 0; index < 32; index++)
+        {
+            var path = Path.Combine(requests, "request-" + index.ToString("D2") + ".json");
+            File.WriteAllText(path, "{}");
+            fileSystem.QuarantineOrdinaryOrDeleteLink(path, quarantine);
+        }
+
+        var landed = Directory.GetFileSystemEntries(quarantine).Select(Path.GetFileName).ToArray();
+        Assert.Equal(32, landed.Length);
+        foreach (var entry in landed)
+        {
+            Assert.Matches(@"^request-\d{2}\.json\.[0-9a-f]{32}\.invalid$", entry!);
+        }
+    }
+
+    [Fact]
     public void WriteImmutable_HoldsParentAgainstConcurrentSwap()
     {
         using var sandbox = new FileSystemSandbox();
