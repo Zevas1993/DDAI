@@ -60,6 +60,7 @@ var _processing_claim_cursor = 0
 var _certified_operation_executors = {}
 var _runtime_certified_operation_types = ["wall_polyline"]
 var _operation_certifications = []
+var _map_data_probe = {}
 var _asset_list_provider = null
 var _texture_loader = null
 
@@ -3631,6 +3632,7 @@ func _status_payload():
 		"level_ids": _current_level_ids(),
 		"certified_operation_types": _certified_operation_types(),
 		"operation_certifications": _operation_certifications.duplicate(true),
+		"map_data_probe": _map_data_probe.duplicate(true),
 		"active_mods": [],
 		"active_mods_available": false,
 		"supported_commands": SUPPORTED_COMMANDS,
@@ -3655,6 +3657,8 @@ func _certify_operation_routes():
 	var certifier = certifier_script.new()
 	if certifier == null or not certifier.has_method("certify_runtime"):
 		return []
+	if certifier.has_method("probe_map_data"):
+		_map_data_probe = certifier.probe_map_data(Global)
 	return certifier.certify_runtime(
 		Global.Editor,
 		Global.World,

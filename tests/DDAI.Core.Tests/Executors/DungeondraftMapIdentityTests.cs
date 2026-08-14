@@ -120,10 +120,47 @@ public sealed class DungeondraftMapIdentityTests
         }
     }
 
+    [Fact]
+    public void CertifyOperationRoutesCapturesMapDataProbeGuardedByHasMethod()
+    {
+        var bridge = ReadBridge();
+        var certifyRoutes = FunctionBody(bridge, "_certify_operation_routes");
+
+        // The certifier instance must be asked for the map-data probe before
+        // _certify_operation_routes returns, guarded by has_method so bridges
+        // paired with an older certifier script (no probe_map_data) do not
+        // crash on a missing method.
+        Assert.Matches(
+            @"if\s+certifier\.has_method\(""probe_map_data""\)\s*:\s*\n\s*_map_data_probe\s*=\s*certifier\.probe_map_data\(Global\)",
+            certifyRoutes);
+
+        Assert.Contains("var _map_data_probe = {}", bridge, StringComparison.Ordinal);
+        Assert.Contains("\"map_data_probe\": _map_data_probe.duplicate(true),", bridge, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void MapDataProbeStateIsNeverFabricatedWithADefaultRecord()
+    {
+        var bridge = ReadBridge();
+
+        // _map_data_probe must start empty. An empty dictionary means "the
+        // probe did not run" -- a different fact from "the probe ran and
+        // found nothing" -- so no fallback dictionary containing a literal
+        // "available": false may ever be assigned to it.
+        Assert.Contains("var _map_data_probe = {}", bridge, StringComparison.Ordinal);
+        Assert.DoesNotMatch(@"_map_data_probe\s*=\s*\{[^}]*""available""\s*:\s*false", bridge);
+    }
+
     private static string ReadCertifier()
     {
         var root = FindRepositoryRoot();
         return File.ReadAllText(Path.Combine(root, "mods", "DDAI", "scripts", "ddai_operation_certifier.gd"));
+    }
+
+    private static string ReadBridge()
+    {
+        var root = FindRepositoryRoot();
+        return File.ReadAllText(Path.Combine(root, "mods", "DDAI", "scripts", "ddai_bridge.gd"));
     }
 
     private static string FunctionBody(string script, string name)
