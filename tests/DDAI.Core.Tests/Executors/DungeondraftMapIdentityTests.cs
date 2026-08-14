@@ -121,34 +121,59 @@ public sealed class DungeondraftMapIdentityTests
     }
 
     [Fact]
-    public void CertifyOperationRoutesCapturesMapDataProbeGuardedByHasMethod()
+    public void CertifyOperationRoutesDoesNotCaptureMapDataProbe()
     {
         var bridge = ReadBridge();
         var certifyRoutes = FunctionBody(bridge, "_certify_operation_routes");
 
-        // The certifier instance must be asked for the map-data probe before
-        // _certify_operation_routes returns, guarded by has_method so bridges
-        // paired with an older certifier script (no probe_map_data) do not
-        // crash on a missing method.
-        Assert.Matches(
-            @"if\s+certifier\.has_method\(""probe_map_data""\)\s*:\s*\n\s*_map_data_probe\s*=\s*certifier\.probe_map_data\(Global\)",
-            certifyRoutes);
-
-        Assert.Contains("var _map_data_probe = {}", bridge, StringComparison.Ordinal);
-        Assert.Contains("\"map_data_probe\": _map_data_probe.duplicate(true),", bridge, StringComparison.Ordinal);
+        // _certify_operation_routes() runs exactly once per mod load, from
+        // start() -- not once per status call. ModMapData is per-map state:
+        // start() can run before any map is open, or against a different map
+        // than the one currently open. Capturing the probe here would freeze
+        // a pre-map or wrong-map reading for the entire process lifetime, so
+        // this function must not reference probe_map_data at all -- the
+        // probe belongs at status time (see
+        // StatusPayloadComputesMapDataProbeFreshOnEveryCall below).
+        Assert.DoesNotContain("probe_map_data", certifyRoutes, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void MapDataProbeStateIsNeverFabricatedWithADefaultRecord()
+    public void StatusPayloadComputesMapDataProbeFreshOnEveryCall()
     {
         var bridge = ReadBridge();
+        var statusPayload = FunctionBody(bridge, "_status_payload");
 
-        // _map_data_probe must start empty. An empty dictionary means "the
-        // probe did not run" -- a different fact from "the probe ran and
-        // found nothing" -- so no fallback dictionary containing a literal
-        // "available": false may ever be assigned to it.
-        Assert.Contains("var _map_data_probe = {}", bridge, StringComparison.Ordinal);
-        Assert.DoesNotMatch(@"_map_data_probe\s*=\s*\{[^}]*""available""\s*:\s*false", bridge);
+        // The probe must be recomputed on every status call, exactly like
+        // map_id/dimensions/level_ids are computed via function calls in the
+        // same returned dictionary rather than read from a field cached once
+        // at mod load. Asserting a direct call here (not a duplicate() of a
+        // stored field) is what would catch a regression back to the
+        // capture-once-at-start bug.
+        Assert.Contains("\"map_data_probe\": _current_map_data_probe(),", statusPayload, StringComparison.Ordinal);
+
+        var probeFunction = FunctionBody(bridge, "_current_map_data_probe");
+        Assert.Contains("has_method(\"probe_map_data\")", probeFunction, StringComparison.Ordinal);
+        Assert.Contains("certifier.probe_map_data(Global)", probeFunction, StringComparison.Ordinal);
+
+        // Every failure path (script fails to load, certifier fails to
+        // instantiate, or an older certifier lacking probe_map_data) must
+        // return an empty dictionary -- never a fabricated "available: false"
+        // record -- because {} means "the probe did not run", a different
+        // fact from "the probe ran and found nothing". Scanning the whole
+        // function body (rather than matching only a direct
+        // "_map_data_probe = {...}" assignment, as an earlier version of
+        // this test did) also catches a two-step fabrication such as
+        // "var default_record = {\"available\": false, ...}" followed by
+        // "return default_record". This still would not catch a fabricated
+        // record built in a *different* function and merely called from
+        // here; guarding against that is left as a known residual gap rather
+        // than contorting a source-text test further.
+        Assert.DoesNotMatch(@"""available""\s*:\s*false", probeFunction);
+        Assert.Contains("return {}", probeFunction, StringComparison.Ordinal);
+
+        // No stale cached field should linger now that the probe is computed
+        // fresh on every call instead of once at mod load.
+        Assert.DoesNotContain("var _map_data_probe", bridge, StringComparison.Ordinal);
     }
 
     private static string ReadCertifier()

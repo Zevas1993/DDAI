@@ -60,7 +60,6 @@ var _processing_claim_cursor = 0
 var _certified_operation_executors = {}
 var _runtime_certified_operation_types = ["wall_polyline"]
 var _operation_certifications = []
-var _map_data_probe = {}
 var _asset_list_provider = null
 var _texture_loader = null
 
@@ -3632,7 +3631,17 @@ func _status_payload():
 		"level_ids": _current_level_ids(),
 		"certified_operation_types": _certified_operation_types(),
 		"operation_certifications": _operation_certifications.duplicate(true),
-		"map_data_probe": _map_data_probe.duplicate(true),
+		# ModMapData is per-map state, so the probe must be recomputed on every
+		# status call (like map_id/dimensions/level_ids above), not captured
+		# once in _certify_operation_routes()/start(). start() can run before
+		# any map is open or against a different map than the one now open; a
+		# reading frozen at mod-load would then falsely report the current
+		# map's state for the rest of the process lifetime. The .NET side
+		# passes unknown payload keys through unfiltered (see
+		# src/DDAI.App/DdaiStatusService.cs:59, which clones response.Payload
+		# verbatim rather than deserializing into a whitelisted DTO), so no
+		# further plumbing is needed for this key to reach ddai_status.
+		"map_data_probe": _current_map_data_probe(),
 		"active_mods": [],
 		"active_mods_available": false,
 		"supported_commands": SUPPORTED_COMMANDS,
@@ -3657,14 +3666,28 @@ func _certify_operation_routes():
 	var certifier = certifier_script.new()
 	if certifier == null or not certifier.has_method("certify_runtime"):
 		return []
-	if certifier.has_method("probe_map_data"):
-		_map_data_probe = certifier.probe_map_data(Global)
 	return certifier.certify_runtime(
 		Global.Editor,
 		Global.World,
 		Global.WorldUI,
 		_runtime_identity(),
 		_certified_operation_types())
+
+
+# Recomputed on every status call rather than cached, because ModMapData is
+# per-map state: _certify_operation_routes() above runs once per mod load
+# (from start()), which can happen before any map is open or against a
+# different map than the one now open. Caching the probe there would freeze
+# a stale or pre-map reading for the entire process lifetime.
+func _current_map_data_probe():
+	var script_path = Global.Root + "scripts/ddai_operation_certifier.gd" if str(Global.Root).length() > 0 else "res://ddai_operation_certifier.gd"
+	var certifier_script = load(script_path)
+	if certifier_script == null:
+		return {}
+	var certifier = certifier_script.new()
+	if certifier == null or not certifier.has_method("probe_map_data"):
+		return {}
+	return certifier.probe_map_data(Global)
 
 
 func _runtime_identity():
