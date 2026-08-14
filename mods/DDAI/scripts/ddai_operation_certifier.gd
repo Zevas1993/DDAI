@@ -4,6 +4,7 @@ var script_class = "tool"
 
 const TARGET_DUNGEONDRAFT_VERSION = "1.2.0.1"
 const TARGET_DUNGEONDRAFT_EXECUTABLE_SHA256 = "c14ddddbaada43610e763f73f0c2786983ca4440578acde0ac9668cda358af02"
+const DDAI_MAP_DATA_KEY = "org.ddai.status_bridge"
 const OPERATION_ROUTES = [
 	{"operation_type": "terrain_stroke", "tool_name": "TerrainBrush", "required_methods": ["SetBiome", "SetSize", "UpdateBrush"], "required_properties": ["IsPainting", "brush"], "level_property": "Terrain"},
 	{"operation_type": "pattern_region", "tool_name": "PatternShapeTool", "required_methods": [], "required_properties": ["Texture"], "level_property": "PatternShapes"},
@@ -126,3 +127,40 @@ func _reason(version_matches, probe, runtime_certified):
 	if not runtime_certified:
 		return "executor_not_live_certified"
 	return "tool_busy" if probe.busy else "runtime_certified"
+
+
+func probe_map_data(global_object):
+	var record = {
+		"available": false,
+		"is_dictionary": false,
+		"ddai_key_present": false,
+		"stored_uuid_valid": false,
+		"foreign_key_count": 0,
+		"reason": "map_data_unavailable",
+	}
+	if global_object == null or not _has_readable_property(global_object, "ModMapData"):
+		return record
+	var data = global_object.get("ModMapData")
+	record.available = true
+	if typeof(data) != TYPE_DICTIONARY:
+		record.reason = "map_data_not_dictionary"
+		return record
+	record.is_dictionary = true
+	record.foreign_key_count = data.keys().size()
+	if data.has(DDAI_MAP_DATA_KEY):
+		record.ddai_key_present = true
+		record.foreign_key_count = max(0, record.foreign_key_count - 1)
+		var owned = data[DDAI_MAP_DATA_KEY]
+		if typeof(owned) == TYPE_DICTIONARY and _is_valid_uuid(owned.get("map_uuid", null)):
+			record.stored_uuid_valid = true
+	record.reason = "map_data_present"
+	return record
+
+
+func _is_valid_uuid(value):
+	if typeof(value) != TYPE_STRING or value.length() != 64:
+		return false
+	for index in range(64):
+		if "0123456789abcdef".find(value[index]) < 0:
+			return false
+	return true
