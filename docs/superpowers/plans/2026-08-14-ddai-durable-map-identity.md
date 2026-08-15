@@ -633,6 +633,36 @@ the remaining executors.
   the `Mesh` (`MaterialMesh`) object, which is undocumented. This is the same shape
   as terrain, which is already fail-closed pending a managed adapter.
 
+### Open blocker: activating a tool from a mod
+
+Live placement of `object_placement` fails at a single point and everything else
+downstream is already correct. Instrumenting the executor recorded:
+
+```json
+{"stage":"after_next","detail":{"was_active":null,"preview_null":true,"active_tool":"Null"}}
+```
+
+`Global.Editor.ActiveToolName` stays at the literal string `"Null"`, and `ObjectTool.Next()`
+therefore creates no preview, so the job is correctly reversed as unverifiable.
+
+Two activation routes were tried and neither worked:
+
+- `Tool.Enable()`, copied from the certified wall executor. Walls only appear to rely on
+  it; they actually drive `WorldUI.AddPolyPoint` plus `WallTool.EndWall`, which need no
+  active tool. It was the wrong template for tools that maintain a live preview.
+- `Editor.OnSelectTool("ObjectTool")` with `Editor.IsToolActive`, both documented on the
+  Editor reference. `IsToolActive` returned `null` rather than a bool, and `ActiveToolName`
+  did not change.
+
+Object, path and floor-shape executors are otherwise complete: they pass all seven
+validation gates, resolve assets, configure the tool, and restore prior state. Only the
+activation step is unresolved.
+
+Worth trying next, cheapest first: read `Global.Editor.Toolset` for a selection method;
+check whether `SuppressTool` or `EnableTools(bool)` gates selection; inspect the exact
+key strings in `Global.Editor.Tools` in case the selection name differs from the lookup
+key; and study a shipping third-party mod that places objects.
+
 ### Consequence for the remaining three
 
 Eleven of fourteen executors are implemented. The three that are not —
