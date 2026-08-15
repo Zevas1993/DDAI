@@ -1,7 +1,7 @@
 {
   "name": "DDAI Status Bridge",
   "unique_id": "org.ddai.status_bridge",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "author": "DDAI contributors",
   "description": "Local filesystem mailbox bridge with revision-locked universal map jobs, a bounded live asset catalog, and a test-gated native wall executor. No network listener.",
   "dd_version": "1.2.0.1"

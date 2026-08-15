@@ -63,7 +63,7 @@ public sealed class DungeondraftModInstallerTests
     {
         using var sandbox = new InstallerSandbox();
         Assert.Equal(0, RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory).ExitCode);
-        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow, "0.2.1");
+        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow, "0.3.0");
 
         var diagnosis = RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory, diagnose: true);
 
@@ -78,7 +78,7 @@ public sealed class DungeondraftModInstallerTests
     {
         using var sandbox = new InstallerSandbox();
         Assert.Equal(0, RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory).ExitCode);
-        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow.AddMinutes(-2), "0.2.1");
+        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow.AddMinutes(-2), "0.3.0");
 
         var diagnosis = RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory, diagnose: true);
 
@@ -93,7 +93,7 @@ public sealed class DungeondraftModInstallerTests
     {
         using var sandbox = new InstallerSandbox();
         Assert.Equal(0, RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory).ExitCode);
-        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow.AddMinutes(2), "0.2.1");
+        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow.AddMinutes(2), "0.3.0");
         var diagnosis = RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory, diagnose: true);
         Assert.True(diagnosis.ExitCode == 0, $"Diagnosis failed: {diagnosis.StandardOutput} {diagnosis.StandardError}");
         Assert.Equal("installed_not_observed", ReadJson(diagnosis.StandardOutput).GetProperty("state").GetString());
@@ -112,7 +112,7 @@ public sealed class DungeondraftModInstallerTests
             File.WriteAllText(legacy, "{ malformed");
             File.SetLastWriteTimeUtc(legacy, DateTime.UtcNow.AddMinutes(5));
         }
-        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow, "0.2.1");
+        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow, "0.3.0");
 
         var diagnosis = RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory, diagnose: true);
 
@@ -127,7 +127,7 @@ public sealed class DungeondraftModInstallerTests
     {
         using var sandbox = new InstallerSandbox();
         Assert.Equal(0, RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory).ExitCode);
-        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow, "0.2.1", schemaVersion: "2.0");
+        WriteHeartbeat(sandbox.UserDataDirectory, DateTimeOffset.UtcNow, "0.3.0", schemaVersion: "2.0");
 
         var diagnosis = RunInstaller(sandbox.RepositoryRoot, sandbox.ModsDirectory, sandbox.UserDataDirectory, diagnose: true);
 

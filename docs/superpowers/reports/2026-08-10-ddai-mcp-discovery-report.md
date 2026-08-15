@@ -110,7 +110,7 @@ Acceptance RED/GREEN history:
 - Files in publish directory: 1
 - Runtime: self-contained `win-x64`
 - Size: 87,047,866 bytes
-- SHA-256: `3a1b6dc48f83699f16a6bfaff80f105d0fd034b5713b9ed26bbf3945f7e3ebf2`
+- SHA-256: `66424558fbb77ee0be461225dc4df8a7f1be388ff8b43602ce9e7ad6969fca9d`
 
 One explicit `dotnet publish` invocation generated this retained executable after the final source state. Published-process acceptance never publishes or writes that directory: it resolves the existing path and rechecks path, one-file contents, size, and hash against the committed JSON receipt and this report before launch. A separate source-freshness test publishes current source only to a temporary directory and proves the retained artifact's hash and last-write time remain unchanged; no hash equality between separate publishes is assumed. The artifact directory is machine-local/ignored evidence and is not part of the source commit.
 

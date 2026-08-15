@@ -34,8 +34,8 @@ public sealed class DungeondraftModPackageTests
         var script = File.ReadAllText(Path.Combine(modRoot, "scripts", "ddai_bridge.gd"));
         var readme = File.ReadAllText(Path.Combine(modRoot, "README.md"));
 
-        Assert.Equal("0.2.1", manifest.RootElement.GetProperty("version").GetString());
-        Assert.Equal("0.2.1", ConstantValue(script, "MOD_VERSION"));
+        Assert.Equal("0.3.0", manifest.RootElement.GetProperty("version").GetString());
+        Assert.Equal("0.3.0", ConstantValue(script, "MOD_VERSION"));
         Assert.Contains("const SUPPORTED_COMMANDS = [\"status\", \"apply_plan\", \"inspect_map\", \"undo_last_job\"]", script, StringComparison.Ordinal);
         Assert.Contains("apply_plan", readme, StringComparison.Ordinal);
         Assert.Contains("native rectangular wall", readme, StringComparison.OrdinalIgnoreCase);

@@ -18,7 +18,7 @@ The screenshot warning was caused by a timestamped DDAI backup under the active 
 - Full Release Core suite: 426/426 passed.
 - Full Release App suite: 362/362 passed.
 - Release build: 0 warnings and 0 errors.
-- Canonical retained single-file artifact: `artifacts/task6/win-x64/ddai.exe`, 87,047,866 bytes, SHA-256 `3a1b6dc48f83699f16a6bfaff80f105d0fd034b5713b9ed26bbf3945f7e3ebf2`.
+- Canonical retained single-file artifact: `artifacts/task6/win-x64/ddai.exe`, 87,047,866 bytes, SHA-256 `66424558fbb77ee0be461225dc4df8a7f1be388ff8b43602ce9e7ad6969fca9d`.
 - Canonical nine-tool schema receipt: 60,265 bytes, SHA-256 `370b9905ccdba4fc9bdc8606811627cd650b438b62d155fb13004977289c4278`.
 - GitNexus: 50 changed symbols, 2 affected undo flows, medium risk; full suites are the controlling evidence.
 

@@ -50,7 +50,7 @@ public sealed class DdaiCapabilityService(
     TimeProvider timeProvider)
 {
     public const string ConnectorVersion = "0.1.0";
-    public const string ExpectedModVersion = "0.2.1";
+    public const string ExpectedModVersion = "0.3.0";
     public const string ExpectedDungeondraftVersion = "1.2.0.1";
     private static readonly string[] SchemaOperations =
     [

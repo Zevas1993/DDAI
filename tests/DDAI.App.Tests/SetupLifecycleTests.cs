@@ -543,7 +543,7 @@ public sealed class SetupLifecycleTests
         Directory.CreateDirectory(directory);
         File.WriteAllText(
             Path.Combine(directory, "heartbeat-slot-0.json"),
-            "{\"schema_version\":\"1.0\",\"mod_version\":\"0.2.1\",\"session_id\":\"session\",\"timestamp\":\"2026-08-09T12:00:00Z\"}");
+            "{\"schema_version\":\"1.0\",\"mod_version\":\"0.3.0\",\"session_id\":\"session\",\"timestamp\":\"2026-08-09T12:00:00Z\"}");
     }
 
     private static string ReadDdaiCommand(string path) =>

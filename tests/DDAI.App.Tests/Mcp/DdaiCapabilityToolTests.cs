@@ -36,7 +36,7 @@ public sealed class DdaiCapabilityToolTests
         var capabilities = sandbox.CreateService().GetCapabilities();
 
         Assert.Equal("0.1.0", capabilities.ConnectorVersion);
-        Assert.Equal("0.2.1", capabilities.ModVersion);
+        Assert.Equal("0.3.0", capabilities.ModVersion);
         Assert.Equal("1.2.0.1", capabilities.DungeondraftVersion);
         Assert.Equal("closed", capabilities.RuntimeState);
         Assert.Null(capabilities.MapRevision);
@@ -66,7 +66,7 @@ public sealed class DdaiCapabilityToolTests
     public void GetCapabilities_RejectsStaleAndMismatchedRuntimeReceipts()
     {
         using var sandbox = new CapabilitySandbox();
-        sandbox.WriteReceipt(sandbox.Now.AddSeconds(-31), "0.2.1", "1.2.0.1", ["status", "apply_plan"]);
+        sandbox.WriteReceipt(sandbox.Now.AddSeconds(-31), "0.3.0", "1.2.0.1", ["status", "apply_plan"]);
 
         var stale = sandbox.CreateService().GetCapabilities();
 
@@ -87,11 +87,11 @@ public sealed class DdaiCapabilityToolTests
         using var sandbox = new CapabilitySandbox();
         sandbox.WriteReceipt(
             sandbox.Now.AddMinutes(-10),
-            "0.2.1",
+            "0.3.0",
             "1.2.0.1",
             ["status", "apply_plan"],
             sessionId: "active-session");
-        sandbox.WriteHeartbeat(sandbox.Now, "0.2.1", "active-session");
+        sandbox.WriteHeartbeat(sandbox.Now, "0.3.0", "active-session");
 
         var live = sandbox.CreateService().GetCapabilities();
 
@@ -102,11 +102,11 @@ public sealed class DdaiCapabilityToolTests
             Assert.Equal("executor_not_live_certified", operation.Reason);
         });
 
-        sandbox.WriteHeartbeat(sandbox.Now, "0.2.1", "different-session");
+        sandbox.WriteHeartbeat(sandbox.Now, "0.3.0", "different-session");
         var mismatched = sandbox.CreateService().GetCapabilities();
         Assert.Equal("stale", mismatched.RuntimeState);
 
-        sandbox.WriteHeartbeat(sandbox.Now.AddSeconds(-31), "0.2.1", "active-session");
+        sandbox.WriteHeartbeat(sandbox.Now.AddSeconds(-31), "0.3.0", "active-session");
         var stale = sandbox.CreateService().GetCapabilities();
         Assert.Equal("stale", stale.RuntimeState);
     }
@@ -117,7 +117,7 @@ public sealed class DdaiCapabilityToolTests
         using var sandbox = new CapabilitySandbox();
         sandbox.WriteReceipt(
             sandbox.Now.AddMinutes(-10),
-            "0.2.1",
+            "0.3.0",
             "1.2.0.1",
             ["status", "apply_plan"],
             sessionId: "active-session");
@@ -126,7 +126,7 @@ public sealed class DdaiCapabilityToolTests
         Directory.CreateDirectory(external);
         try
         {
-            CapabilitySandbox.WriteHeartbeatFile(external, sandbox.Now, "0.2.1", "active-session");
+            CapabilitySandbox.WriteHeartbeatFile(external, sandbox.Now, "0.3.0", "active-session");
             CreateDirectoryJunction(junction, external);
 
             var capabilities = sandbox.CreateService().GetCapabilities();
@@ -147,7 +147,7 @@ public sealed class DdaiCapabilityToolTests
         using var sandbox = new CapabilitySandbox();
         sandbox.WriteReceipt(
             sandbox.Now,
-            "0.2.1",
+            "0.3.0",
             "1.2.0.1",
             ["status", "apply_plan", "inspect_map"],
             certifications:
@@ -181,7 +181,7 @@ public sealed class DdaiCapabilityToolTests
         using var sandbox = new CapabilitySandbox();
         sandbox.WriteReceipt(
             sandbox.Now,
-            "0.2.1",
+            "0.3.0",
             "1.2.0.1",
             ["status", "apply_plan", "inspect_map"],
             certifications:
@@ -201,7 +201,7 @@ public sealed class DdaiCapabilityToolTests
         using var sandbox = new CapabilitySandbox();
         sandbox.WriteReceipt(
             sandbox.Now,
-            "0.2.1",
+            "0.3.0",
             "1.2.0.1",
             ["status", "apply_plan", "inspect_map"],
             certifications: [],
@@ -210,7 +210,7 @@ public sealed class DdaiCapabilityToolTests
 
         sandbox.WriteReceipt(
             sandbox.Now,
-            "0.2.1",
+            "0.3.0",
             "1.2.0.1",
             ["status", "apply_plan", "inspect_map"],
             certifications: [Certification("wall_polyline", "WallTool", true, false, true, "runtime_certified")],
@@ -243,7 +243,7 @@ public sealed class DdaiCapabilityToolTests
         using var sandbox = new CapabilitySandbox();
         sandbox.WriteReceipt(
             sandbox.Now,
-            "0.2.1",
+            "0.3.0",
             "1.2.0.1",
             ["status", "apply_plan", "inspect_map"],
             certifications:
@@ -262,7 +262,7 @@ public sealed class DdaiCapabilityToolTests
 
         sandbox.WriteReceipt(
             sandbox.Now,
-            "0.2.1",
+            "0.3.0",
             "1.2.0.1",
             ["status", "apply_plan", "inspect_map"],
             certifications:
@@ -310,7 +310,7 @@ public sealed class DdaiCapabilityToolTests
         using var sandbox = new CapabilitySandbox();
         sandbox.WriteReceipt(
             sandbox.Now,
-            "0.2.1",
+            "0.3.0",
             "1.2.0.1",
             ["status", "apply_plan", "inspect_map"],
             "1723377600-1000",
@@ -318,7 +318,7 @@ public sealed class DdaiCapabilityToolTests
             certifications: [Certification("wall_polyline", "WallTool", true, false, false, "executor_not_live_certified")]);
         sandbox.WriteReceipt(
             sandbox.Now,
-            "0.2.1",
+            "0.3.0",
             "1.2.0.1",
             ["status", "apply_plan", "inspect_map"],
             "1723377600-1001",
@@ -460,7 +460,7 @@ public sealed class DdaiCapabilityToolTests
         {
             schema_version = "1.0",
             @event = "started",
-            mod_version = "0.2.1",
+            mod_version = "0.3.0",
             target_dungeondraft_version = "1.2.0.1",
             timestamp = Now.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture),
             session_id = "test-session",
