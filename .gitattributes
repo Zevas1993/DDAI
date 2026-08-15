@@ -1,0 +1,15 @@
+# The repository stores and checks out LF. Without this, core.autocrlf=true
+# rewrites the working tree to CRLF on checkout, which breaks the static tests
+# that assert on multi-line substrings of the GDScript sources.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending converted.
+*.png binary
+*.jpg binary
+*.exe binary
+*.dll binary
+*.zip binary
+*.pck binary
+*.dmp binary
+*.dungeondraft_map binary
+*.dungeondraft_pack binary
