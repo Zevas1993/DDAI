@@ -628,6 +628,19 @@ the remaining executors.
 - **LightTool documents no placement call.** `preview` is marked "DO NOT MODIFY" and
   no Confirm or Record is exposed, so the placement route must be discovered live
   before `light_placement` can be implemented honestly.
+- **MaterialBrush documents no paint call.** It exposes `SetMaterial`, `SetLayer`,
+  `SetSmooth`, `Size` and `UpdateBrushRadius`, but the mutation itself runs through
+  the `Mesh` (`MaterialMesh`) object, which is undocumented. This is the same shape
+  as terrain, which is already fail-closed pending a managed adapter.
+
+### Consequence for the remaining three
+
+Eleven of fourteen executors are implemented. The three that are not —
+`portal_placement`, `light_placement` and `material_stroke` — each lack a documented
+mutation route, and one may be barred outright by the language boundary. None can be
+written honestly from the reference alone; each needs a live read-only discovery pass
+against the allowlisted build first. Estimating them as ordinary coding work would be
+wrong.
 
 ## Success criteria
 
