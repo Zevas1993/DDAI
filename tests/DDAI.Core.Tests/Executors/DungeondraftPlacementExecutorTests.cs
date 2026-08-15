@@ -80,6 +80,62 @@ public sealed class DungeondraftPlacementExecutorTests
             StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void PathPolylineUsesTheDocumentedPathToolAndPathwayRoute()
+    {
+        var body = FunctionBody(ReadBridge(), "_execute_path_polyline");
+
+        Assert.Contains("path_tool.Texture = texture", body, StringComparison.Ordinal);
+        Assert.Contains("path_tool.Width", body, StringComparison.Ordinal);
+        Assert.Contains("path_tool.Smoothness", body, StringComparison.Ordinal);
+        Assert.Contains("path_tool.SetLayer(", body, StringComparison.Ordinal);
+        Assert.Contains("path_tool.SetSorting(", body, StringComparison.Ordinal);
+        Assert.Contains("path_tool.SetFadeIn(", body, StringComparison.Ordinal);
+        Assert.Contains("path_tool.SetFadeOut(", body, StringComparison.Ordinal);
+
+        // Points are set on the active Pathway in world space, then Smooth()
+        // regenerates the visual, then the path is ended with the loop flag.
+        Assert.Contains("path_tool.StartPath()", body, StringComparison.Ordinal);
+        Assert.Contains("path_tool.ActivePath", body, StringComparison.Ordinal);
+        Assert.Contains("SetEditPoints(", body, StringComparison.Ordinal);
+        Assert.Contains("Smooth()", body, StringComparison.Ordinal);
+        Assert.Contains("path_tool.EndPath(", body, StringComparison.Ordinal);
+
+        Assert.True(
+            body.IndexOf("path_tool.StartPath()", StringComparison.Ordinal)
+                < body.IndexOf("SetEditPoints(", StringComparison.Ordinal),
+            "The path must be started before its edit points are set.");
+        Assert.True(
+            body.IndexOf("SetEditPoints(", StringComparison.Ordinal)
+                < body.IndexOf("path_tool.EndPath(", StringComparison.Ordinal),
+            "Edit points must be set before the path is ended.");
+    }
+
+    [Fact]
+    public void PathPolylineRejectsABusyToolAndObservesExactlyOneNewPathway()
+    {
+        var body = FunctionBody(ReadBridge(), "_execute_path_polyline");
+
+        Assert.Contains("path_tool.isDrawing", body, StringComparison.Ordinal);
+        Assert.Contains("pathways_before", body, StringComparison.Ordinal);
+        Assert.Contains("pathways_after", body, StringComparison.Ordinal);
+        Assert.Contains("_single_new_node(pathways_before, pathways_after)", body, StringComparison.Ordinal);
+        Assert.Contains("_ensure_registered_node(", body, StringComparison.Ordinal);
+        Assert.Contains("untracked_change", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PathPolylineIsRegisteredAndReversible()
+    {
+        var bridge = ReadBridge();
+
+        Assert.Contains(
+            "\"path_polyline\": funcref(self, \"_execute_path_polyline\")",
+            bridge,
+            StringComparison.Ordinal);
+        Assert.Contains("path_polyline", FunctionBody(bridge, "_reverse_operation"), StringComparison.Ordinal);
+    }
+
     private static string ReadBridge() =>
         File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
 

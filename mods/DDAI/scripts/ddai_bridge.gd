@@ -80,6 +80,7 @@ func start():
 		"roof_region": funcref(self, "_execute_roof_region"),
 		"wall_polyline": funcref(self, "_execute_wall_polyline"),
 		"object_placement": funcref(self, "_execute_object_placement"),
+		"path_polyline": funcref(self, "_execute_path_polyline"),
 	}
 	_operation_certifications = _certify_operation_routes()
 	if _asset_list_provider == null:
@@ -1664,6 +1665,64 @@ func _execute_object_placement(operation, job_key):
 	return {"ok": node_id.ok, "node_ids": [node_id.value] if node_id.ok else [], "untracked_change": not node_id.ok}
 
 
+# Paths follow the published PathTool and Pathway contracts. Edit points are set
+# on the active Pathway in world space, Smooth() regenerates the visual, and
+# EndPath carries the loop flag. Confirm() is avoided because it closes loops on
+# its own and would override the plan's explicit intent.
+func _execute_path_polyline(operation, job_key):
+	var context = _surface_context(operation, job_key, "PathTool")
+	if not context.ok:
+		return {"ok": false, "node_ids": []}
+	var level = context.level
+	var path_tool = context.tool
+	if path_tool.isDrawing or level.Pathways.get_child_count() >= MAXIMUM_INSPECTION_STATE_ITEMS:
+		return {"ok": false, "node_ids": []}
+	var texture = _texture_loader.call_func(context.resource_identity)
+	if texture == null:
+		return {"ok": false, "node_ids": []}
+	var points = _grid_points_to_world(operation.path.points)
+	if points.size() < 2:
+		return {"ok": false, "node_ids": []}
+	var pathways_before = level.Pathways.get_children()
+	var prior_texture = path_tool.Texture
+	var prior_width = path_tool.Width
+	var prior_smoothness = path_tool.Smoothness
+	var prior_layer = path_tool.ActiveLayer
+	var prior_sorting = path_tool.Sorting
+	var prior_fade_in = path_tool.fadeIn
+	var prior_fade_out = path_tool.fadeOut
+	path_tool.Texture = texture
+	path_tool.Width = float(operation.width) * float(Global.World.GridSize)
+	path_tool.Smoothness = float(operation.smoothness)
+	path_tool.SetLayer(int(operation.layer))
+	path_tool.SetSorting(0 if str(operation.sorting) == "over" else 1)
+	path_tool.SetFadeIn(bool(operation.fade_in))
+	path_tool.SetFadeOut(bool(operation.fade_out))
+	path_tool.StartPath()
+	var active = path_tool.ActivePath
+	var drawn = false
+	if active != null:
+		active.SetEditPoints(PoolVector2Array(points))
+		active.Smooth()
+		path_tool.EndPath(bool(operation.loop))
+		drawn = true
+	path_tool.Texture = prior_texture
+	path_tool.Width = prior_width
+	path_tool.Smoothness = prior_smoothness
+	path_tool.SetLayer(int(prior_layer))
+	path_tool.SetSorting(int(prior_sorting))
+	path_tool.SetFadeIn(prior_fade_in)
+	path_tool.SetFadeOut(prior_fade_out)
+	if not drawn:
+		return {"ok": false, "node_ids": []}
+	var pathways_after = level.Pathways.get_children()
+	if pathways_after.size() != pathways_before.size() + 1:
+		return {"ok": false, "node_ids": [], "untracked_change": true}
+	var created = _single_new_node(pathways_before, pathways_after)
+	var node_id = _ensure_registered_node(created)
+	return {"ok": node_id.ok, "node_ids": [node_id.value] if node_id.ok else [], "untracked_change": not node_id.ok}
+
+
 func _surface_context(operation, job_key, tool_name):
 	if not _resolved_job_assets.has(job_key) or not _resolved_job_assets[job_key].has(operation.operation_id):
 		return {"ok": false}
@@ -1914,7 +1973,7 @@ func _observe_operation(operation, native_node_ids, job_key = ""):
 func _reverse_operation(operation, native_node_ids, job_key = ""):
 	if operation.operation_type in ["terrain_stroke", "cave_region"]:
 		return _reverse_surface_rollback(operation, native_node_ids, job_key)
-	if operation.operation_type in ["pattern_region", "colorable_pattern_region", "roof_region", "object_placement"]:
+	if operation.operation_type in ["pattern_region", "colorable_pattern_region", "roof_region", "object_placement", "path_polyline"]:
 		return _reverse_addressable_surface(operation, native_node_ids)
 	if operation.operation_type == "wall_polyline":
 		return _reverse_wall_polyline(native_node_ids)
