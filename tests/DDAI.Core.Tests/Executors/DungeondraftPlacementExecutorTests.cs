@@ -136,6 +136,43 @@ public sealed class DungeondraftPlacementExecutorTests
         Assert.Contains("path_polyline", FunctionBody(bridge, "_reverse_operation"), StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void FloorShapeRegionSelectsTheTilesetAndUsesTheShapeToolRoute()
+    {
+        var body = FunctionBody(ReadBridge(), "_execute_floor_shape_region");
+
+        // FloorShapeTool extends ShapeTool, the same base as RoofTool, whose Mode
+        // plus DrawRect/FinishShape route is already proven live here.
+        Assert.Contains("floor_tool.SmartTileId", body, StringComparison.Ordinal);
+        Assert.Contains("floor_tool.Mode", body, StringComparison.Ordinal);
+        Assert.Contains("floor_tool.DrawRect(", body, StringComparison.Ordinal);
+        Assert.Contains("floor_tool.FinishShape()", body, StringComparison.Ordinal);
+        Assert.Contains("Global.WorldUI.AddPolyPoint(", body, StringComparison.Ordinal);
+        Assert.Contains("floor_tool.isDragging", body, StringComparison.Ordinal);
+
+        Assert.Contains("shapes_before", body, StringComparison.Ordinal);
+        Assert.Contains("shapes_after", body, StringComparison.Ordinal);
+        Assert.Contains("_single_new_node(shapes_before, shapes_after)", body, StringComparison.Ordinal);
+        Assert.Contains("untracked_change", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AllThreeTileCategoriesAreRegisteredAndReversible()
+    {
+        var bridge = ReadBridge();
+
+        // Three distinct categories share one executor but must never be
+        // interchangeable at the plan layer; each registers its own entry.
+        foreach (var category in new[] { "simple_tile_region", "smart_tile_region", "smart_tile_double_region" })
+        {
+            Assert.Contains(
+                $"\"{category}\": funcref(self, \"_execute_floor_shape_region\")",
+                bridge,
+                StringComparison.Ordinal);
+            Assert.Contains(category, FunctionBody(bridge, "_reverse_operation"), StringComparison.Ordinal);
+        }
+    }
+
     private static string ReadBridge() =>
         File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
 

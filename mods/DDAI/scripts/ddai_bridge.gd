@@ -81,6 +81,9 @@ func start():
 		"wall_polyline": funcref(self, "_execute_wall_polyline"),
 		"object_placement": funcref(self, "_execute_object_placement"),
 		"path_polyline": funcref(self, "_execute_path_polyline"),
+		"simple_tile_region": funcref(self, "_execute_floor_shape_region"),
+		"smart_tile_region": funcref(self, "_execute_floor_shape_region"),
+		"smart_tile_double_region": funcref(self, "_execute_floor_shape_region"),
 	}
 	_operation_certifications = _certify_operation_routes()
 	if _asset_list_provider == null:
@@ -1723,6 +1726,59 @@ func _execute_path_polyline(operation, job_key):
 	return {"ok": node_id.ok, "node_ids": [node_id.value] if node_id.ok else [], "untracked_change": not node_id.ok}
 
 
+# Floor shapes cover the three tile categories. FloorShapeTool extends ShapeTool,
+# the same base as RoofTool, so the proven Mode plus DrawRect/FinishShape route is
+# reused. SmartTileId selects the style; the three categories share this executor
+# but never share an asset_ref, because the plan layer keeps them distinct.
+func _execute_floor_shape_region(operation, job_key):
+	var context = _surface_context(operation, job_key, "FloorShapeTool")
+	if not context.ok:
+		return {"ok": false, "node_ids": []}
+	var level = context.level
+	var floor_tool = context.tool
+	if floor_tool.isDragging or level.FloorShapes.get_child_count() >= MAXIMUM_INSPECTION_STATE_ITEMS:
+		return {"ok": false, "node_ids": []}
+	var tileset = _floor_shape_tileset_id(context.resource_identity)
+	if tileset < 0:
+		return {"ok": false, "node_ids": []}
+	var points = _grid_points_to_world(operation.region.points)
+	if points.size() < 3:
+		return {"ok": false, "node_ids": []}
+	var shapes_before = level.FloorShapes.get_children()
+	var prior_tile_id = floor_tool.SmartTileId
+	var prior_mode = floor_tool.Mode
+	floor_tool.SmartTileId = tileset
+	var rectangle = _axis_aligned_rectangle(points)
+	if rectangle.ok:
+		floor_tool.Mode = 0
+		floor_tool.DrawRect(rectangle.rect)
+	else:
+		floor_tool.Mode = 1
+		Global.WorldUI.ClearPolyline()
+		for point in points:
+			Global.WorldUI.AddPolyPoint(point)
+		floor_tool.FinishShape()
+		Global.WorldUI.ClearPolyline()
+	floor_tool.SmartTileId = prior_tile_id
+	floor_tool.Mode = prior_mode
+	var shapes_after = level.FloorShapes.get_children()
+	if shapes_after.size() != shapes_before.size() + 1:
+		return {"ok": false, "node_ids": [], "untracked_change": true}
+	var created = _single_new_node(shapes_before, shapes_after)
+	var node_id = _ensure_registered_node(created)
+	return {"ok": node_id.ok, "node_ids": [node_id.value] if node_id.ok else [], "untracked_change": not node_id.ok}
+
+
+# The catalog stores a tileset's loaded id in its resource identity. A tile plan
+# is refused rather than guessed when the identity is not an exact integer id.
+func _floor_shape_tileset_id(resource_identity):
+	var text = str(resource_identity)
+	if not text.is_valid_integer():
+		return -1
+	var value = int(text)
+	return value if value >= 0 else -1
+
+
 func _surface_context(operation, job_key, tool_name):
 	if not _resolved_job_assets.has(job_key) or not _resolved_job_assets[job_key].has(operation.operation_id):
 		return {"ok": false}
@@ -1973,7 +2029,7 @@ func _observe_operation(operation, native_node_ids, job_key = ""):
 func _reverse_operation(operation, native_node_ids, job_key = ""):
 	if operation.operation_type in ["terrain_stroke", "cave_region"]:
 		return _reverse_surface_rollback(operation, native_node_ids, job_key)
-	if operation.operation_type in ["pattern_region", "colorable_pattern_region", "roof_region", "object_placement", "path_polyline"]:
+	if operation.operation_type in ["pattern_region", "colorable_pattern_region", "roof_region", "object_placement", "path_polyline", "simple_tile_region", "smart_tile_region", "smart_tile_double_region"]:
 		return _reverse_addressable_surface(operation, native_node_ids)
 	if operation.operation_type == "wall_polyline":
 		return _reverse_wall_polyline(native_node_ids)

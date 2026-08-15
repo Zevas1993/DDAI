@@ -604,6 +604,31 @@ git commit -m "test: certify durable map identity"
 
 ---
 
+## Executor API findings (recorded 2026-08-15)
+
+Researched against the published Dungeondraft modding reference while implementing
+the remaining executors.
+
+- **ObjectTool** spells its texture property lowercase (`texture`), unlike most tools
+  in the certification matrix. The certifier row was wrong, which is why the live
+  probe reported `properties_readable: false` for `object_placement`. Fixed.
+- **`Confirm()` on ObjectTool calls `Record()` then `Next()`**, so a fresh preview
+  exists after every placement. Observation must pin exactly one new placed child.
+- **PathTool exposes no point API.** Points are set on the active `Pathway` through
+  `SetEditPoints` in world space, followed by `Smooth()`. `Confirm()` closes loops on
+  its own, so `EndPath(loop)` is used to honour the plan's explicit intent.
+- **PortalTool may be unusable from GDScript.** The reference states the portal
+  creation data "cannot cross C#<->GDScript language barrier", and directs callers to
+  `Wall.AddPortal()` instead. If that holds, `portal_placement` is not achievable from
+  a GDScript mod and doors/windows need a different route or must be declared
+  permanently unsupported. Prove or disprove this before budgeting work for it.
+- **FloorShapeTool's draw route is undocumented.** It extends `ShapeTool`, the same
+  base as `RoofTool`, whose `Mode` plus `DrawRect`/`FinishShape` route is already
+  proven live in this codebase. Tiles reuse it, and `SmartTileId` selects the style.
+- **LightTool documents no placement call.** `preview` is marked "DO NOT MODIFY" and
+  no Confirm or Record is exposed, so the placement route must be discovered live
+  before `light_placement` can be implemented honestly.
+
 ## Success criteria
 
 1. Reopening the same saved map yields the identical `map_id`.
