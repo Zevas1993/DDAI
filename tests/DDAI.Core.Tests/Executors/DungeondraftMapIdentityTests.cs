@@ -204,6 +204,34 @@ public sealed class DungeondraftMapIdentityTests
     }
 
     [Fact]
+    public void StatusAndInspectionReportMapIdentityState()
+    {
+        var bridge = ReadBridge();
+
+        // Agents need to know whether the map_id they are holding will survive a
+        // reload before they invest in a long workflow against it.
+        Assert.Contains("\"map_identity_state\": _map_identity_state", bridge, StringComparison.Ordinal);
+        Assert.Equal(
+            2,
+            System.Text.RegularExpressions.Regex.Matches(bridge, @"""map_identity_state"":\s*_map_identity_state").Count);
+    }
+
+    [Fact]
+    public void NoSessionDerivedIdentityRemainsAnywhereInTheBridge()
+    {
+        var bridge = ReadBridge();
+
+        // Map inspection carried its own copy of the old session-derived formula, so
+        // inspect_map would have kept reporting an unstable identity while status
+        // reported the durable one. Identity must have exactly one source.
+        //
+        // _mint_map_uuid legitimately mixes session and world-instance values as
+        // entropy for a NEW uuid, so this targets the old derivation shape only:
+        // hashing that pair directly into an identity.
+        Assert.DoesNotContain("str(Global.World.get_instance_id())", bridge, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void CertifyOperationRoutesDoesNotCaptureMapDataProbe()
     {
         var bridge = ReadBridge();

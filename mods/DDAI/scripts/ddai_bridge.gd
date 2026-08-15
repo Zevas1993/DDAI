@@ -3189,7 +3189,7 @@ func _inspect_map_payload(payload):
 	if not revision_result.ok:
 		return revision_result
 	var map_revision = revision_result.revision
-	var map_id = (_framed_string("session_id=", _session_id) + "world_instance_id=" + str(Global.World.get_instance_id()) + "\n").sha256_text()
+	var map_id = _current_map_id()
 	var offset_result = _inspection_cursor_offset(
 		payload.cursor,
 		map_id,
@@ -3217,6 +3217,7 @@ func _inspect_map_payload(payload):
 		next_cursor = _inspection_cursor_value(map_id, map_revision, current_level_id, payload.region, page_end)
 	return {"ok": true, "payload": {
 		"map_id": map_id,
+		"map_identity_state": _map_identity_state,
 		"map_revision": map_revision,
 		"canvas": {"width": int(Global.World.Width), "height": int(Global.World.Height)},
 		"grid_size": grid_size,
@@ -3697,6 +3698,7 @@ func _status_payload():
 		"dimensions": {"width": int(Global.World.Width), "height": int(Global.World.Height)} if Global.World != null and _is_runtime_positive_int32(Global.World.Width) and _is_runtime_positive_int32(Global.World.Height) else null,
 		"revision": _map_job_revision,
 		"map_id": _current_map_id(),
+		"map_identity_state": _map_identity_state,
 		"map_job_revision": _map_job_revision,
 		"level_ids": _current_level_ids(),
 		"certified_operation_types": _certified_operation_types(),
