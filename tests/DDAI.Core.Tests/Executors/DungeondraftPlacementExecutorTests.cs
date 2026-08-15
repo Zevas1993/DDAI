@@ -48,9 +48,15 @@ public sealed class DungeondraftPlacementExecutorTests
         // preview, so the observation must pin down exactly one new placed object.
         Assert.Contains("objects_before", body, StringComparison.Ordinal);
         Assert.Contains("objects_after", body, StringComparison.Ordinal);
-        Assert.Contains("_single_new_node(objects_before, objects_after)", body, StringComparison.Ordinal);
         Assert.Contains("_ensure_registered_node(", body, StringComparison.Ordinal);
         Assert.Contains("untracked_change", body, StringComparison.Ordinal);
+
+        // Confirm() calls Record() then Next(), so a fresh preview Prop is parented
+        // before observation runs. A plain +1 child count therefore never matches and
+        // every placement was reversed as unverifiable. The trailing preview must be
+        // excluded explicitly.
+        Assert.Contains("trailing_preview", body, StringComparison.Ordinal);
+        Assert.Contains("created_nodes.size() != 1", body, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -170,6 +176,29 @@ public sealed class DungeondraftPlacementExecutorTests
                 bridge,
                 StringComparison.Ordinal);
             Assert.Contains(category, FunctionBody(bridge, "_reverse_operation"), StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void EveryRegisteredExecutorAlsoDeclaresItsOperationFieldSchema()
+    {
+        var bridge = ReadBridge();
+        var validation = FunctionBody(bridge, "_validate_universal_operation");
+
+        // Registering an executor is not enough. An operation whose fields are not
+        // declared in expected_keys is rejected as unsupported_operation, which
+        // reads like the executor is missing rather than its schema. Live proof of
+        // object_placement failed on exactly this before the schemas were added.
+        var registered = System.Text.RegularExpressions.Regex
+            .Matches(bridge, @"""(?<op>[a-z_]+)"": funcref\(self, ""_execute_")
+            .Select(match => match.Groups["op"].Value)
+            .Distinct();
+
+        foreach (var operation in registered)
+        {
+            Assert.True(
+                validation.Contains($"\"{operation}\": [", StringComparison.Ordinal),
+                $"Executor '{operation}' is registered but declares no field schema, so every plan using it is refused.");
         }
     }
 

@@ -792,6 +792,11 @@ func _validate_universal_operation(operation, operation_path, canvas, operation_
 		"cave_region": ["operation_type", "operation_id", "level_id", "asset_ref", "region", "floor_color_rgba", "wall_color_rgba"],
 		"roof_region": ["operation_type", "operation_id", "level_id", "asset_ref", "region", "width", "shade"],
 		"wall_polyline": ["operation_type", "operation_id", "level_id", "asset_ref", "path", "closed", "color_rgba"],
+		"object_placement": ["operation_type", "operation_id", "level_id", "asset_ref", "position", "rotation_degrees", "scale", "layer", "sorting", "shadow", "block_light", "custom_color_rgba"],
+		"path_polyline": ["operation_type", "operation_id", "level_id", "asset_ref", "path", "width", "smoothness", "layer", "sorting", "fade_in", "fade_out", "loop"],
+		"simple_tile_region": ["operation_type", "operation_id", "level_id", "asset_ref", "region", "layer"],
+		"smart_tile_region": ["operation_type", "operation_id", "level_id", "asset_ref", "region", "layer"],
+		"smart_tile_double_region": ["operation_type", "operation_id", "level_id", "asset_ref", "region", "layer"],
 	}
 	if not expected_keys.has(operation_type) or not _certified_operation_executors.has(operation_type):
 		return {"ok": false, "error": _error("unsupported_operation", "The operation type is not implemented by this runtime.", operation_path + ".operation_type")}
@@ -804,7 +809,19 @@ func _validate_universal_operation(operation, operation_path, canvas, operation_
 		return {"ok": false, "error": _error("invalid_level_id", "level_id must be safe.", operation_path + ".level_id")}
 	if typeof(operation.asset_ref) != TYPE_STRING or operation.asset_ref.length() != 71 or not operation.asset_ref.begins_with("sha256:") or not _is_sha256(operation.asset_ref.substr(7, 64)):
 		return {"ok": false, "error": _error("invalid_asset_ref", "asset_ref must be a canonical opaque SHA-256 reference.", operation_path + ".asset_ref")}
-	var geometry_name = "path" if operation_type in ["terrain_stroke", "wall_polyline"] else "region"
+	# Point placements carry a single position instead of a points array, so they
+	# are validated here and never reach the polyline/region contract below.
+	if operation_type == "object_placement":
+		if typeof(operation.position) != TYPE_DICTIONARY or not _dictionary_has_exact_keys(operation.position, ["x", "y"]) or not _is_bounded_grid_point(operation.position, canvas):
+			return {"ok": false, "error": _error("invalid_point", "Placement position must be finite and inside the canvas.", operation_path + ".position")}
+		if not _is_rotation(operation.rotation_degrees) or not _is_positive_universal_number(operation.scale) or not _is_supported_layer(operation.layer):
+			return {"ok": false, "error": _error("invalid_object_style", "Object rotation, scale or layer is invalid.", operation_path)}
+		if not _is_supported_sorting(operation.sorting) or typeof(operation.shadow) != TYPE_BOOL or typeof(operation.block_light) != TYPE_BOOL:
+			return {"ok": false, "error": _error("invalid_object_style", "Object sorting, shadow or block light is invalid.", operation_path)}
+		if operation.custom_color_rgba != null and not _is_rgba(operation.custom_color_rgba):
+			return {"ok": false, "error": _error("invalid_object_style", "Object custom color is invalid.", operation_path + ".custom_color_rgba")}
+		return {"ok": true, "point_count": 1}
+	var geometry_name = "path" if operation_type in ["terrain_stroke", "wall_polyline", "path_polyline"] else "region"
 	var geometry = operation[geometry_name]
 	var minimum_points = 2 if geometry_name == "path" else 3
 	if typeof(geometry) != TYPE_DICTIONARY or not _dictionary_has_exact_keys(geometry, ["points"]) or typeof(geometry.points) != TYPE_ARRAY or geometry.points.size() < minimum_points or geometry.points.size() > MAXIMUM_UNIVERSAL_POINTS:
@@ -829,7 +846,15 @@ func _validate_universal_operation(operation, operation_path, canvas, operation_
 		return {"ok": false, "error": _error("invalid_roof_style", "Roof width or shade is invalid.", operation_path)}
 	if operation_type == "wall_polyline" and (typeof(operation.closed) != TYPE_BOOL or not _is_rgba(operation.color_rgba)):
 		return {"ok": false, "error": _error("invalid_wall_style", "Wall closed and color values are invalid.", operation_path)}
+	if operation_type == "path_polyline" and (not _is_positive_universal_number(operation.width) or not _is_unit_universal_number(operation.smoothness) or not _is_supported_layer(operation.layer) or not _is_supported_sorting(operation.sorting) or typeof(operation.fade_in) != TYPE_BOOL or typeof(operation.fade_out) != TYPE_BOOL or typeof(operation.loop) != TYPE_BOOL):
+		return {"ok": false, "error": _error("invalid_path_style", "Path width, smoothness, layer, sorting or fades are invalid.", operation_path)}
+	if operation_type in ["simple_tile_region", "smart_tile_region", "smart_tile_double_region"] and not _is_supported_layer(operation.layer):
+		return {"ok": false, "error": _error("invalid_tile_style", "Tile layer is invalid.", operation_path + ".layer")}
 	return {"ok": true, "point_count": geometry.points.size()}
+
+
+func _is_supported_sorting(value):
+	return typeof(value) == TYPE_STRING and value in ["over", "under"]
 
 
 func _preflight_universal_plan(plan):
@@ -898,6 +923,11 @@ func _surface_category(operation_type):
 		"cave_region": "Caves",
 		"roof_region": "Roofs",
 		"wall_polyline": "Walls",
+		"object_placement": "Objects",
+		"path_polyline": "Paths",
+		"simple_tile_region": "Simple Tiles",
+		"smart_tile_region": "Smart Tiles",
+		"smart_tile_double_region": "Smart Tiles Double",
 	}.get(operation_type, "")
 
 
@@ -909,6 +939,11 @@ func _surface_route_preflight(operation, level):
 		"cave_region": "CaveBrush",
 		"roof_region": "RoofTool",
 		"wall_polyline": "WallTool",
+		"object_placement": "ObjectTool",
+		"path_polyline": "PathTool",
+		"simple_tile_region": "FloorShapeTool",
+		"smart_tile_region": "FloorShapeTool",
+		"smart_tile_double_region": "FloorShapeTool",
 	}.get(operation.operation_type, "")
 	if tool_name == "" or not Global.Editor.Tools.has(tool_name) or Global.Editor.Tools[tool_name] == null:
 		return {"ok": false, "error": _error("operation_tool_unavailable", "The documented operation tool is unavailable.", "payload.operations")}
@@ -921,6 +956,10 @@ func _surface_route_preflight(operation, level):
 		return {"ok": false, "error": _error("cave_tool_busy", "Wait for the current cave edit to finish.", "payload.operations")}
 	if operation.operation_type == "roof_region" and tool.isDrawing:
 		return {"ok": false, "error": _error("roof_tool_busy", "Finish the current manual roof first.", "payload.operations")}
+	if operation.operation_type == "path_polyline" and tool.isDrawing:
+		return {"ok": false, "error": _error("path_tool_busy", "Finish the current manual path first.", "payload.operations")}
+	if operation.operation_type in ["simple_tile_region", "smart_tile_region", "smart_tile_double_region"] and tool.isDragging:
+		return {"ok": false, "error": _error("tile_tool_busy", "Finish the current manual floor shape first.", "payload.operations")}
 	if operation.operation_type in ["roof_region", "wall_polyline"]:
 		if Global.WorldUI == null or Global.WorldUI.EditArcPoint or Global.WorldUI.Polyline.size() > 0:
 			return {"ok": false, "error": _error("polyline_busy", "Finish or cancel the current manual polyline first.", "payload.operations")}
@@ -1641,16 +1680,27 @@ func _execute_object_placement(operation, job_key):
 	object_tool.SetSorting(0 if str(operation.sorting) == "over" else 1)
 	object_tool.SetShadow(bool(operation.shadow))
 	object_tool.SetBlockLight(bool(operation.block_light))
+	# An inactive tool creates no preview, so Next() silently does nothing and the
+	# job is reversed as unverifiable. Activation is restored on every exit path.
+	var tool_was_active = Global.Editor.IsToolActive("ObjectTool")
+	if not tool_was_active:
+		Global.Editor.OnSelectTool("ObjectTool")
 	object_tool.Next()
 	var preview = object_tool.Preview
 	var placed = false
+	var trailing_preview = null
 	if preview != null:
 		preview.position = positions[0]
 		if operation.has("custom_color_rgba") and typeof(operation.custom_color_rgba) == TYPE_STRING:
 			object_tool.ChangeColor(_rgba_color(operation.custom_color_rgba), "")
 			object_tool.PromoteCustomColor()
 		object_tool.Confirm()
+		# Confirm() calls Record() then Next(), so a fresh preview Prop is already
+		# parented here. It is not the placed object and must not be counted.
+		trailing_preview = object_tool.Preview
 		placed = true
+	if not tool_was_active:
+		Global.Editor.OnDeselectTool()
 	object_tool.texture = prior_texture
 	object_tool.Rotation.value = prior_rotation
 	object_tool.Scale.value = prior_scale
@@ -1660,11 +1710,19 @@ func _execute_object_placement(operation, job_key):
 	object_tool.SetBlockLight(prior_block_light)
 	if not placed:
 		return {"ok": false, "node_ids": []}
+	var known = {}
+	for node in objects_before:
+		known[node.get_instance_id()] = true
+	if trailing_preview != null:
+		known[trailing_preview.get_instance_id()] = true
 	var objects_after = level.Objects.get_children()
-	if objects_after.size() != objects_before.size() + 1:
+	var created_nodes = []
+	for node in objects_after:
+		if not known.has(node.get_instance_id()):
+			created_nodes.append(node)
+	if created_nodes.size() != 1:
 		return {"ok": false, "node_ids": [], "untracked_change": true}
-	var created = _single_new_node(objects_before, objects_after)
-	var node_id = _ensure_registered_node(created)
+	var node_id = _ensure_registered_node(created_nodes[0])
 	return {"ok": node_id.ok, "node_ids": [node_id.value] if node_id.ok else [], "untracked_change": not node_id.ok}
 
 
@@ -1701,6 +1759,9 @@ func _execute_path_polyline(operation, job_key):
 	path_tool.SetSorting(0 if str(operation.sorting) == "over" else 1)
 	path_tool.SetFadeIn(bool(operation.fade_in))
 	path_tool.SetFadeOut(bool(operation.fade_out))
+	var path_tool_was_active = Global.Editor.IsToolActive("PathTool")
+	if not path_tool_was_active:
+		Global.Editor.OnSelectTool("PathTool")
 	path_tool.StartPath()
 	var active = path_tool.ActivePath
 	var drawn = false
@@ -1709,6 +1770,8 @@ func _execute_path_polyline(operation, job_key):
 		active.Smooth()
 		path_tool.EndPath(bool(operation.loop))
 		drawn = true
+	if not path_tool_was_active:
+		Global.Editor.OnDeselectTool()
 	path_tool.Texture = prior_texture
 	path_tool.Width = prior_width
 	path_tool.Smoothness = prior_smoothness
@@ -1748,6 +1811,9 @@ func _execute_floor_shape_region(operation, job_key):
 	var prior_tile_id = floor_tool.SmartTileId
 	var prior_mode = floor_tool.Mode
 	floor_tool.SmartTileId = tileset
+	var floor_tool_was_active = Global.Editor.IsToolActive("FloorShapeTool")
+	if not floor_tool_was_active:
+		Global.Editor.OnSelectTool("FloorShapeTool")
 	var rectangle = _axis_aligned_rectangle(points)
 	if rectangle.ok:
 		floor_tool.Mode = 0
@@ -1759,6 +1825,8 @@ func _execute_floor_shape_region(operation, job_key):
 			Global.WorldUI.AddPolyPoint(point)
 		floor_tool.FinishShape()
 		Global.WorldUI.ClearPolyline()
+	if not floor_tool_was_active:
+		Global.Editor.OnDeselectTool()
 	floor_tool.SmartTileId = prior_tile_id
 	floor_tool.Mode = prior_mode
 	var shapes_after = level.FloorShapes.get_children()
@@ -2549,8 +2617,11 @@ func _universal_plan_fingerprint_input(plan):
 		text += _framed_string(prefix + ".operation_id=", operation.operation_id)
 		text += _framed_string(prefix + ".level_id=", operation.level_id)
 		text += _framed_string(prefix + ".asset_ref=", operation.asset_ref)
-		if operation.operation_type in ["terrain_stroke", "wall_polyline"]:
+		if operation.operation_type in ["terrain_stroke", "wall_polyline", "path_polyline"]:
 			text += _universal_geometry_fingerprint(prefix, "path", operation.path)
+		elif operation.operation_type == "object_placement":
+			text += prefix + ".position.x=" + _double_fingerprint_text(float(operation.position.x)) + "\n"
+			text += prefix + ".position.y=" + _double_fingerprint_text(float(operation.position.y)) + "\n"
 		else:
 			text += _universal_geometry_fingerprint(prefix, "region", operation.region)
 		if operation.operation_type == "terrain_stroke":
@@ -2570,6 +2641,26 @@ func _universal_plan_fingerprint_input(plan):
 		elif operation.operation_type == "wall_polyline":
 			text += prefix + ".closed=" + ("true" if operation.closed else "false") + "\n"
 			text += _framed_string(prefix + ".color_rgba=", operation.color_rgba)
+		elif operation.operation_type == "object_placement":
+			text += prefix + ".rotation_degrees=" + _double_fingerprint_text(float(operation.rotation_degrees)) + "\n"
+			text += prefix + ".scale=" + _double_fingerprint_text(float(operation.scale)) + "\n"
+			text += prefix + ".layer=" + str(int(operation.layer)) + "\n"
+			text += _framed_string(prefix + ".sorting=", str(operation.sorting))
+			text += prefix + ".shadow=" + ("true" if operation.shadow else "false") + "\n"
+			text += prefix + ".block_light=" + ("true" if operation.block_light else "false") + "\n"
+			text += prefix + ".custom_color_rgba.present=" + ("true" if operation.custom_color_rgba != null else "false") + "\n"
+			if operation.custom_color_rgba != null:
+				text += _framed_string(prefix + ".custom_color_rgba=", operation.custom_color_rgba)
+		elif operation.operation_type == "path_polyline":
+			text += prefix + ".width=" + _double_fingerprint_text(float(operation.width)) + "\n"
+			text += prefix + ".smoothness=" + _double_fingerprint_text(float(operation.smoothness)) + "\n"
+			text += prefix + ".layer=" + str(int(operation.layer)) + "\n"
+			text += _framed_string(prefix + ".sorting=", str(operation.sorting))
+			text += prefix + ".fade_in=" + ("true" if operation.fade_in else "false") + "\n"
+			text += prefix + ".fade_out=" + ("true" if operation.fade_out else "false") + "\n"
+			text += prefix + ".loop=" + ("true" if operation.loop else "false") + "\n"
+		elif operation.operation_type in ["simple_tile_region", "smart_tile_region", "smart_tile_double_region"]:
+			text += prefix + ".layer=" + str(int(operation.layer)) + "\n"
 	return text
 
 
