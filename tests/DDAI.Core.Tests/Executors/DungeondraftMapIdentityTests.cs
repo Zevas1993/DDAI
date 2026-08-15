@@ -173,6 +173,37 @@ public sealed class DungeondraftMapIdentityTests
     }
 
     [Fact]
+    public void BindMapIdentityWritesOnlyTheOwnedKeyAndOnlyWhenPending()
+    {
+        var bridge = ReadBridge();
+        var body = FunctionBody(bridge, "_bind_map_identity");
+
+        Assert.Contains("pending", body, StringComparison.Ordinal);
+        Assert.Contains("MAP_DATA_KEY", body, StringComparison.Ordinal);
+        Assert.Contains("map_uuid", body, StringComparison.Ordinal);
+        Assert.Contains("\"bound\"", body, StringComparison.Ordinal);
+
+        // A live map already carried a foreign mod's key seconds after creation,
+        // so clobbering the store is a real hazard rather than a theoretical one.
+        Assert.DoesNotContain("erase(", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("clear(", body, StringComparison.Ordinal);
+        Assert.DoesNotMatch(@"ModMapData\s*=(?!=)", body);
+
+        // Direct member access only, same rule as every other host read.
+        Assert.DoesNotMatch(@"Global\s*\.\s*get\s*\(", body);
+        Assert.DoesNotContain("get_property_list", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PreflightBindsIdentityBeforeMutating()
+    {
+        var bridge = ReadBridge();
+        var preflight = FunctionBody(bridge, "_preflight_universal_plan");
+
+        Assert.Contains("_bind_map_identity()", preflight, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void CertifyOperationRoutesDoesNotCaptureMapDataProbe()
     {
         var bridge = ReadBridge();

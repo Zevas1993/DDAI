@@ -830,6 +830,9 @@ func _validate_universal_operation(operation, operation_path, canvas, operation_
 func _preflight_universal_plan(plan):
 	if Global.World == null or not _is_runtime_positive_int32(Global.World.Width) or not _is_runtime_positive_int32(Global.World.Height) or not _is_runtime_positive_finite_number(Global.World.GridSize):
 		return {"ok": false, "error": _error("map_not_available", "No usable Dungeondraft map is available.", "")}
+	# The map is about to be mutated, so this is the moment identity becomes
+	# durable. Binding never changes the uuid value, only its persistence.
+	_bind_map_identity()
 	if _current_map_id() != plan.expected_map_id:
 		return {"ok": false, "error": _error("map_id_mismatch", "The open map identity changed.", "payload.expected_map_id")}
 	var current_state_fingerprint = _capture_map_job_state_fingerprint()
@@ -2514,6 +2517,26 @@ func _read_stored_map_uuid():
 		return ""
 	var value = owned.get("map_uuid", null)
 	return value if _is_sha256(value) else ""
+
+
+# Persists the already-resolved uuid into the host store. Called at mutation time
+# only, so read-only commands never dirty the user's map. A freshly created map
+# was observed already carrying another mod's key, so only the DDAI-owned entry
+# is touched and any existing owned fields are preserved.
+func _bind_map_identity():
+	_resolve_map_identity()
+	if _map_identity_state != "pending" or _resolved_map_uuid == "":
+		return _map_identity_state == "bound"
+	var data = Global.ModMapData
+	if typeof(data) != TYPE_DICTIONARY:
+		return false
+	var owned = {}
+	if data.has(MAP_DATA_KEY) and typeof(data[MAP_DATA_KEY]) == TYPE_DICTIONARY:
+		owned = data[MAP_DATA_KEY]
+	owned["map_uuid"] = _resolved_map_uuid
+	data[MAP_DATA_KEY] = owned
+	_map_identity_state = "bound"
+	return true
 
 
 # Uniqueness, not unpredictability, is the requirement.
