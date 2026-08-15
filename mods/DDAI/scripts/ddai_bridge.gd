@@ -1656,8 +1656,7 @@ func _execute_object_placement(operation, job_key):
 	if not context.ok:
 		return {"ok": false, "node_ids": []}
 	var level = context.level
-	var object_tool = context.tool
-	if level.Objects.get_child_count() >= MAXIMUM_INSPECTION_STATE_ITEMS:
+	if level.Objects == null or level.Objects.get_child_count() >= MAXIMUM_INSPECTION_STATE_ITEMS:
 		return {"ok": false, "node_ids": []}
 	var texture = _texture_loader.call_func(context.resource_identity)
 	if texture == null:
@@ -1665,71 +1664,36 @@ func _execute_object_placement(operation, job_key):
 	var positions = _grid_points_to_world([operation.position])
 	if positions.size() != 1:
 		return {"ok": false, "node_ids": []}
-	var objects_before = level.Objects.get_children()
-	var prior_texture = object_tool.texture
-	var prior_rotation = object_tool.Rotation.value
-	var prior_scale = object_tool.Scale.value
-	var prior_layer = object_tool.ActiveLayer
-	var prior_sorting = object_tool.Sorting
-	var prior_shadow = object_tool.Shadow
-	var prior_block_light = object_tool.BlockLight
-	object_tool.texture = texture
-	object_tool.Rotation.value = float(operation.rotation_degrees)
-	object_tool.Scale.value = float(operation.scale)
-	object_tool.SetLayer(int(operation.layer))
-	object_tool.SetSorting(0 if str(operation.sorting) == "over" else 1)
-	object_tool.SetShadow(bool(operation.shadow))
-	object_tool.SetBlockLight(bool(operation.block_light))
-	# An inactive tool creates no preview, so Next() silently does nothing and the
-	# job is reversed as unverifiable. Activation is restored on every exit path.
-	var tool_was_active = Global.Editor.IsToolActive("ObjectTool")
-	if not tool_was_active:
-		Global.Editor.OnSelectTool("ObjectTool")
-	object_tool.Next()
-	var preview = object_tool.Preview
-	var placed = false
-	var trailing_preview = null
-	if preview != null:
-		preview.position = positions[0]
-		if operation.has("custom_color_rgba") and typeof(operation.custom_color_rgba) == TYPE_STRING:
-			object_tool.ChangeColor(_rgba_color(operation.custom_color_rgba), "")
-			object_tool.PromoteCustomColor()
-		object_tool.Confirm()
-		# Confirm() calls Record() then Next(), so a fresh preview Prop is already
-		# parented here. It is not the placed object and must not be counted.
-		trailing_preview = object_tool.Preview
-		placed = true
-	if not tool_was_active:
-		Global.Editor.OnDeselectTool()
-	object_tool.texture = prior_texture
-	object_tool.Rotation.value = prior_rotation
-	object_tool.Scale.value = prior_scale
-	object_tool.SetLayer(int(prior_layer))
-	object_tool.SetSorting(int(prior_sorting))
-	object_tool.SetShadow(prior_shadow)
-	object_tool.SetBlockLight(prior_block_light)
-	if not placed:
+	var objects_before = {}
+	for node in level.Objects.get_children():
+		objects_before[node.get_instance_id()] = true
+	# Container route. Objects.CreateObject parents a Prop directly, so no editor
+	# tool is activated at all. The tool APIs drive the interactive UI and do
+	# nothing unless the tool is the selected one, which a mod cannot reliably
+	# arrange; the container APIs are the mod-facing surface. Documented sibling
+	# routes exist for lights (Lights.CreateLight) and portals (Wall.AddPortal).
+	var prop = level.Objects.CreateObject(0 if str(operation.sorting) == "over" else 1)
+	if prop == null:
 		return {"ok": false, "node_ids": []}
-	var known = {}
-	for node in objects_before:
-		known[node.get_instance_id()] = true
-	if trailing_preview != null:
-		known[trailing_preview.get_instance_id()] = true
-	var objects_after = level.Objects.get_children()
+	prop.SetTexture(texture)
+	prop.position = positions[0]
+	prop.rotation_degrees = float(operation.rotation_degrees)
+	prop.scale = Vector2(float(operation.scale), float(operation.scale))
+	prop.HasShadow = bool(operation.shadow)
+	prop.SetBlockLight(bool(operation.block_light))
+	if typeof(operation.custom_color_rgba) == TYPE_STRING:
+		prop.SetCustomColor(_rgba_color(operation.custom_color_rgba))
+	# CreateObject does not register the Prop in the search index; the caller must.
+	level.Objects.AddToSearchTable(prop, false)
 	var created_nodes = []
-	for node in objects_after:
-		if not known.has(node.get_instance_id()):
+	for node in level.Objects.get_children():
+		if not objects_before.has(node.get_instance_id()):
 			created_nodes.append(node)
 	if created_nodes.size() != 1:
 		return {"ok": false, "node_ids": [], "untracked_change": true}
 	var node_id = _ensure_registered_node(created_nodes[0])
 	return {"ok": node_id.ok, "node_ids": [node_id.value] if node_id.ok else [], "untracked_change": not node_id.ok}
 
-
-# Paths follow the published PathTool and Pathway contracts. Edit points are set
-# on the active Pathway in world space, Smooth() regenerates the visual, and
-# EndPath carries the loop flag. Confirm() is avoided because it closes loops on
-# its own and would override the plan's explicit intent.
 func _execute_path_polyline(operation, job_key):
 	var context = _surface_context(operation, job_key, "PathTool")
 	if not context.ok:
@@ -1882,11 +1846,15 @@ func _ensure_registered_node(node):
 	if node == null:
 		return {"ok": false}
 	var node_id = _node_id_metadata(node)
-	if node_id.ok and Global.World.HasNodeID(int(node_id.value)) and Global.World.GetNodeByID(int(node_id.value)) == node:
+	# Zero is never a real registration. A Prop from Objects.CreateObject carries a
+	# default node_id of 0 because ObjectTool.Record(), which normally assigns the
+	# id, is bypassed on the container route. Accepting it recorded {0} as the
+	# reversal evidence and left the job stuck after operation_applied.
+	if node_id.ok and int(node_id.value) > 0 and Global.World.HasNodeID(int(node_id.value)) and Global.World.GetNodeByID(int(node_id.value)) == node:
 		return node_id
 	node_id = _runtime_node_id(Global.World.AssignNodeID(node))
 	var persisted = _node_id_metadata(node)
-	if not node_id.ok or not persisted.ok or persisted.value != node_id.value or not Global.World.HasNodeID(int(node_id.value)) or Global.World.GetNodeByID(int(node_id.value)) != node:
+	if not node_id.ok or int(node_id.value) <= 0 or not persisted.ok or persisted.value != node_id.value or not Global.World.HasNodeID(int(node_id.value)) or Global.World.GetNodeByID(int(node_id.value)) != node:
 		return {"ok": false}
 	return node_id
 
