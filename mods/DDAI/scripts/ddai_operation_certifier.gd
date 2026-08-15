@@ -11,7 +11,10 @@ const OPERATION_ROUTES = [
 	{"operation_type": "colorable_pattern_region", "tool_name": "PatternShapeTool", "required_methods": [], "required_properties": ["Texture"], "level_property": "PatternShapes"},
 	{"operation_type": "cave_region", "tool_name": "CaveBrush", "required_methods": [], "required_properties": [], "level_property": "CaveMesh"},
 	{"operation_type": "roof_region", "tool_name": "RoofTool", "required_methods": ["DrawRect", "FinishShape"], "required_properties": ["isDrawing", "Texture"], "level_property": "Roofs"},
-	{"operation_type": "object_placement", "tool_name": "ObjectTool", "required_methods": ["Confirm", "SetLayer", "SetSorting", "SetShadow", "SetBlockLight"], "required_properties": ["Texture", "Preview"], "level_property": "Objects"},
+	# ObjectTool spells its texture property lowercase, unlike most tools in this
+	# matrix. The published reference confirms it, and the live probe reported
+	# properties_readable false for this row until the casing was corrected.
+	{"operation_type": "object_placement", "tool_name": "ObjectTool", "required_methods": ["Confirm", "SetLayer", "SetSorting", "SetShadow", "SetBlockLight"], "required_properties": ["texture", "Preview"], "level_property": "Objects"},
 	{"operation_type": "wall_polyline", "tool_name": "WallTool", "required_methods": ["EndWall"], "required_properties": ["isDrawing", "Texture"], "level_property": "Walls"},
 	{"operation_type": "material_stroke", "tool_name": "MaterialBrush", "required_methods": ["SetMaterial", "SetLayer", "SetSmooth"], "required_properties": ["Mesh"], "level_property": "MaterialMeshes"},
 	{"operation_type": "portal_placement", "tool_name": "PortalTool", "required_methods": ["SetFreestanding", "FindBestLocation", "ChangeTexture"], "required_properties": ["Texture"], "level_property": "Portals"},

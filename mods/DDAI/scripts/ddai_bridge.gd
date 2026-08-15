@@ -79,6 +79,7 @@ func start():
 		"cave_region": funcref(self, "_execute_cave_region"),
 		"roof_region": funcref(self, "_execute_roof_region"),
 		"wall_polyline": funcref(self, "_execute_wall_polyline"),
+		"object_placement": funcref(self, "_execute_object_placement"),
 	}
 	_operation_certifications = _certify_operation_routes()
 	if _asset_list_provider == null:
@@ -1603,6 +1604,66 @@ func _execute_roof_region(operation, job_key):
 	return {"ok": node_id.ok, "node_ids": [node_id.value] if node_id.ok else [], "untracked_change": not node_id.ok}
 
 
+# Object placement follows the published ObjectTool contract. Note the texture
+# property is lowercase there, unlike every other tool in the matrix. Confirm()
+# internally calls Record() then Next(), so the preview is created and placed
+# before Confirm and a fresh preview exists afterwards.
+func _execute_object_placement(operation, job_key):
+	var context = _surface_context(operation, job_key, "ObjectTool")
+	if not context.ok:
+		return {"ok": false, "node_ids": []}
+	var level = context.level
+	var object_tool = context.tool
+	if level.Objects.get_child_count() >= MAXIMUM_INSPECTION_STATE_ITEMS:
+		return {"ok": false, "node_ids": []}
+	var texture = _texture_loader.call_func(context.resource_identity)
+	if texture == null:
+		return {"ok": false, "node_ids": []}
+	var positions = _grid_points_to_world([operation.position])
+	if positions.size() != 1:
+		return {"ok": false, "node_ids": []}
+	var objects_before = level.Objects.get_children()
+	var prior_texture = object_tool.texture
+	var prior_rotation = object_tool.Rotation.value
+	var prior_scale = object_tool.Scale.value
+	var prior_layer = object_tool.ActiveLayer
+	var prior_sorting = object_tool.Sorting
+	var prior_shadow = object_tool.Shadow
+	var prior_block_light = object_tool.BlockLight
+	object_tool.texture = texture
+	object_tool.Rotation.value = float(operation.rotation_degrees)
+	object_tool.Scale.value = float(operation.scale)
+	object_tool.SetLayer(int(operation.layer))
+	object_tool.SetSorting(0 if str(operation.sorting) == "over" else 1)
+	object_tool.SetShadow(bool(operation.shadow))
+	object_tool.SetBlockLight(bool(operation.block_light))
+	object_tool.Next()
+	var preview = object_tool.Preview
+	var placed = false
+	if preview != null:
+		preview.position = positions[0]
+		if operation.has("custom_color_rgba") and typeof(operation.custom_color_rgba) == TYPE_STRING:
+			object_tool.ChangeColor(_rgba_color(operation.custom_color_rgba), "")
+			object_tool.PromoteCustomColor()
+		object_tool.Confirm()
+		placed = true
+	object_tool.texture = prior_texture
+	object_tool.Rotation.value = prior_rotation
+	object_tool.Scale.value = prior_scale
+	object_tool.SetLayer(int(prior_layer))
+	object_tool.SetSorting(int(prior_sorting))
+	object_tool.SetShadow(prior_shadow)
+	object_tool.SetBlockLight(prior_block_light)
+	if not placed:
+		return {"ok": false, "node_ids": []}
+	var objects_after = level.Objects.get_children()
+	if objects_after.size() != objects_before.size() + 1:
+		return {"ok": false, "node_ids": [], "untracked_change": true}
+	var created = _single_new_node(objects_before, objects_after)
+	var node_id = _ensure_registered_node(created)
+	return {"ok": node_id.ok, "node_ids": [node_id.value] if node_id.ok else [], "untracked_change": not node_id.ok}
+
+
 func _surface_context(operation, job_key, tool_name):
 	if not _resolved_job_assets.has(job_key) or not _resolved_job_assets[job_key].has(operation.operation_id):
 		return {"ok": false}
@@ -1853,7 +1914,7 @@ func _observe_operation(operation, native_node_ids, job_key = ""):
 func _reverse_operation(operation, native_node_ids, job_key = ""):
 	if operation.operation_type in ["terrain_stroke", "cave_region"]:
 		return _reverse_surface_rollback(operation, native_node_ids, job_key)
-	if operation.operation_type in ["pattern_region", "colorable_pattern_region", "roof_region"]:
+	if operation.operation_type in ["pattern_region", "colorable_pattern_region", "roof_region", "object_placement"]:
 		return _reverse_addressable_surface(operation, native_node_ids)
 	if operation.operation_type == "wall_polyline":
 		return _reverse_wall_polyline(native_node_ids)
