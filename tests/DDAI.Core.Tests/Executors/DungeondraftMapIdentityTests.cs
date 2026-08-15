@@ -132,6 +132,47 @@ public sealed class DungeondraftMapIdentityTests
     }
 
     [Fact]
+    public void CurrentMapIdResolvesDurableIdentityAndNeverSessionState()
+    {
+        var bridge = ReadBridge();
+        var body = FunctionBody(bridge, "_current_map_id");
+
+        // Session-derived identity was the whole defect: map_id changed on every
+        // mod reload while the map was byte-identical.
+        Assert.DoesNotContain("_session_id", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("get_instance_id", body, StringComparison.Ordinal);
+        Assert.Contains("_resolved_map_uuid", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ResolveMapIdentityAdoptsAStoredUuidAndMintsWithoutWriting()
+    {
+        var bridge = ReadBridge();
+        var body = FunctionBody(bridge, "_resolve_map_identity");
+
+        Assert.Contains("_read_stored_map_uuid", body, StringComparison.Ordinal);
+        Assert.Contains("\"bound\"", body, StringComparison.Ordinal);
+        Assert.Contains("\"pending\"", body, StringComparison.Ordinal);
+        Assert.Contains("\"unbound\"", body, StringComparison.Ordinal);
+
+        // Resolution runs on read-only paths, so it must never write into the
+        // host store. Binding is a separate, mutation-time step.
+        Assert.DoesNotMatch(@"ModMapData\s*\[[^\]]*\]\s*=(?!=)", body);
+    }
+
+    [Fact]
+    public void ReadStoredMapUuidUsesDirectMemberAccessOnly()
+    {
+        var bridge = ReadBridge();
+        var body = FunctionBody(bridge, "_read_stored_map_uuid");
+
+        // Same rule as the certifier probe: reflecting on the host crashed it.
+        Assert.Contains("Global.ModMapData", body, StringComparison.Ordinal);
+        Assert.DoesNotMatch(@"Global\s*\.\s*get\s*\(", body);
+        Assert.DoesNotContain("get_property_list", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void CertifyOperationRoutesDoesNotCaptureMapDataProbe()
     {
         var bridge = ReadBridge();

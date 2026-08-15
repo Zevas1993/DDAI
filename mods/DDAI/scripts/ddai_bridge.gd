@@ -5,6 +5,7 @@ const TARGET_DUNGEONDRAFT_VERSION = "1.2.0.1"
 const TARGET_DUNGEONDRAFT_EXECUTABLE_SHA256 = "c14ddddbaada43610e763f73f0c2786983ca4440578acde0ac9668cda358af02"
 const MAILBOX_SCHEMA_VERSION = "1.0"
 const MAILBOX_ROOT = "user://ddai"
+const MAP_DATA_KEY = "org.ddai.status_bridge"
 const MAXIMUM_MESSAGE_BYTES = 1048576
 const POLL_INTERVAL_SECONDS = 0.25
 const HEARTBEAT_INTERVAL_SECONDS = 10.0
@@ -60,6 +61,9 @@ var _processing_claim_cursor = 0
 var _certified_operation_executors = {}
 var _runtime_certified_operation_types = ["wall_polyline"]
 var _operation_certifications = []
+var _resolved_map_uuid = ""
+var _map_identity_state = "unbound"
+var _resolved_map_world_id = 0
 var _asset_list_provider = null
 var _texture_loader = null
 
@@ -2473,9 +2477,52 @@ func _rgba_color(value):
 
 
 func _current_map_id():
+	_resolve_map_identity()
+	return _resolved_map_uuid
+
+
+# Resolves identity once per opened world and caches it. The value is minted in
+# memory when the map carries none, so it never changes mid-session; only its
+# durability changes, when _bind_map_identity() persists it at mutation time.
+func _resolve_map_identity():
 	if Global.World == null:
+		_resolved_map_uuid = ""
+		_map_identity_state = "unbound"
+		_resolved_map_world_id = 0
+		return
+	var world_id = Global.World.get_instance_id()
+	if _resolved_map_uuid != "" and _resolved_map_world_id == world_id:
+		return
+	_resolved_map_world_id = world_id
+	var stored = _read_stored_map_uuid()
+	if stored != "":
+		_resolved_map_uuid = stored
+		_map_identity_state = "bound"
+		return
+	_resolved_map_uuid = _mint_map_uuid()
+	_map_identity_state = "pending"
+
+
+# Direct member access only. Reflecting on Global crashed Dungeondraft 1.2.0.1;
+# see docs/superpowers/reports/2026-08-14-ddai-map-data-probe-crash-report.md.
+func _read_stored_map_uuid():
+	var data = Global.ModMapData
+	if typeof(data) != TYPE_DICTIONARY or not data.has(MAP_DATA_KEY):
 		return ""
-	return (_framed_string("session_id=", _session_id) + "world_instance_id=" + str(Global.World.get_instance_id()) + "\n").sha256_text()
+	var owned = data[MAP_DATA_KEY]
+	if typeof(owned) != TYPE_DICTIONARY:
+		return ""
+	var value = owned.get("map_uuid", null)
+	return value if _is_sha256(value) else ""
+
+
+# Uniqueness, not unpredictability, is the requirement.
+func _mint_map_uuid():
+	return (
+		_framed_string("session_id=", _session_id)
+		+ "world_instance_id=" + str(_resolved_map_world_id)
+		+ "ticks=" + str(OS.get_ticks_usec())
+		+ "\n").sha256_text()
 
 
 func _current_level_ids():
