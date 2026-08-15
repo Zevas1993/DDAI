@@ -71,7 +71,7 @@ public sealed class MapSnapshotContractTests
         Assert.Equal(json, MapSnapshotJson.SerializePage(roundTrip));
         Assert.True(Encoding.UTF8.GetByteCount(json) <= MapSnapshotJson.MaximumJsonBytes);
         using var document = JsonDocument.Parse(json);
-        Assert.Equal(9, document.RootElement.EnumerateObject().Count());
+        Assert.Equal(10, document.RootElement.EnumerateObject().Count());
         Assert.Equal(new string('b', 64), document.RootElement.GetProperty("map_revision").GetString());
         Assert.Equal(7, document.RootElement.GetProperty("items")[0].GetProperty("node_id").GetInt64());
         Assert.Equal(JsonValueKind.Null, document.RootElement.GetProperty("items")[0].GetProperty("asset_ref").ValueKind);
@@ -427,6 +427,7 @@ public sealed class MapSnapshotContractTests
 
     private static MapSnapshotPage ValidPage() => new(
         new string('a', 64),
+        "bound",
         new string('b', 64),
         new MapCanvas(40, 30),
         256,

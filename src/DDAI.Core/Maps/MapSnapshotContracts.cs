@@ -40,6 +40,7 @@ public sealed record MapSnapshotItem(
 
 public sealed record MapSnapshotPage(
     [property: JsonPropertyName("map_id")] string MapId,
+    [property: JsonPropertyName("map_identity_state")] string MapIdentityState,
     [property: JsonPropertyName("map_revision")] string MapRevision,
     [property: JsonPropertyName("canvas")] MapCanvas Canvas,
     [property: JsonPropertyName("grid_size")] double GridSize,
@@ -268,7 +269,7 @@ public static class MapSnapshotJson
         EnsureObjectShape(
             root,
             "map snapshot page",
-            ["map_id", "map_revision", "canvas", "grid_size", "levels", "items", "next_cursor", "truncated", "unsupported_kinds"]);
+            ["map_id", "map_identity_state", "map_revision", "canvas", "grid_size", "levels", "items", "next_cursor", "truncated", "unsupported_kinds"]);
         EnsureObjectShape(root.GetProperty("canvas"), "map canvas", ["width", "height"]);
 
         EnsureArrayObjects(root.GetProperty("levels"), "map snapshot level", ["id", "label", "current"]);

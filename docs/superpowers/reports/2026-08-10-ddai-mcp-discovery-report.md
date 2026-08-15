@@ -109,8 +109,8 @@ Acceptance RED/GREEN history:
 - Path: `artifacts/task6/win-x64/ddai.exe`
 - Files in publish directory: 1
 - Runtime: self-contained `win-x64`
-- Size: 87,047,866 bytes
-- SHA-256: `66424558fbb77ee0be461225dc4df8a7f1be388ff8b43602ce9e7ad6969fca9d`
+- Size: 87,048,378 bytes
+- SHA-256: `a7a4188d747c5a7d750e276255485b6ca9b8789fef33edb306e10e1e84ade2d8`
 
 One explicit `dotnet publish` invocation generated this retained executable after the final source state. Published-process acceptance never publishes or writes that directory: it resolves the existing path and rechecks path, one-file contents, size, and hash against the committed JSON receipt and this report before launch. A separate source-freshness test publishes current source only to a temporary directory and proves the retained artifact's hash and last-write time remain unchanged; no hash equality between separate publishes is assumed. The artifact directory is machine-local/ignored evidence and is not part of the source commit.
 

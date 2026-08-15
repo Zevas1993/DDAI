@@ -2,8 +2,8 @@
   "schema_version": "1.0",
   "artifact": {
     "relative_path": "artifacts/task6/win-x64/ddai.exe",
-    "size_bytes": 87047866,
-    "sha256": "66424558fbb77ee0be461225dc4df8a7f1be388ff8b43602ce9e7ad6969fca9d"
+    "size_bytes": 87048378,
+    "sha256": "a7a4188d747c5a7d750e276255485b6ca9b8789fef33edb306e10e1e84ade2d8"
   },
   "input_schemas": {
     "ddai_get_capabilities": {

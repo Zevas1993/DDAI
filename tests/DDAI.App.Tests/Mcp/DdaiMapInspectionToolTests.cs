@@ -383,6 +383,7 @@ public sealed class DdaiMapInspectionToolTests
 
     private static MapSnapshotPage Page(string? assetRef = null) => new(
         new string('a', 64),
+        "bound",
         new string('b', 64),
         new MapCanvas(40, 30),
         256,

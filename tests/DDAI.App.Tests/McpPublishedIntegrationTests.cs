@@ -1481,6 +1481,7 @@ public sealed class McpPublishedIntegrationTests
                 ?? throw new JsonException("The published inspection query was null.");
             var page = new MapSnapshotPage(
                 new string('a', 64),
+                "bound",
                 MapRevision,
                 new MapCanvas(40, 30),
                 256,
