@@ -633,7 +633,69 @@ the remaining executors.
   the `Mesh` (`MaterialMesh`) object, which is undocumented. This is the same shape
   as terrain, which is already fail-closed pending a managed adapter.
 
-### Open blocker: activating a tool from a mod
+### Resolved: Dungeondraft has two API surfaces
+
+Tool APIs (`ObjectTool.Next/Confirm`, `PathTool.StartPath`) drive the interactive UI
+and silently do nothing unless that tool is the user's selected one. `Editor.OnSelectTool`
+works when called from a status handler but not from the plan executor, and no
+threading or object-identity difference explains it: both contexts showed the same
+editor instance on the same thread.
+
+Container APIs are the mod-facing surface and need no tool at all:
+
+| Operation | Route |
+|---|---|
+| `object_placement` | `Objects.CreateObject(sorting)` then `AddToSearchTable` |
+| `light_placement` | `Lights.CreateLight(showWidget)` |
+| `portal_placement` | `Wall.AddPortal(...)` attached, `Level.CreateFreestandingPortal(...)` free |
+| `material_stroke` | `Level.GetOrMakeMaterialMesh(layer, texture, smooth)` |
+| `terrain_stroke` | `Terrain.Paint(id, brush, offset, position, rate)` / `Fill(id)` |
+
+`wall_polyline` was a misleading template. It appears tool-driven but actually uses
+`WorldUI.AddPolyPoint` plus `WallTool.EndWall`, which manipulate map data and need no
+active tool. Generalising from the one certified operation cost several cycles.
+
+### The container route bypasses tool finalisation
+
+`ObjectTool.Record()` normally assigns the NodeID, registers the search entry and
+computes bounds. Creating through the container skips all of it, so the caller must:
+
+1. assign the node id (`World.AssignNodeID`)
+2. register in the search index (`Objects.AddToSearchTable`)
+3. compute `Rect` and `SelectRect` from texture size and scale
+
+Missing the third produced a zero-area rect, and `_inspection_item` rejects that, so a
+single object made the entire map uninspectable.
+
+### An executor must be registered in eight places
+
+| # | Switch | Failure signature |
+|---|---|---|
+| 1 | executor registration | operation never runs |
+| 2 | reversal classification | undo cannot reverse it |
+| 3 | `expected_keys` field schema | `unsupported_operation`, blames the executor |
+| 4 | geometry shape selection | `invalid_geometry` on a field the operation lacks |
+| 5 | style validation | bad values accepted silently |
+| 6 | tool and category maps | `operation_tool_unavailable` |
+| 7 | plan fingerprint | errors on a missing field, or every plan is rejected |
+| 8 | `_addressable_surface_nodes` | job stalls at `operation_applied`, no error at all |
+
+Numbers 7 and 8 fail in ways that point nowhere near the cause. Consolidating these
+into one registration table is worth doing before the remaining executors land.
+
+### Remaining: observation is in-memory across ticks
+
+Object placement applies, registers and inspects correctly, but the job does not reach
+`committed`. `_observe_operation` is scheduled on one tick and its result read on the
+next through `_pending_observation_results`, which is in-memory only. A job left at
+`operation_applied` when the process restarts can never advance, and the connector's
+apply deadline expires well before the state machine finishes.
+
+Next step is to instrument `_observe_addressable_surface` directly to see whether it
+returns `observed` or `failed` for a container-created object, rather than inferring it
+from the stalled job.
+
+### Superseded: activating a tool from a mod
 
 Live placement of `object_placement` fails at a single point and everything else
 downstream is already correct. Instrumenting the executor recorded:
