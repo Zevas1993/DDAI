@@ -41,16 +41,22 @@ public sealed class DungeondraftPlacementExecutorTests
     }
 
     [Fact]
-    public void NodeRegistrationRejectsAZeroIdentifier()
+    public void NodeRegistrationProvesIdentityByLookupNotByMagnitude()
     {
         var body = FunctionBody(ReadBridge(), "_ensure_registered_node");
 
-        // A Prop from Objects.CreateObject carries node_id 0 because ObjectTool
-        // .Record(), which assigns the id, is bypassed on the container route.
-        // Accepting 0 recorded {0} as reversal evidence and stalled the job after
-        // operation_applied.
-        Assert.Contains("int(node_id.value) > 0", body, StringComparison.Ordinal);
-        Assert.Contains("int(node_id.value) <= 0", body, StringComparison.Ordinal);
+        // Zero is a valid node id. World.AssignNodeID hands out nextNodeID then
+        // increments, so the first node registered in a session legitimately gets
+        // 0, and HasNodeID(0) resolves it. Live evidence: assign returned 0 with
+        // nextNodeID advancing to 1 and the lookup round trip succeeding.
+        // Rejecting ids by magnitude would refuse the first object on a fresh map.
+        Assert.DoesNotContain("node_id.value) > 0", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("node_id.value) <= 0", body, StringComparison.Ordinal);
+
+        // Identity is proven by the round trip instead.
+        Assert.Contains("Global.World.HasNodeID(int(node_id.value))", body, StringComparison.Ordinal);
+        Assert.Contains("Global.World.GetNodeByID(int(node_id.value)) == node", body, StringComparison.Ordinal);
+        Assert.Contains("persisted.value != node_id.value", body, StringComparison.Ordinal);
     }
 
     [Fact]

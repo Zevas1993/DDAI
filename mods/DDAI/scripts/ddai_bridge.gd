@@ -1683,6 +1683,13 @@ func _execute_object_placement(operation, job_key):
 	prop.SetBlockLight(bool(operation.block_light))
 	if typeof(operation.custom_color_rgba) == TYPE_STRING:
 		prop.SetCustomColor(_rgba_color(operation.custom_color_rgba))
+	# Rect is a derived bound that only the tool's finalisation computes. On the
+	# container route it stays (0,0,0,0), which makes map inspection reject the
+	# whole state as invalid global bounds. Compute it from the texture size and
+	# scale, centred on the world position the way Dungeondraft centres objects.
+	var world_size = texture.get_size() * float(operation.scale)
+	prop.Rect = Rect2(positions[0] - world_size * 0.5, world_size)
+	prop.SelectRect = prop.Rect
 	# CreateObject does not register the Prop in the search index; the caller must.
 	level.Objects.AddToSearchTable(prop, false)
 	var created_nodes = []
@@ -1846,15 +1853,15 @@ func _ensure_registered_node(node):
 	if node == null:
 		return {"ok": false}
 	var node_id = _node_id_metadata(node)
-	# Zero is never a real registration. A Prop from Objects.CreateObject carries a
-	# default node_id of 0 because ObjectTool.Record(), which normally assigns the
-	# id, is bypassed on the container route. Accepting it recorded {0} as the
-	# reversal evidence and left the job stuck after operation_applied.
-	if node_id.ok and int(node_id.value) > 0 and Global.World.HasNodeID(int(node_id.value)) and Global.World.GetNodeByID(int(node_id.value)) == node:
+	# Zero is a valid node id here. World.AssignNodeID hands out nextNodeID and then
+	# increments, so the first node registered in a session legitimately receives 0
+	# and HasNodeID(0) resolves it. Identity is proven by the lookup round trip, not
+	# by the magnitude of the id.
+	if node_id.ok and Global.World.HasNodeID(int(node_id.value)) and Global.World.GetNodeByID(int(node_id.value)) == node:
 		return node_id
 	node_id = _runtime_node_id(Global.World.AssignNodeID(node))
 	var persisted = _node_id_metadata(node)
-	if not node_id.ok or int(node_id.value) <= 0 or not persisted.ok or persisted.value != node_id.value or not Global.World.HasNodeID(int(node_id.value)) or Global.World.GetNodeByID(int(node_id.value)) != node:
+	if not node_id.ok or not persisted.ok or persisted.value != node_id.value or not Global.World.HasNodeID(int(node_id.value)) or Global.World.GetNodeByID(int(node_id.value)) != node:
 		return {"ok": false}
 	return node_id
 
@@ -2206,6 +2213,21 @@ func _addressable_surface_nodes(operation):
 			if count < 0 or nodes.size() > MAXIMUM_INSPECTION_STATE_ITEMS - count:
 				return null
 			source = level.Roofs.get_children()
+		elif operation.operation_type == "object_placement":
+			var object_count = level.Objects.get_child_count()
+			if object_count < 0 or nodes.size() > MAXIMUM_INSPECTION_STATE_ITEMS - object_count:
+				return null
+			source = level.Objects.get_children()
+		elif operation.operation_type == "path_polyline":
+			var path_count = level.Pathways.get_child_count()
+			if path_count < 0 or nodes.size() > MAXIMUM_INSPECTION_STATE_ITEMS - path_count:
+				return null
+			source = level.Pathways.get_children()
+		elif operation.operation_type in ["simple_tile_region", "smart_tile_region", "smart_tile_double_region"]:
+			var shape_count = level.FloorShapes.get_child_count()
+			if shape_count < 0 or nodes.size() > MAXIMUM_INSPECTION_STATE_ITEMS - shape_count:
+				return null
+			source = level.FloorShapes.get_children()
 		else:
 			return null
 		if typeof(source) != TYPE_ARRAY or nodes.size() > MAXIMUM_INSPECTION_STATE_ITEMS - source.size():
