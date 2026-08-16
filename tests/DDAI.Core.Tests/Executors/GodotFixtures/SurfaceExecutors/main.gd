@@ -133,6 +133,41 @@ class MockRoofTool:
 	func DrawRect(_rect): Global.World.create_roof()
 	func FinishShape(): Global.World.create_roof()
 
+class MockProp:
+	extends Node2D
+	var Rect = Rect2()
+	var SelectRect = Rect2()
+	var HasShadow = false
+	var recorded = false
+	func SetTexture(_value): pass
+	func SetBlockLight(_value): pass
+	func SetCustomColor(_value): pass
+
+class MockObjects:
+	extends Node
+	var search_table = {}
+	func CreateObject(_sorting):
+		var prop = MockProp.new()
+		add_child(prop)
+		return prop
+	func AddToSearchTable(prop, _refresh): search_table[prop] = true
+	func RemoveFromSearchTable(prop): search_table.erase(prop)
+	func Save():
+		var saved = []
+		for prop in get_children():
+			if prop.recorded:
+				saved.append({"node_id": int(prop.get_meta("node_id")), "layer": prop.z_index})
+		return saved
+
+class MockObjectTool:
+	extends Reference
+	var record_calls = 0
+	func Record(prop):
+		record_calls += 1
+		if not prop.has_meta("node_id"):
+			Global.World.AssignNodeID(prop)
+		prop.recorded = true
+
 class MockSelectTool:
 	extends Reference
 	var selected = []
@@ -157,6 +192,7 @@ class MockLevel:
 	var PatternShapes = MockPatterns.new()
 	var CaveMesh = MockCave.new()
 	var Roofs = MockRoofs.new()
+	var Objects = MockObjects.new()
 
 class MockWorld:
 	extends Node
@@ -167,7 +203,9 @@ class MockWorld:
 	var levels = [level]
 	var registry = {}
 	var next_id = 10
-	func _init(): add_child(level.Roofs)
+	func _init():
+		add_child(level.Roofs)
+		add_child(level.Objects)
 	func GetLevelByID(value): return level if int(value) == 0 else null
 	func AssignNodeID(node):
 		next_id += 1
@@ -183,7 +221,7 @@ class MockWorld:
 class MockEditor:
 	extends Reference
 	var ActiveToolName = ""
-	var Tools = {"TerrainBrush": MockTerrainTool.new(), "PatternShapeTool": MockPatternTool.new(), "CaveBrush": MockCaveTool.new(), "RoofTool": MockRoofTool.new(), "SelectTool": MockSelectTool.new()}
+	var Tools = {"TerrainBrush": MockTerrainTool.new(), "PatternShapeTool": MockPatternTool.new(), "CaveBrush": MockCaveTool.new(), "RoofTool": MockRoofTool.new(), "ObjectTool": MockObjectTool.new(), "SelectTool": MockSelectTool.new()}
 
 class MockWorldUI:
 	extends Reference
@@ -223,6 +261,7 @@ func _ready():
 	print("DDAI_STAGE:ROOF_BEGIN")
 	var roof_ok = _roof(bridge)
 	print("DDAI_STAGE:ROOF_END:" + str(roof_ok))
+	var object_persistence_ok = _object_persistence(bridge)
 	var state_restored = tool_state == _tool_state(Global.Editor)
 	var tamper_ok = _rollback_tamper(bridge)
 	print("DDAI_SURFACE_TERRAIN_FAILS_CLOSED:" + str(terrain_ok))
@@ -233,7 +272,8 @@ func _ready():
 	print("DDAI_SURFACE_TOOL_STATE:" + str(state_restored))
 	print("DDAI_SURFACE_ROLLBACK_TAMPER:" + str(tamper_ok))
 	print("DDAI_SURFACE_CAPABILITY_WITHHELD:" + str(capability_withheld))
-	get_tree().quit(0 if terrain_ok and pattern_ok and color_pattern_ok and cave_ok and roof_ok and state_restored and tamper_ok and capability_withheld else 1)
+	print("DDAI_OBJECT_SAVE_PERSISTENCE:" + str(object_persistence_ok))
+	get_tree().quit(0 if terrain_ok and pattern_ok and color_pattern_ok and cave_ok and roof_ok and state_restored and tamper_ok and capability_withheld and object_persistence_ok else 1)
 
 func _operation(kind, id):
 	var base = {"operation_type": kind, "operation_id": id, "level_id": "0", "asset_ref": "sha256:" + "a".repeat(64)}
@@ -241,6 +281,7 @@ func _operation(kind, id):
 	elif kind in ["pattern_region","colorable_pattern_region"]: base.merge({"region":{"points":[{"x":1.0,"y":1.0},{"x":3.0,"y":1.0},{"x":3.0,"y":3.0}]},"rotation_degrees":15.0,"layer":100.0})
 	elif kind == "cave_region": base.merge({"region":{"points":[{"x":1.0,"y":1.0},{"x":3.0,"y":1.0},{"x":3.0,"y":3.0}]},"floor_color_rgba":"#112233ff","wall_color_rgba":"#445566ff"})
 	elif kind == "roof_region": base.merge({"region":{"points":[{"x":1.0,"y":1.0},{"x":3.0,"y":1.0},{"x":3.0,"y":3.0},{"x":1.0,"y":3.0}]},"width":1.0,"shade":0.5})
+	elif kind == "object_placement": base.merge({"position":{"x":2.0,"y":2.0},"rotation_degrees":0.0,"scale":1.0,"layer":100,"sorting":"over","shadow":true,"block_light":false,"custom_color_rgba":null})
 	if kind == "colorable_pattern_region": base["color_rgba"] = "#aabbccdd"
 	return base
 
@@ -292,6 +333,14 @@ func _roof(bridge):
 	Global.Editor.Tools["SelectTool"].selected.clear()
 	var reversed=bridge._reverse_operation(op,result.node_ids,key) and bridge._observe_reversal(op,result.node_ids,key)
 	return result.ok and observed and reversed
+
+func _object_persistence(bridge):
+	var op = _operation("object_placement", "object")
+	var key = "object-persistence-key"
+	_resolve(bridge, key, op)
+	var result = bridge._execute_object_placement(op, key)
+	var saved = Global.World.level.Objects.Save()
+	return result.ok and result.node_ids.size() == 1 and saved.size() == 1 and int(saved[0].node_id) == int(result.node_ids[0]) and saved[0].layer == 100 and Global.Editor.Tools["ObjectTool"].record_calls == 1
 
 func _rollback_tamper(bridge):
 	var op=_operation("cave_region","tamper")

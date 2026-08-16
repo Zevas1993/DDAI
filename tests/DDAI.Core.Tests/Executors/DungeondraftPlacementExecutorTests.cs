@@ -5,22 +5,24 @@ namespace DDAI.Core.Tests.Executors;
 public sealed class DungeondraftPlacementExecutorTests
 {
     [Fact]
-    public void ObjectPlacementUsesTheContainerRouteAndNeverATool()
+    public void ObjectPlacementUsesContainerCreationAndDocumentedRecordFinalization()
     {
         var body = FunctionBody(ReadBridge(), "_execute_object_placement");
 
-        // Tool APIs drive the interactive UI and do nothing unless the tool is the
-        // user's selected one, which a mod cannot arrange from a background handler.
-        // Objects.CreateObject parents a Prop directly and needs no tool at all.
+        // Objects.CreateObject parents the exact Prop without driving a preview.
+        // Record finalizes that Prop for persistence and undo history without
+        // selecting the tool or asking it to create/move another preview.
         Assert.Contains("level.Objects.CreateObject(", body, StringComparison.Ordinal);
         Assert.Contains("prop.SetTexture(texture)", body, StringComparison.Ordinal);
         Assert.Contains("prop.position", body, StringComparison.Ordinal);
         Assert.Contains("prop.rotation_degrees", body, StringComparison.Ordinal);
         Assert.Contains("prop.scale", body, StringComparison.Ordinal);
+        Assert.Contains("prop.z_index = int(operation.layer)", body, StringComparison.Ordinal);
         Assert.Contains("prop.HasShadow", body, StringComparison.Ordinal);
         Assert.Contains("prop.SetBlockLight(", body, StringComparison.Ordinal);
+        Assert.Contains("context.tool.Record(prop)", body, StringComparison.Ordinal);
 
-        // CreateObject does not register the Prop in the search index.
+        // Direct CreateObject callers must still register the Prop in the search index.
         Assert.Contains("AddToSearchTable(", body, StringComparison.Ordinal);
 
         foreach (var toolCall in new[] { "OnSelectTool", "OnDeselectTool", ".Enable()", ".Disable()", ".Next()", ".Confirm()" })

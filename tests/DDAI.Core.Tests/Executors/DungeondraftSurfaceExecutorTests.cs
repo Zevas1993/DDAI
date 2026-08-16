@@ -322,6 +322,7 @@ public sealed class DungeondraftSurfaceExecutorTests
                          "DDAI_SURFACE_TOOL_STATE:True",
                          "DDAI_SURFACE_ROLLBACK_TAMPER:True",
                          "DDAI_SURFACE_CAPABILITY_WITHHELD:True",
+                         "DDAI_OBJECT_SAVE_PERSISTENCE:True",
                      })
             {
                 Assert.Contains(receipt, output, StringComparison.Ordinal);

@@ -152,6 +152,7 @@ func _ready():
 	var cursor_vector = _test_cross_runtime_cursor_vector()
 	var map_identity = _test_runtime_world_identity_prevents_map_id_collision()
 	var object_correlation = _test_documented_object_fingerprint_is_internal_and_read_only()
+	var reloaded_object_bounds = _test_reloaded_object_reconstructs_read_only_bounds()
 	var node_id_diagnostic = _test_node_id_boundary_diagnostic_is_bounded()
 	var read_only = _mutation_count() == 0
 	print("DDAI_INSPECTION_PAGINATION:", pagination)
@@ -160,9 +161,10 @@ func _ready():
 	print("DDAI_INSPECTION_CURSOR_VECTOR:", cursor_vector)
 	print("DDAI_INSPECTION_MAP_IDENTITY:", map_identity)
 	print("DDAI_INSPECTION_OBJECT_CORRELATION:", object_correlation)
+	print("DDAI_INSPECTION_RELOADED_OBJECT_BOUNDS:", reloaded_object_bounds)
 	print("DDAI_INSPECTION_NODE_ID_DIAGNOSTIC:", node_id_diagnostic)
 	print("DDAI_INSPECTION_READ_ONLY:", read_only)
-	var exit_code = 0 if pagination and stale and bounds and cursor_vector and map_identity and object_correlation and node_id_diagnostic and read_only else 1
+	var exit_code = 0 if pagination and stale and bounds and cursor_vector and map_identity and object_correlation and reloaded_object_bounds and node_id_diagnostic and read_only else 1
 	Global.World = null
 	for node in nodes:
 		if is_instance_valid(node) and node.get_parent() == null:
@@ -223,6 +225,35 @@ func _test_documented_object_fingerprint_is_internal_and_read_only():
 	prop.test_move(Rect2(10, 20, 20, 10))
 	level.Objects.remove_child(prop)
 	return moved.ok and moved.payload.map_revision != first.payload.map_revision
+
+
+func _test_reloaded_object_reconstructs_read_only_bounds():
+	var image = Image.new()
+	image.create(20, 10, false, Image.FORMAT_RGBA8)
+	var texture = ImageTexture.new()
+	texture.create_from_image(image)
+	texture.set_path("res://private/objects/reloaded-log.png")
+	var prop = FakeProp.new(9, Rect2(), texture)
+	prop.position = Vector2(20, 30)
+	prop.scale = Vector2(2, 1)
+	nodes.append(prop)
+	level.Objects.add_child(prop)
+	var result = bridge._inspect_map_payload(_query(20))
+	level.Objects.remove_child(prop)
+	if not result.ok or prop.Rect != Rect2():
+		return false
+	var hostile = FakeProp.new(10, Rect2(0, 0, -1, 1), texture)
+	var hostile_result = bridge._documented_object_rect(hostile)
+	hostile.free()
+	var degenerate = FakeProp.new(11, Rect2(0, 0, 0, 1), texture)
+	var degenerate_result = bridge._documented_object_rect(degenerate)
+	degenerate.free()
+	if hostile_result != null or degenerate_result != null:
+		return false
+	for item in result.payload.items:
+		if item.node_id == 9:
+			return item.kind == "object" and item.bounds.x == 0.0 and item.bounds.y == 2.5 and item.bounds.width == 4.0 and item.bounds.height == 1.0
+	return false
 
 
 func _test_node_id_boundary_diagnostic_is_bounded():

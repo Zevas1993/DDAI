@@ -1651,10 +1651,10 @@ func _execute_roof_region(operation, job_key):
 	return {"ok": node_id.ok, "node_ids": [node_id.value] if node_id.ok else [], "untracked_change": not node_id.ok}
 
 
-# Object placement follows the published ObjectTool contract. Note the texture
-# property is lowercase there, unlike every other tool in the matrix. Confirm()
-# internally calls Record() then Next(), so the preview is created and placed
-# before Confirm and a fresh preview exists afterwards.
+# Object placement creates the Prop through the documented container route, then
+# uses ObjectTool.Record(prop) only for the documented non-interactive lifecycle
+# transition from preview to real. Record assigns the NodeID and makes the Prop
+# eligible for normal save/undo handling; it does not require selecting the tool.
 func _execute_object_placement(operation, job_key):
 	var context = _surface_context(operation, job_key, "ObjectTool")
 	if not context.ok:
@@ -1683,6 +1683,7 @@ func _execute_object_placement(operation, job_key):
 	prop.position = positions[0]
 	prop.rotation_degrees = float(operation.rotation_degrees)
 	prop.scale = Vector2(float(operation.scale), float(operation.scale))
+	prop.z_index = int(operation.layer)
 	prop.HasShadow = bool(operation.shadow)
 	prop.SetBlockLight(bool(operation.block_light))
 	if typeof(operation.custom_color_rgba) == TYPE_STRING:
@@ -1694,8 +1695,11 @@ func _execute_object_placement(operation, job_key):
 	var world_size = texture.get_size() * float(operation.scale)
 	prop.Rect = Rect2(positions[0] - world_size * 0.5, world_size)
 	prop.SelectRect = prop.Rect
-	# CreateObject does not register the Prop in the search index; the caller must.
-	level.Objects.AddToSearchTable(prop, false)
+	# CreateObject alone leaves the Prop outside ObjectTool's persisted lifecycle.
+	# Record finalises this exact Prop without creating or moving another preview.
+	context.tool.Record(prop)
+	# Direct CreateObject callers must still register the Prop in the search index.
+	level.Objects.AddToSearchTable(prop, str(operation.sorting) == "under")
 	var created_nodes = []
 	for node in level.Objects.get_children():
 		if not objects_before.has(node.get_instance_id()):
@@ -3577,7 +3581,7 @@ func _inspection_item(node, kind, level_id, grid_size):
 	elif kind == "pattern_shape":
 		global_rect = node.GlobalRect
 	elif kind == "object":
-		global_rect = node.Rect
+		global_rect = _documented_object_rect(node)
 	else:
 		return {"ok": false, "error": _error("inspection_state_invalid", "Inspection item kind is not supported.", "")}
 	if typeof(global_rect) != TYPE_RECT2 or not _inspection_rect_is_finite_positive(global_rect):
@@ -3611,6 +3615,34 @@ func _inspection_item(node, kind, level_id, grid_size):
 		"resource_fingerprint": resource_fingerprint,
 	}
 	return {"ok": true, "item": item, "correlation_unavailable": correlation_unavailable}
+
+
+func _documented_object_rect(node):
+	var saved_rect = node.Rect
+	if typeof(saved_rect) != TYPE_RECT2:
+		return null
+	if _inspection_rect_is_finite_positive(saved_rect) and saved_rect.size.x > 0.0 and saved_rect.size.y > 0.0:
+		return saved_rect
+	# Only the exact default zero Rect is a known save/load omission. Any other
+	# invalid native geometry remains invalid and must fail closed.
+	if saved_rect != Rect2():
+		return null
+	# Objects.Save does not serialize the derived Rect. After Objects.Load recreates
+	# a Prop, the public Rect may therefore still be zero even though its documented
+	# position, scale, Sprite, and texture are complete. Reconstruct the same
+	# axis-aligned bounds used at placement without mutating the live Prop.
+	if typeof(node.position) != TYPE_VECTOR2 or typeof(node.scale) != TYPE_VECTOR2 or node.Sprite == null or node.Sprite.texture == null:
+		return null
+	var texture_size = node.Sprite.texture.get_size()
+	if typeof(texture_size) != TYPE_VECTOR2:
+		return null
+	for value in [node.position.x, node.position.y, node.scale.x, node.scale.y, texture_size.x, texture_size.y]:
+		if is_nan(float(value)) or is_inf(float(value)):
+			return null
+	var world_size = Vector2(abs(texture_size.x * node.scale.x), abs(texture_size.y * node.scale.y))
+	if world_size.x <= 0.0 or world_size.y <= 0.0:
+		return null
+	return Rect2(node.position - world_size * 0.5, world_size)
 
 
 func _inspection_rect_is_finite_positive(rect):

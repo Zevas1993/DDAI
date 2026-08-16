@@ -237,7 +237,8 @@ public sealed class MapSnapshotContractTests
         var script = File.ReadAllText(Path.Combine(FindRepositoryRoot(), "mods", "DDAI", "scripts", "ddai_bridge.gd"));
         var inspection = FunctionBody(script, "_inspect_map_payload") +
             FunctionBody(script, "_append_inspection_container") +
-            FunctionBody(script, "_inspection_item");
+            FunctionBody(script, "_inspection_item") +
+            FunctionBody(script, "_documented_object_rect");
 
         Assert.Contains("\"inspect_map\"", script, StringComparison.Ordinal);
         foreach (var documentedPath in new[] { "level.Walls", "level.Pathways", "level.Roofs", "level.PatternShapes", "level.Objects" })
@@ -248,7 +249,8 @@ public sealed class MapSnapshotContractTests
         Assert.Contains("_node_id_metadata(node)", inspection, StringComparison.Ordinal);
         Assert.Contains("get_meta(\"node_id\")", FunctionBody(script, "_node_id_metadata"), StringComparison.Ordinal);
         Assert.Contains("GlobalRect", inspection, StringComparison.Ordinal);
-        Assert.Contains("node.Rect", inspection, StringComparison.Ordinal);
+        Assert.Contains("_documented_object_rect(node)", inspection, StringComparison.Ordinal);
+        Assert.Contains("node.Rect", FunctionBody(script, "_documented_object_rect"), StringComparison.Ordinal);
         Assert.Contains("node.Sprite.texture.resource_path", inspection, StringComparison.Ordinal);
         Assert.Contains("unsupported_kinds", inspection, StringComparison.Ordinal);
         foreach (var forbidden in new[] { "get_property_list", "find_node", "get_node(", "get_tree(", "NodeLookup", ".Data", "Directory.new", "File.new", ".Save(" })
@@ -412,6 +414,7 @@ public sealed class MapSnapshotContractTests
                          "DDAI_INSPECTION_CURSOR_VECTOR:True",
                           "DDAI_INSPECTION_MAP_IDENTITY:True",
                           "DDAI_INSPECTION_OBJECT_CORRELATION:True",
+                          "DDAI_INSPECTION_RELOADED_OBJECT_BOUNDS:True",
                           "DDAI_INSPECTION_NODE_ID_DIAGNOSTIC:True",
                           "DDAI_INSPECTION_READ_ONLY:True",
                      })
