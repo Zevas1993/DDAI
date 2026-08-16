@@ -201,7 +201,14 @@ func _ready():
 	var bridge = BridgeScript.new()
 	bridge._texture_loader = funcref(self, "_texture")
 	bridge._ensure_mailbox_directories()
-	var capability_withheld = bridge._certified_operation_types() == ["wall_polyline"]
+	# This fixture proves the surface families stay withheld. It deliberately does
+	# not pin the whole certified list, so certifying an unrelated operation such
+	# as object_placement does not falsely fail the surface capability check.
+	var certified_types = bridge._certified_operation_types()
+	var capability_withheld = true
+	for withheld_type in ["terrain_stroke", "pattern_region", "colorable_pattern_region", "cave_region", "roof_region"]:
+		if certified_types.has(withheld_type):
+			capability_withheld = false
 	var tool_state = _tool_state(Global.Editor)
 	print("DDAI_STAGE:TERRAIN_BEGIN")
 	var terrain_ok = _terrain(bridge)

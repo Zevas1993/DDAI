@@ -74,16 +74,32 @@ public sealed class DungeondraftPlacementExecutorTests
     }
 
     [Fact]
-    public void ObjectPlacementRemainsUncertifiedUntilLiveProof()
+    public void OnlyLiveProvenOperationsArePublished()
     {
         var bridge = ReadBridge();
 
-        // Implementing an executor must never publish it. Certification requires a
-        // disposable-map create, observe, reverse, save and reopen proof.
+        // object_placement was certified on 2026-08-16 against Dungeondraft 1.2.0.1:
+        // applied at the exact requested grid position, observed with its node id
+        // recorded, committed, then reversed with the map fingerprint returning to
+        // its pre-apply value. Everything else stays withheld until it has the same
+        // create, observe and reverse proof on a disposable map.
         Assert.Contains(
-            "var _runtime_certified_operation_types = [\"wall_polyline\"]",
+            "var _runtime_certified_operation_types = [\"wall_polyline\", \"object_placement\"]",
             bridge,
             StringComparison.Ordinal);
+
+        foreach (var uncertified in new[]
+                 {
+                     "terrain_stroke", "pattern_region", "colorable_pattern_region", "cave_region",
+                     "roof_region", "material_stroke", "portal_placement", "path_polyline",
+                     "light_placement", "simple_tile_region", "smart_tile_region", "smart_tile_double_region",
+                 })
+        {
+            Assert.DoesNotContain(
+                $"\"{uncertified}\"]",
+                FunctionBody(bridge, "_certified_operation_types"),
+                StringComparison.Ordinal);
+        }
     }
 
     [Fact]

@@ -59,7 +59,7 @@ var _pending_reversal_results = {}
 var _resolved_job_assets = {}
 var _processing_claim_cursor = 0
 var _certified_operation_executors = {}
-var _runtime_certified_operation_types = ["wall_polyline"]
+var _runtime_certified_operation_types = ["wall_polyline", "object_placement"]
 var _operation_certifications = []
 var _resolved_map_uuid = ""
 var _map_identity_state = "unbound"
@@ -690,7 +690,7 @@ func _undoable_record_is_valid(record, payload, target_key):
 		if typeof(observation) != TYPE_DICTIONARY or not _dictionary_has_exact_keys(observation, ["operation_index", "operation_id", "native_node_ids"]) or int(observation.operation_index) != index or observation.operation_id != record.plan.operations[index].operation_id or typeof(observation.native_node_ids) != TYPE_ARRAY or observation.native_node_ids.size() == 0:
 			return false
 		for node_id in observation.native_node_ids:
-			if not _is_positive_json_safe_integer(node_id):
+			if not _is_nonnegative_json_safe_integer(node_id):
 				return false
 	return true
 
@@ -1086,8 +1086,12 @@ func _read_map_job_journal(path, request, request_fingerprint, plan_fingerprint)
 		return null
 	if job.observed_native_node_ids.size() > MAXIMUM_UNIVERSAL_POINTS or job.current_operation_node_ids.size() > MAXIMUM_UNIVERSAL_POINTS or job.operation_observations.size() > MAXIMUM_UNIVERSAL_OPERATIONS:
 		return null
+	# Node ids are non-negative, not positive. World.AssignNodeID hands out
+	# nextNodeID and then increments, so the first node registered in a session
+	# legitimately receives 0. Demanding > 0 here rejected the journal outright,
+	# which left the job unreadable and stalled it at operation_applied forever.
 	for node_id in job.observed_native_node_ids + job.current_operation_node_ids:
-		if not _is_positive_json_safe_integer(node_id):
+		if not _is_nonnegative_json_safe_integer(node_id):
 			return null
 	for observation in job.operation_observations:
 		if typeof(observation) != TYPE_DICTIONARY or not _dictionary_has_exact_keys(observation, ["operation_index", "operation_id", "native_node_ids"]):
@@ -1095,7 +1099,7 @@ func _read_map_job_journal(path, request, request_fingerprint, plan_fingerprint)
 		if not _is_nonnegative_json_int32(observation.operation_index) or int(observation.operation_index) >= request.payload.operations.size() or observation.operation_id != request.payload.operations[int(observation.operation_index)].operation_id or typeof(observation.native_node_ids) != TYPE_ARRAY:
 			return null
 		for node_id in observation.native_node_ids:
-			if not _is_positive_json_safe_integer(node_id):
+			if not _is_nonnegative_json_safe_integer(node_id):
 				return null
 	if job.reversal_operation_index != null and (not _is_json_int32(job.reversal_operation_index) or int(job.reversal_operation_index) < -1 or int(job.reversal_operation_index) >= request.payload.operations.size()):
 		return null
@@ -1136,7 +1140,7 @@ func _native_ids_are_safe_for_job(job, node_ids):
 		existing[int(node_id)] = true
 	var current = {}
 	for node_id in node_ids:
-		if not _is_positive_json_safe_integer(float(node_id)):
+		if not _is_nonnegative_json_safe_integer(float(node_id)):
 			return false
 		var canonical_id = int(node_id)
 		if existing.has(canonical_id) or current.has(canonical_id):
@@ -2257,9 +2261,33 @@ func _observe_addressable_surface(operation, native_node_ids):
 	return true
 
 
+func _reverse_container_objects(operation, native_node_ids):
+	var level = Global.World.GetLevelByID(int(operation.level_id))
+	if level == null or level.Objects == null:
+		return false
+	for node_id in native_node_ids:
+		if not Global.World.HasNodeID(int(node_id)):
+			return false
+		var node = Global.World.GetNodeByID(int(node_id))
+		if node == null or node.get_parent() != level.Objects:
+			return false
+		level.Objects.RemoveFromSearchTable(node)
+		level.Objects.remove_child(node)
+		node.queue_free()
+	for node_id in native_node_ids:
+		if Global.World.HasNodeID(int(node_id)) and Global.World.GetNodeByID(int(node_id)) != null:
+			return false
+	return true
+
+
 func _reverse_addressable_surface(operation, native_node_ids):
 	if not _observe_addressable_surface(operation, native_node_ids):
 		return false
+	# Objects are created through the container route, so they are removed the same
+	# way. The search index entry added at creation must be withdrawn first, exactly
+	# mirroring Objects.CreateObject plus AddToSearchTable.
+	if operation.operation_type == "object_placement":
+		return _reverse_container_objects(operation, native_node_ids)
 	if Global.Editor == null or typeof(Global.Editor.Tools) != TYPE_DICTIONARY or not Global.Editor.Tools.has("SelectTool") or Global.Editor.Tools["SelectTool"] == null:
 		return false
 	var select_tool = Global.Editor.Tools["SelectTool"]
@@ -2273,6 +2301,13 @@ func _reverse_addressable_surface(operation, native_node_ids):
 			return false
 	select_tool.Delete()
 	select_tool.DeselectAll()
+	# Verify the reversal instead of assuming it. SelectTool.Delete() is a tool
+	# route and does nothing while that tool is not the selected one, so this
+	# returned true for objects that were never removed. A reversal that cannot be
+	# proven must fail, because undo evidence is the connector's rollback contract.
+	for node_id in native_node_ids:
+		if Global.World.HasNodeID(int(node_id)) and Global.World.GetNodeByID(int(node_id)) != null:
+			return false
 	return true
 
 
