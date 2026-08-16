@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using DDAI.Core.MapPlans;
+using DDAI.Core.MapPlans.Operations;
 
 namespace DDAI.Core.Tests.Executors;
 
@@ -309,7 +311,9 @@ public sealed class DungeondraftSurfaceExecutorTests
 
             var output = await outputTask;
             var error = await errorTask;
-            Assert.True(exited, "Pinned Godot surface executor harness timed out.");
+            Assert.True(
+                exited,
+                $"Pinned Godot surface executor harness timed out.{Environment.NewLine}stdout:{Environment.NewLine}{output}{Environment.NewLine}stderr:{Environment.NewLine}{error}");
             Assert.True(process.ExitCode == 0, $"Godot exited {process.ExitCode}.\nstdout:\n{output}\nstderr:\n{error}");
             Assert.True(string.IsNullOrEmpty(error), $"Godot stderr:\n{error}");
             foreach (var receipt in new[]
@@ -323,10 +327,42 @@ public sealed class DungeondraftSurfaceExecutorTests
                          "DDAI_SURFACE_ROLLBACK_TAMPER:True",
                          "DDAI_SURFACE_CAPABILITY_WITHHELD:True",
                          "DDAI_OBJECT_SAVE_PERSISTENCE:True",
+                         "DDAI_LIGHT_SAVE_PERSISTENCE:True",
+                         "DDAI_LIGHT_NUMERIC_BOUNDS:True",
+                         "DDAI_LIGHT_FINGERPRINT_FIELDS:True",
                      })
             {
                 Assert.Contains(receipt, output, StringComparison.Ordinal);
             }
+
+            var fingerprintPrefix = "DDAI_LIGHT_PLAN_FINGERPRINT:";
+            var actualFingerprint = Assert.Single(
+                output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries),
+                line => line.StartsWith(fingerprintPrefix, StringComparison.Ordinal))[fingerprintPrefix.Length..];
+            var expectedPlan = new MapPlan
+            {
+                SchemaVersion = MapPlan.CurrentSchemaVersion,
+                RequestId = "light-fingerprint-001",
+                ExpectedMapId = "map-live",
+                BaseRevision = 0,
+                ExpectedCatalogRevision = 1,
+                Mode = MapOperationMode.Add,
+                CoordinateSystem = MapCoordinateSystem.Grid,
+                Canvas = new MapCanvas(40, 30),
+                Operations =
+                [
+                    new LightPlacementOperation(
+                        "light-fingerprint",
+                        "0",
+                        "sha256:" + new string('a', 64),
+                        new GridPoint(3, 4),
+                        6,
+                        0.75,
+                        "#ffeeddcc",
+                        true),
+                ],
+            };
+            Assert.Equal(MapPlanJson.Fingerprint(expectedPlan), actualFingerprint);
         }
         finally
         {

@@ -41,6 +41,7 @@ class MockLevel:
 	var Pathways = Node.new()
 	var Roofs = Node.new()
 	var Objects = Node.new()
+	var Lights = Node.new()
 	var PatternShapes = MockPatternShapes.new()
 
 
@@ -74,6 +75,7 @@ class MockWorld:
 		add_child(level.Pathways)
 		add_child(level.Roofs)
 		add_child(level.Objects)
+		add_child(level.Lights)
 
 	func GetLevelByID(level_id):
 		return level if int(level_id) == 0 else null

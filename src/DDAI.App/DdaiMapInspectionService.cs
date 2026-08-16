@@ -93,36 +93,46 @@ public sealed class DdaiMapInspectionService(
                     catalog);
             }
 
-            var correlationUnavailable = false;
+            var unavailableCorrelations = new HashSet<string>(StringComparer.Ordinal);
             var correlatedItems = page.Items.Select(item =>
             {
                 if (item.ResourceFingerprint is null)
                 {
-                    if (string.Equals(item.Kind, "object", StringComparison.Ordinal) && item.AssetRef is null)
+                    if ((string.Equals(item.Kind, "object", StringComparison.Ordinal) ||
+                            string.Equals(item.Kind, "light", StringComparison.Ordinal)) &&
+                        item.AssetRef is null)
                     {
-                        correlationUnavailable = true;
+                        unavailableCorrelations.Add(item.Kind + "_asset_correlation");
                     }
 
                     return item;
                 }
 
+                var category = string.Equals(item.Kind, "object", StringComparison.Ordinal)
+                    ? "Objects"
+                    : string.Equals(item.Kind, "light", StringComparison.Ordinal)
+                        ? "Lights"
+                        : null;
                 var matches = catalog?.Entries
-                    .Where(entry => string.Equals(entry.Category, "Objects", StringComparison.Ordinal) &&
+                    .Where(entry => string.Equals(entry.Category, category, StringComparison.Ordinal) &&
                         string.Equals(entry.ResourceFingerprint, item.ResourceFingerprint, StringComparison.Ordinal))
                     .Take(2)
                     .ToArray() ?? [];
                 if (matches.Length != 1)
                 {
-                    correlationUnavailable = true;
+                    unavailableCorrelations.Add(item.Kind + "_asset_correlation");
                     return item with { AssetRef = null, ResourceFingerprint = null };
                 }
 
                 return item with { AssetRef = matches[0].AssetRef, ResourceFingerprint = null };
             }).ToArray();
             var unsupportedKinds = page.UnsupportedKinds.ToList();
-            if (correlationUnavailable && !unsupportedKinds.Contains("object_asset_correlation", StringComparer.Ordinal))
+            foreach (var unavailableCorrelation in unavailableCorrelations)
             {
-                unsupportedKinds.Add("object_asset_correlation");
+                if (!unsupportedKinds.Contains(unavailableCorrelation, StringComparer.Ordinal))
+                {
+                    unsupportedKinds.Add(unavailableCorrelation);
+                }
             }
             var publicPage = page with
             {

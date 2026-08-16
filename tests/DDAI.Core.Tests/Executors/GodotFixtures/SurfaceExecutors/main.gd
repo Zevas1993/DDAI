@@ -168,6 +168,49 @@ class MockObjectTool:
 			Global.World.AssignNodeID(prop)
 		prop.recorded = true
 
+class MockLight:
+	extends Light2D
+	func _exit_tree():
+		if has_meta("node_id"):
+			# Dungeondraft's native node registry does not necessarily unregister a
+			# queued node before the current bridge transition returns. Mirror that
+			# frame boundary so reversal must rely on its separate observation step.
+			Global.World.pending_registry_erases.append(int(get_meta("node_id")))
+
+class MockLights:
+	extends Node
+	var create_light_calls = 0
+	func CreateLight(_show_widget=false):
+		create_light_calls += 1
+		var light = MockLight.new()
+		light.set_meta("preview", true)
+		add_child(light)
+		return light
+	func Save():
+		var saved = []
+		for light in get_children():
+			if not bool(light.get_meta("preview")):
+				saved.append({
+					"node_id": int(light.get_meta("node_id")),
+					"position": light.position,
+					"range": light.texture_scale / 512.0 * float(light.texture.get_width()),
+					"intensity": light.energy,
+					"color": light.color,
+					"shadows": light.shadow_enabled,
+				})
+		return saved
+
+class MockLightTool:
+	extends Reference
+	var texture = null
+	var Range = RangeValue.new()
+	var Intensity = 1.0
+	var light_color = Color.white
+	var Shadows = false
+	var preview = null
+	func _get(property):
+		return light_color if property == "Color" else null
+
 class MockSelectTool:
 	extends Reference
 	var selected = []
@@ -193,6 +236,7 @@ class MockLevel:
 	var CaveMesh = MockCave.new()
 	var Roofs = MockRoofs.new()
 	var Objects = MockObjects.new()
+	var Lights = MockLights.new()
 
 class MockWorld:
 	extends Node
@@ -202,10 +246,13 @@ class MockWorld:
 	var level = MockLevel.new()
 	var levels = [level]
 	var registry = {}
+	var pending_registry_erases = []
+	var delete_node_calls = 0
 	var next_id = 10
 	func _init():
 		add_child(level.Roofs)
 		add_child(level.Objects)
+		add_child(level.Lights)
 	func GetLevelByID(value): return level if int(value) == 0 else null
 	func AssignNodeID(node):
 		next_id += 1
@@ -214,6 +261,22 @@ class MockWorld:
 		return next_id
 	func HasNodeID(value): return registry.has(int(value))
 	func GetNodeByID(value): return registry.get(int(value), null)
+	func DeleteNodeByID(value):
+		var node_id = int(value)
+		if not registry.has(node_id):
+			return false
+		var node = registry[node_id]
+		if node == null or node.get_parent() == null:
+			return false
+		delete_node_calls += 1
+		node.get_parent().remove_child(node)
+		registry.erase(node_id)
+		node.queue_free()
+		return true
+	func FlushPendingRegistryErases():
+		for node_id in pending_registry_erases:
+			registry.erase(int(node_id))
+		pending_registry_erases.clear()
 	func create_roof():
 		var node = MockRoofNode.new()
 		level.Roofs.add_child(node)
@@ -221,7 +284,7 @@ class MockWorld:
 class MockEditor:
 	extends Reference
 	var ActiveToolName = ""
-	var Tools = {"TerrainBrush": MockTerrainTool.new(), "PatternShapeTool": MockPatternTool.new(), "CaveBrush": MockCaveTool.new(), "RoofTool": MockRoofTool.new(), "ObjectTool": MockObjectTool.new(), "SelectTool": MockSelectTool.new()}
+	var Tools = {"TerrainBrush": MockTerrainTool.new(), "PatternShapeTool": MockPatternTool.new(), "CaveBrush": MockCaveTool.new(), "RoofTool": MockRoofTool.new(), "ObjectTool": MockObjectTool.new(), "LightTool": MockLightTool.new(), "SelectTool": MockSelectTool.new()}
 
 class MockWorldUI:
 	extends Reference
@@ -262,6 +325,9 @@ func _ready():
 	var roof_ok = _roof(bridge)
 	print("DDAI_STAGE:ROOF_END:" + str(roof_ok))
 	var object_persistence_ok = _object_persistence(bridge)
+	var light_persistence_ok = _light_persistence(bridge)
+	var light_numeric_bounds_ok = _light_numeric_bounds(bridge)
+	var light_fingerprint_ok = _light_fingerprint_fields(bridge)
 	var state_restored = tool_state == _tool_state(Global.Editor)
 	var tamper_ok = _rollback_tamper(bridge)
 	print("DDAI_SURFACE_TERRAIN_FAILS_CLOSED:" + str(terrain_ok))
@@ -273,7 +339,10 @@ func _ready():
 	print("DDAI_SURFACE_ROLLBACK_TAMPER:" + str(tamper_ok))
 	print("DDAI_SURFACE_CAPABILITY_WITHHELD:" + str(capability_withheld))
 	print("DDAI_OBJECT_SAVE_PERSISTENCE:" + str(object_persistence_ok))
-	get_tree().quit(0 if terrain_ok and pattern_ok and color_pattern_ok and cave_ok and roof_ok and state_restored and tamper_ok and capability_withheld and object_persistence_ok else 1)
+	print("DDAI_LIGHT_SAVE_PERSISTENCE:" + str(light_persistence_ok))
+	print("DDAI_LIGHT_NUMERIC_BOUNDS:" + str(light_numeric_bounds_ok))
+	print("DDAI_LIGHT_FINGERPRINT_FIELDS:" + str(light_fingerprint_ok))
+	get_tree().quit(0 if terrain_ok and pattern_ok and color_pattern_ok and cave_ok and roof_ok and state_restored and tamper_ok and capability_withheld and object_persistence_ok and light_persistence_ok and light_numeric_bounds_ok and light_fingerprint_ok else 1)
 
 func _operation(kind, id):
 	var base = {"operation_type": kind, "operation_id": id, "level_id": "0", "asset_ref": "sha256:" + "a".repeat(64)}
@@ -282,12 +351,17 @@ func _operation(kind, id):
 	elif kind == "cave_region": base.merge({"region":{"points":[{"x":1.0,"y":1.0},{"x":3.0,"y":1.0},{"x":3.0,"y":3.0}]},"floor_color_rgba":"#112233ff","wall_color_rgba":"#445566ff"})
 	elif kind == "roof_region": base.merge({"region":{"points":[{"x":1.0,"y":1.0},{"x":3.0,"y":1.0},{"x":3.0,"y":3.0},{"x":1.0,"y":3.0}]},"width":1.0,"shade":0.5})
 	elif kind == "object_placement": base.merge({"position":{"x":2.0,"y":2.0},"rotation_degrees":0.0,"scale":1.0,"layer":100,"sorting":"over","shadow":true,"block_light":false,"custom_color_rgba":null})
+	elif kind == "light_placement": base.merge({"position":{"x":3.0,"y":4.0},"range":6.0,"intensity":0.75,"color_rgba":"#ffeeddcc","shadows":true})
 	if kind == "colorable_pattern_region": base["color_rgba"] = "#aabbccdd"
 	return base
 
 func _resolve(bridge, key, operation): bridge._resolved_job_assets[key] = {operation.operation_id:"res://fixture.png"}
 func _texture(identity):
+	var image = Image.new()
+	image.create(512, 512, false, Image.FORMAT_RGBA8)
+	image.fill(Color.white)
 	var texture = ImageTexture.new()
+	texture.create_from_image(image)
 	texture.take_over_path(identity)
 	return texture
 func _tool_state(editor): return str(editor.Tools["TerrainBrush"].Enabled)+"|"+str(editor.Tools["TerrainBrush"].Size)+"|"+str(editor.Tools["PatternShapeTool"].ActiveLayer)+"|"+str(editor.Tools["RoofTool"].Mode)
@@ -341,6 +415,57 @@ func _object_persistence(bridge):
 	var result = bridge._execute_object_placement(op, key)
 	var saved = Global.World.level.Objects.Save()
 	return result.ok and result.node_ids.size() == 1 and saved.size() == 1 and int(saved[0].node_id) == int(result.node_ids[0]) and saved[0].layer == 100 and Global.Editor.Tools["ObjectTool"].record_calls == 1
+
+func _light_persistence(bridge):
+	var op = _operation("light_placement", "light")
+	var key = "light-persistence-key"
+	_resolve(bridge, key, op)
+	var tool = Global.Editor.Tools["LightTool"]
+	var before = str(tool.texture) + "|" + str(tool.Range.value) + "|" + str(tool.Intensity) + "|" + str(tool.Color) + "|" + str(tool.Shadows) + "|" + str(tool.preview)
+	var result = bridge._execute_light_placement(op, key)
+	var observed = result.ok and bridge._observe_operation(op, result.node_ids, key) == "observed"
+	var saved = Global.World.level.Lights.Save()
+	var persisted_color = saved[0].color if saved.size() == 1 else Color.black
+	var persisted = saved.size() == 1 and int(saved[0].node_id) == int(result.node_ids[0]) and saved[0].position == Vector2(192.0, 256.0) and is_equal_approx(float(saved[0].range), 6.0) and is_equal_approx(float(saved[0].intensity), 0.75) and is_equal_approx(persisted_color.r, 1.0) and is_equal_approx(persisted_color.g, 238.0 / 255.0) and is_equal_approx(persisted_color.b, 221.0 / 255.0) and is_equal_approx(persisted_color.a, 204.0 / 255.0) and saved[0].shadows
+	var reverse_started = observed and bridge._reverse_operation(op, result.node_ids, key)
+	Global.World.FlushPendingRegistryErases()
+	var reversed = reverse_started and bridge._observe_reversal(op, result.node_ids, key)
+	var after = str(tool.texture) + "|" + str(tool.Range.value) + "|" + str(tool.Intensity) + "|" + str(tool.Color) + "|" + str(tool.Shadows) + "|" + str(tool.preview)
+	return persisted and reversed and Global.World.level.Lights.get_child_count() == 0 and Global.World.delete_node_calls == 1 and before == after
+
+func _light_numeric_bounds(bridge):
+	var lights = Global.World.level.Lights
+	var before_children = lights.get_child_count()
+	var before_calls = lights.create_light_calls
+	var overflow = _operation("light_placement", "light-overflow")
+	overflow.range = 1.0e37
+	_resolve(bridge, "light-overflow-key", overflow)
+	var overflow_result = bridge._execute_light_placement(overflow, "light-overflow-key")
+	var range_underflow = _operation("light_placement", "light-range-underflow")
+	range_underflow.range = 1.0e-300
+	_resolve(bridge, "light-range-underflow-key", range_underflow)
+	var range_underflow_result = bridge._execute_light_placement(range_underflow, "light-range-underflow-key")
+	var intensity_underflow = _operation("light_placement", "light-intensity-underflow")
+	intensity_underflow.intensity = 1.0e-300
+	_resolve(bridge, "light-intensity-underflow-key", intensity_underflow)
+	var intensity_underflow_result = bridge._execute_light_placement(intensity_underflow, "light-intensity-underflow-key")
+	return not overflow_result.ok and not range_underflow_result.ok and not intensity_underflow_result.ok and lights.get_child_count() == before_children and lights.create_light_calls == before_calls
+
+func _light_fingerprint_fields(bridge):
+	var operation = _operation("light_placement", "light-fingerprint")
+	var plan = {
+		"schema_version":"2.0", "request_id":"light-fingerprint-001",
+		"expected_map_id":"map-live", "base_revision":0.0,
+		"expected_catalog_revision":1.0, "mode":"add",
+		"coordinate_system":"grid", "canvas":{"width":40.0,"height":30.0},
+		"operations":[operation],
+	}
+	var text = bridge._universal_plan_fingerprint_input(plan)
+	print("DDAI_LIGHT_PLAN_FINGERPRINT:" + text.sha256_text())
+	for field in [".position.x=", ".position.y=", ".range=", ".intensity=", ".color_rgba=", ".shadows=true"]:
+		if text.find(field) < 0:
+			return false
+	return text.find(".region.") < 0 and text.sha256_text().length() == 64
 
 func _rollback_tamper(bridge):
 	var op=_operation("cave_region","tamper")

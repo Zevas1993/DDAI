@@ -20,6 +20,8 @@ const MAXIMUM_UNIVERSAL_POINTS = 10000
 const MAXIMUM_SURFACE_SAMPLES = 10000
 const MAXIMUM_TERRAIN_BLEND_PIXELS = 262144
 const MINIMUM_UNIVERSAL_NONZERO_MAGNITUDE = 1e-300
+const MAXIMUM_RUNTIME_SINGLE = 3.4028234663852886e38
+const MINIMUM_RUNTIME_POSITIVE_SINGLE = 1.1754943508222875e-38
 const MAXIMUM_CATALOG_CHUNKS = 4096
 const MAXIMUM_CATALOG_ENTRIES = 100000
 const MAXIMUM_CATALOG_SNAPSHOTS = 4096
@@ -59,7 +61,7 @@ var _pending_reversal_results = {}
 var _resolved_job_assets = {}
 var _processing_claim_cursor = 0
 var _certified_operation_executors = {}
-var _runtime_certified_operation_types = ["wall_polyline", "object_placement"]
+var _runtime_certified_operation_types = ["wall_polyline", "object_placement", "light_placement"]
 var _operation_certifications = []
 var _resolved_map_uuid = ""
 var _map_identity_state = "unbound"
@@ -80,6 +82,7 @@ func start():
 		"roof_region": funcref(self, "_execute_roof_region"),
 		"wall_polyline": funcref(self, "_execute_wall_polyline"),
 		"object_placement": funcref(self, "_execute_object_placement"),
+		"light_placement": funcref(self, "_execute_light_placement"),
 		"path_polyline": funcref(self, "_execute_path_polyline"),
 		"simple_tile_region": funcref(self, "_execute_floor_shape_region"),
 		"smart_tile_region": funcref(self, "_execute_floor_shape_region"),
@@ -793,6 +796,7 @@ func _validate_universal_operation(operation, operation_path, canvas, operation_
 		"roof_region": ["operation_type", "operation_id", "level_id", "asset_ref", "region", "width", "shade"],
 		"wall_polyline": ["operation_type", "operation_id", "level_id", "asset_ref", "path", "closed", "color_rgba"],
 		"object_placement": ["operation_type", "operation_id", "level_id", "asset_ref", "position", "rotation_degrees", "scale", "layer", "sorting", "shadow", "block_light", "custom_color_rgba"],
+		"light_placement": ["operation_type", "operation_id", "level_id", "asset_ref", "position", "range", "intensity", "color_rgba", "shadows"],
 		"path_polyline": ["operation_type", "operation_id", "level_id", "asset_ref", "path", "width", "smoothness", "layer", "sorting", "fade_in", "fade_out", "loop"],
 		"simple_tile_region": ["operation_type", "operation_id", "level_id", "asset_ref", "region", "layer"],
 		"smart_tile_region": ["operation_type", "operation_id", "level_id", "asset_ref", "region", "layer"],
@@ -811,15 +815,20 @@ func _validate_universal_operation(operation, operation_path, canvas, operation_
 		return {"ok": false, "error": _error("invalid_asset_ref", "asset_ref must be a canonical opaque SHA-256 reference.", operation_path + ".asset_ref")}
 	# Point placements carry a single position instead of a points array, so they
 	# are validated here and never reach the polyline/region contract below.
-	if operation_type == "object_placement":
+	if operation_type in ["object_placement", "light_placement"]:
 		if typeof(operation.position) != TYPE_DICTIONARY or not _dictionary_has_exact_keys(operation.position, ["x", "y"]) or not _is_bounded_grid_point(operation.position, canvas):
 			return {"ok": false, "error": _error("invalid_point", "Placement position must be finite and inside the canvas.", operation_path + ".position")}
+	if operation_type == "object_placement":
 		if not _is_rotation(operation.rotation_degrees) or not _is_positive_universal_number(operation.scale) or not _is_supported_layer(operation.layer):
 			return {"ok": false, "error": _error("invalid_object_style", "Object rotation, scale or layer is invalid.", operation_path)}
 		if not _is_supported_sorting(operation.sorting) or typeof(operation.shadow) != TYPE_BOOL or typeof(operation.block_light) != TYPE_BOOL:
 			return {"ok": false, "error": _error("invalid_object_style", "Object sorting, shadow or block light is invalid.", operation_path)}
 		if operation.custom_color_rgba != null and not _is_rgba(operation.custom_color_rgba):
 			return {"ok": false, "error": _error("invalid_object_style", "Object custom color is invalid.", operation_path + ".custom_color_rgba")}
+		return {"ok": true, "point_count": 1}
+	if operation_type == "light_placement":
+		if not _is_positive_universal_number(operation.range) or not _is_positive_universal_number(operation.intensity) or not _is_rgba(operation.color_rgba) or typeof(operation.shadows) != TYPE_BOOL:
+			return {"ok": false, "error": _error("invalid_light_style", "Light range, intensity, color or shadows is invalid.", operation_path)}
 		return {"ok": true, "point_count": 1}
 	var geometry_name = "path" if operation_type in ["terrain_stroke", "wall_polyline", "path_polyline"] else "region"
 	var geometry = operation[geometry_name]
@@ -924,6 +933,7 @@ func _surface_category(operation_type):
 		"roof_region": "Roofs",
 		"wall_polyline": "Walls",
 		"object_placement": "Objects",
+		"light_placement": "Lights",
 		"path_polyline": "Paths",
 		"simple_tile_region": "Simple Tiles",
 		"smart_tile_region": "Smart Tiles",
@@ -940,6 +950,7 @@ func _surface_route_preflight(operation, level):
 		"roof_region": "RoofTool",
 		"wall_polyline": "WallTool",
 		"object_placement": "ObjectTool",
+		"light_placement": "LightTool",
 		"path_polyline": "PathTool",
 		"simple_tile_region": "FloorShapeTool",
 		"smart_tile_region": "FloorShapeTool",
@@ -958,6 +969,8 @@ func _surface_route_preflight(operation, level):
 		return {"ok": false, "error": _error("roof_tool_busy", "Finish the current manual roof first.", "payload.operations")}
 	if operation.operation_type == "path_polyline" and tool.isDrawing:
 		return {"ok": false, "error": _error("path_tool_busy", "Finish the current manual path first.", "payload.operations")}
+	if operation.operation_type == "light_placement" and tool.preview != null:
+		return {"ok": false, "error": _error("light_tool_busy", "Finish the current manual light placement first.", "payload.operations")}
 	if operation.operation_type in ["simple_tile_region", "smart_tile_region", "smart_tile_double_region"] and tool.isDragging:
 		return {"ok": false, "error": _error("tile_tool_busy", "Finish the current manual floor shape first.", "payload.operations")}
 	if operation.operation_type in ["roof_region", "wall_polyline"]:
@@ -1709,6 +1722,58 @@ func _execute_object_placement(operation, job_key):
 	var node_id = _ensure_registered_node(created_nodes[0])
 	return {"ok": node_id.ok, "node_ids": [node_id.value] if node_id.ok else [], "untracked_change": not node_id.ok}
 
+
+# Lights.CreateLight is the documented persistent container route. The installed
+# 1.2.0.1 serializer stores range as texture_scale * texture_width / 512 and its
+# loader restores the inverse, so this mapping is round-trip exact without
+# activating or mutating the interactive LightTool.
+func _execute_light_placement(operation, job_key):
+	var context = _surface_context(operation, job_key, "LightTool")
+	if not context.ok:
+		return {"ok": false, "node_ids": []}
+	var level = context.level
+	if level.Lights == null or level.Lights.get_child_count() >= MAXIMUM_INSPECTION_STATE_ITEMS:
+		return {"ok": false, "node_ids": []}
+	var texture = _texture_loader.call_func(context.resource_identity)
+	if texture == null or int(texture.get_width()) <= 0 or int(texture.get_height()) <= 0:
+		return {"ok": false, "node_ids": []}
+	var positions = _grid_points_to_world([operation.position])
+	if positions.size() != 1:
+		return {"ok": false, "node_ids": []}
+	var texture_scale = float(operation.range) * 512.0 / float(texture.get_width())
+	if not _is_runtime_positive_single(texture_scale) or not _is_runtime_positive_single(operation.intensity):
+		return {"ok": false, "node_ids": []}
+	# Dungeondraft persists these values through single-precision Light2D fields.
+	# Validate the exact derived rectangle before CreateLight so conversion cannot
+	# underflow to zero or overflow a later inspection/state fingerprint.
+	var world_width = abs(float(texture.get_width()) * texture_scale)
+	var world_height = abs(float(texture.get_height()) * texture_scale)
+	var origin_x = float(positions[0].x) - world_width * 0.5
+	var origin_y = float(positions[0].y) - world_height * 0.5
+	if not _is_runtime_positive_single(world_width) or not _is_runtime_positive_single(world_height) or not _is_runtime_finite_single(origin_x) or not _is_runtime_finite_single(origin_y):
+		return {"ok": false, "node_ids": []}
+	var lights_before = {}
+	for node in level.Lights.get_children():
+		lights_before[node.get_instance_id()] = true
+	var light = level.Lights.CreateLight(false)
+	if light == null:
+		return {"ok": false, "node_ids": []}
+	light.set_meta("preview", false)
+	light.texture = texture
+	light.position = positions[0]
+	light.texture_scale = texture_scale
+	light.energy = float(operation.intensity)
+	light.color = _rgba_color(operation.color_rgba)
+	light.shadow_enabled = bool(operation.shadows)
+	var created_nodes = []
+	for node in level.Lights.get_children():
+		if not lights_before.has(node.get_instance_id()):
+			created_nodes.append(node)
+	if created_nodes.size() != 1 or created_nodes[0] != light:
+		return {"ok": false, "node_ids": [], "untracked_change": true}
+	var node_id = _ensure_registered_node(light)
+	return {"ok": node_id.ok, "node_ids": [node_id.value] if node_id.ok else [], "untracked_change": not node_id.ok}
+
 func _execute_path_polyline(operation, job_key):
 	var context = _surface_context(operation, job_key, "PathTool")
 	if not context.ok:
@@ -2080,7 +2145,7 @@ func _observe_operation(operation, native_node_ids, job_key = ""):
 func _reverse_operation(operation, native_node_ids, job_key = ""):
 	if operation.operation_type in ["terrain_stroke", "cave_region"]:
 		return _reverse_surface_rollback(operation, native_node_ids, job_key)
-	if operation.operation_type in ["pattern_region", "colorable_pattern_region", "roof_region", "object_placement", "path_polyline", "simple_tile_region", "smart_tile_region", "smart_tile_double_region"]:
+	if operation.operation_type in ["pattern_region", "colorable_pattern_region", "roof_region", "object_placement", "light_placement", "path_polyline", "simple_tile_region", "smart_tile_region", "smart_tile_double_region"]:
 		return _reverse_addressable_surface(operation, native_node_ids)
 	if operation.operation_type == "wall_polyline":
 		return _reverse_wall_polyline(native_node_ids)
@@ -2226,6 +2291,11 @@ func _addressable_surface_nodes(operation):
 			if object_count < 0 or nodes.size() > MAXIMUM_INSPECTION_STATE_ITEMS - object_count:
 				return null
 			source = level.Objects.get_children()
+		elif operation.operation_type == "light_placement":
+			var light_count = level.Lights.get_child_count()
+			if light_count < 0 or nodes.size() > MAXIMUM_INSPECTION_STATE_ITEMS - light_count:
+				return null
+			source = level.Lights.get_children()
 		elif operation.operation_type == "path_polyline":
 			var path_count = level.Pathways.get_child_count()
 			if path_count < 0 or nodes.size() > MAXIMUM_INSPECTION_STATE_ITEMS - path_count:
@@ -2284,6 +2354,26 @@ func _reverse_container_objects(operation, native_node_ids):
 	return true
 
 
+func _reverse_container_lights(operation, native_node_ids):
+	var level = Global.World.GetLevelByID(int(operation.level_id))
+	if level == null or level.Lights == null:
+		return false
+	for node_id in native_node_ids:
+		if not Global.World.HasNodeID(int(node_id)):
+			return false
+		var node = Global.World.GetNodeByID(int(node_id))
+		if node == null or node.get_parent() != level.Lights:
+			return false
+	# World.DeleteNodeByID is Dungeondraft's documented asset-instance deletion
+	# route. It removes the registry entry as well as the native node. Validate
+	# every exact target and parent before beginning any deletion, then let the
+	# durable next-tick observation prove registry and container absence.
+	for node_id in native_node_ids:
+		if not Global.World.DeleteNodeByID(int(node_id)):
+			return false
+	return true
+
+
 func _reverse_addressable_surface(operation, native_node_ids):
 	if not _observe_addressable_surface(operation, native_node_ids):
 		return false
@@ -2292,6 +2382,8 @@ func _reverse_addressable_surface(operation, native_node_ids):
 	# mirroring Objects.CreateObject plus AddToSearchTable.
 	if operation.operation_type == "object_placement":
 		return _reverse_container_objects(operation, native_node_ids)
+	if operation.operation_type == "light_placement":
+		return _reverse_container_lights(operation, native_node_ids)
 	if Global.Editor == null or typeof(Global.Editor.Tools) != TYPE_DICTIONARY or not Global.Editor.Tools.has("SelectTool") or Global.Editor.Tools["SelectTool"] == null:
 		return false
 	var select_tool = Global.Editor.Tools["SelectTool"]
@@ -2648,7 +2740,7 @@ func _universal_plan_fingerprint_input(plan):
 		text += _framed_string(prefix + ".asset_ref=", operation.asset_ref)
 		if operation.operation_type in ["terrain_stroke", "wall_polyline", "path_polyline"]:
 			text += _universal_geometry_fingerprint(prefix, "path", operation.path)
-		elif operation.operation_type == "object_placement":
+		elif operation.operation_type in ["object_placement", "light_placement"]:
 			text += prefix + ".position.x=" + _double_fingerprint_text(float(operation.position.x)) + "\n"
 			text += prefix + ".position.y=" + _double_fingerprint_text(float(operation.position.y)) + "\n"
 		else:
@@ -2680,6 +2772,11 @@ func _universal_plan_fingerprint_input(plan):
 			text += prefix + ".custom_color_rgba.present=" + ("true" if operation.custom_color_rgba != null else "false") + "\n"
 			if operation.custom_color_rgba != null:
 				text += _framed_string(prefix + ".custom_color_rgba=", operation.custom_color_rgba)
+		elif operation.operation_type == "light_placement":
+			text += prefix + ".range=" + _double_fingerprint_text(float(operation.range)) + "\n"
+			text += prefix + ".intensity=" + _double_fingerprint_text(float(operation.intensity)) + "\n"
+			text += _framed_string(prefix + ".color_rgba=", operation.color_rgba)
+			text += prefix + ".shadows=" + ("true" if operation.shadows else "false") + "\n"
 		elif operation.operation_type == "path_polyline":
 			text += prefix + ".width=" + _double_fingerprint_text(float(operation.width)) + "\n"
 			text += prefix + ".smoothness=" + _double_fingerprint_text(float(operation.smoothness)) + "\n"
@@ -3436,7 +3533,7 @@ func _inspect_map_payload(payload):
 	var level = Global.World.GetLevelByID(current_level_id)
 	if level == null:
 		return {"ok": false, "error": _error("active_level_unavailable", "The current map level is unavailable.", "")}
-	if level.Walls == null or level.Pathways == null or level.Roofs == null or level.PatternShapes == null or level.Objects == null:
+	if level.Walls == null or level.Pathways == null or level.Roofs == null or level.PatternShapes == null or level.Objects == null or level.Lights == null:
 		return {"ok": false, "error": _error("active_level_unavailable", "A documented current-level inspection container is unavailable.", "")}
 
 	var region_result = _inspection_region(payload.region, int(Global.World.Width), int(Global.World.Height))
@@ -3445,11 +3542,11 @@ func _inspect_map_payload(payload):
 	var levels_result = _inspection_levels(current_level_id, level)
 	if not levels_result.ok:
 		return levels_result
-	var state = {"items": [], "node_ids": {}, "object_correlation_unavailable": false}
+	var state = {"items": [], "node_ids": {}, "correlation_unavailable": {}}
 	var grid_size = float(Global.World.GridSize)
 	# This is a fixed allowlist of documented public containers on the current
 	# Level. It deliberately does not reflect over or recursively crawl the scene.
-	var fixed_container_count = level.Walls.get_child_count() + level.Pathways.get_child_count() + level.Roofs.get_child_count() + level.Objects.get_child_count()
+	var fixed_container_count = level.Walls.get_child_count() + level.Pathways.get_child_count() + level.Roofs.get_child_count() + level.Objects.get_child_count() + level.Lights.get_child_count()
 	if fixed_container_count < 0 or fixed_container_count > MAXIMUM_INSPECTION_STATE_ITEMS:
 		return {"ok": false, "error": _error("inspection_state_too_large", "The documented inspection state exceeds its item bound.", "")}
 	var pattern_shapes = level.PatternShapes.GetShapes()
@@ -3472,9 +3569,13 @@ func _inspect_map_payload(payload):
 	append_result = _append_inspection_container(level.Objects.get_children(), "object", state, current_level_id, grid_size)
 	if not append_result.ok:
 		return append_result
-	var unsupported_kinds = ["portal", "light", "text", "material", "floor_shape"]
-	if state.object_correlation_unavailable:
-		unsupported_kinds.append("object_asset_correlation")
+	append_result = _append_inspection_container(level.Lights.get_children(), "light", state, current_level_id, grid_size)
+	if not append_result.ok:
+		return append_result
+	var unsupported_kinds = ["portal", "text", "material", "floor_shape"]
+	for correlation_kind in ["object_asset_correlation", "light_asset_correlation"]:
+		if state.correlation_unavailable.has(correlation_kind):
+			unsupported_kinds.append(correlation_kind)
 	var revision_result = _inspection_state_revision(
 		int(Global.World.Width),
 		int(Global.World.Height),
@@ -3564,7 +3665,7 @@ func _append_inspection_container(nodes, kind, state, level_id, grid_size):
 		state.node_ids[item.node_id] = true
 		state.items.append(item)
 		if item_result.get("correlation_unavailable", false):
-			state.object_correlation_unavailable = true
+			state.correlation_unavailable[kind + "_asset_correlation"] = true
 	return {"ok": true}
 
 
@@ -3582,6 +3683,8 @@ func _inspection_item(node, kind, level_id, grid_size):
 		global_rect = node.GlobalRect
 	elif kind == "object":
 		global_rect = _documented_object_rect(node)
+	elif kind == "light":
+		global_rect = _documented_light_rect(node)
 	else:
 		return {"ok": false, "error": _error("inspection_state_invalid", "Inspection item kind is not supported.", "")}
 	if typeof(global_rect) != TYPE_RECT2 or not _inspection_rect_is_finite_positive(global_rect):
@@ -3594,11 +3697,12 @@ func _inspection_item(node, kind, level_id, grid_size):
 	var node_id = normalized_node_id.value
 	var resource_fingerprint = null
 	var correlation_unavailable = false
-	if kind == "object":
-		if node.Sprite == null or node.Sprite.texture == null or str(node.Sprite.texture.resource_path).length() == 0:
+	if kind in ["object", "light"]:
+		var correlated_texture = node.Sprite.texture if kind == "object" and node.Sprite != null else (node.texture if kind == "light" else null)
+		if correlated_texture == null or str(correlated_texture.resource_path).length() == 0:
 			correlation_unavailable = true
 		else:
-			resource_fingerprint = str(node.Sprite.texture.resource_path).sha256_text()
+			resource_fingerprint = str(correlated_texture.resource_path).sha256_text()
 	var item = {
 		"node_id": node_id,
 		"kind": kind,
@@ -3645,6 +3749,21 @@ func _documented_object_rect(node):
 	return Rect2(node.position - world_size * 0.5, world_size)
 
 
+func _documented_light_rect(node):
+	if typeof(node.position) != TYPE_VECTOR2 or node.texture == null or not _is_runtime_positive_finite_number(node.texture_scale):
+		return null
+	var texture_size = node.texture.get_size()
+	if typeof(texture_size) != TYPE_VECTOR2:
+		return null
+	for value in [node.position.x, node.position.y, texture_size.x, texture_size.y]:
+		if is_nan(float(value)) or is_inf(float(value)):
+			return null
+	var world_size = Vector2(abs(texture_size.x * node.texture_scale), abs(texture_size.y * node.texture_scale))
+	if world_size.x <= 0.0 or world_size.y <= 0.0:
+		return null
+	return Rect2(node.position - world_size * 0.5, world_size)
+
+
 func _inspection_rect_is_finite_positive(rect):
 	for value in [rect.position.x, rect.position.y, rect.size.x, rect.size.y]:
 		if is_nan(float(value)) or is_inf(float(value)):
@@ -3677,6 +3796,14 @@ func _is_runtime_positive_int32(value):
 
 func _is_runtime_positive_finite_number(value):
 	return (typeof(value) == TYPE_INT or typeof(value) == TYPE_REAL) and not is_nan(float(value)) and not is_inf(float(value)) and float(value) > 0.0
+
+
+func _is_runtime_positive_single(value):
+	return _is_runtime_finite_single(value) and float(value) >= MINIMUM_RUNTIME_POSITIVE_SINGLE
+
+
+func _is_runtime_finite_single(value):
+	return (typeof(value) == TYPE_INT or typeof(value) == TYPE_REAL) and not is_nan(float(value)) and not is_inf(float(value)) and abs(float(value)) <= MAXIMUM_RUNTIME_SINGLE
 
 
 func _inspection_region(region, canvas_width, canvas_height):

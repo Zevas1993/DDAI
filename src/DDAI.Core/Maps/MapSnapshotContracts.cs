@@ -58,10 +58,10 @@ public static class MapSnapshotJson
     private const int MaximumCursorOffset = 10_000;
 
     private static readonly HashSet<string> SupportedKinds =
-        new(["wall", "path", "roof", "pattern_shape", "object"], StringComparer.Ordinal);
+        new(["wall", "path", "roof", "pattern_shape", "object", "light"], StringComparer.Ordinal);
 
     private static readonly HashSet<string> UnsupportedKinds =
-        new(["object", "portal", "light", "text", "material", "floor_shape", "object_asset_correlation"], StringComparer.Ordinal);
+        new(["object", "portal", "light", "text", "material", "floor_shape", "object_asset_correlation", "light_asset_correlation"], StringComparer.Ordinal);
 
     private static readonly JsonSerializerOptions WireSerializerOptions = new()
     {
@@ -409,9 +409,11 @@ public static class MapSnapshotJson
             }
             if (item.ResourceFingerprint is not null)
             {
-                if (!string.Equals(item.Kind, "object", StringComparison.Ordinal) || item.AssetRef is not null)
+                if ((!string.Equals(item.Kind, "object", StringComparison.Ordinal) &&
+                        !string.Equals(item.Kind, "light", StringComparison.Ordinal)) ||
+                    item.AssetRef is not null)
                 {
-                    throw new JsonException("Only an unresolved object may carry an internal resource fingerprint.");
+                    throw new JsonException("Only an unresolved object or light may carry an internal resource fingerprint.");
                 }
 
                 RequireHash(item.ResourceFingerprint, "resource fingerprint");

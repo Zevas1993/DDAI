@@ -198,6 +198,45 @@ public sealed class DdaiMapInspectionToolTests
     }
 
     [Fact]
+    public async Task InspectMap_ResolvesLightFingerprintOnlyWithinTheLightsCategory()
+    {
+        const string identity = "resource/light-fragmented";
+        using var sandbox = new InspectionSandbox();
+        var entries = sandbox.PublishObjectCatalog(74, [identity, identity], ["Lights", "Objects"]);
+        var page = Page() with
+        {
+            Items =
+            [
+                new MapSnapshotItem(
+                    11,
+                    "light",
+                    new MapSnapshotBounds(2, 3, 6, 6),
+                    3,
+                    null,
+                    Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant()),
+            ],
+            UnsupportedKinds = ["portal", "text", "material", "floor_shape"],
+        };
+        var bridge = Task.Run(() =>
+        {
+            var claim = WaitForClaim(sandbox.Mailbox);
+            sandbox.Mailbox.PublishResponse(claim, SuccessResponse(claim.Request, page));
+        });
+
+        var result = await DdaiMapTools.InspectMapAsync(
+            new MapInspectionQuery(Limit: 1),
+            sandbox.CreateService(),
+            new DdaiMcpRuntimeOptions(TimeSpan.FromSeconds(2)),
+            CancellationToken.None);
+        await bridge;
+
+        using var json = StructuredJson(result);
+        Assert.Equal(entries[0].AssetRef, json.RootElement.GetProperty("items")[0].GetProperty("asset_ref").GetString());
+        Assert.DoesNotContain("resource_fingerprint", Assert.IsType<TextContentBlock>(Assert.Single(result.Content)).Text, StringComparison.Ordinal);
+        Assert.DoesNotContain("light_asset_correlation", json.RootElement.GetProperty("unsupported_kinds").EnumerateArray().Select(item => item.GetString()));
+    }
+
+    [Fact]
     public async Task InspectMap_RejectsEmptyPageOutsideReturnedCanvasAndAcceptsExactBoundary()
     {
         var emptyPage = Page() with

@@ -101,6 +101,23 @@ public sealed class MapSnapshotContractTests
     }
 
     [Fact]
+    public void SnapshotPage_AcceptsInternalLightFingerprintButRejectsItOnOtherKinds()
+    {
+        var fingerprint = new string('e', 64);
+        var lightPage = ValidPage() with
+        {
+            Items = [new MapSnapshotItem(10, "light", new MapSnapshotBounds(1, 2, 3, 4), 3, null, fingerprint)],
+        };
+        var wallPage = lightPage with
+        {
+            Items = [lightPage.Items[0] with { Kind = "wall" }],
+        };
+
+        Assert.Equal(fingerprint, MapSnapshotJson.DeserializePage(MapSnapshotJson.SerializePage(lightPage)).Items[0].ResourceFingerprint);
+        Assert.Throws<JsonException>(() => MapSnapshotJson.DeserializePage(MapSnapshotJson.SerializePage(wallPage)));
+    }
+
+    [Fact]
     public void SnapshotPage_AcceptsAxisAlignedWallExtentsButRejectsPointBounds()
     {
         var horizontal = ValidPage() with
@@ -241,7 +258,7 @@ public sealed class MapSnapshotContractTests
             FunctionBody(script, "_documented_object_rect");
 
         Assert.Contains("\"inspect_map\"", script, StringComparison.Ordinal);
-        foreach (var documentedPath in new[] { "level.Walls", "level.Pathways", "level.Roofs", "level.PatternShapes", "level.Objects" })
+        foreach (var documentedPath in new[] { "level.Walls", "level.Pathways", "level.Roofs", "level.PatternShapes", "level.Objects", "level.Lights" })
         {
             Assert.Contains(documentedPath, inspection, StringComparison.Ordinal);
         }
@@ -250,8 +267,12 @@ public sealed class MapSnapshotContractTests
         Assert.Contains("get_meta(\"node_id\")", FunctionBody(script, "_node_id_metadata"), StringComparison.Ordinal);
         Assert.Contains("GlobalRect", inspection, StringComparison.Ordinal);
         Assert.Contains("_documented_object_rect(node)", inspection, StringComparison.Ordinal);
+        Assert.Contains("_documented_light_rect(node)", inspection, StringComparison.Ordinal);
         Assert.Contains("node.Rect", FunctionBody(script, "_documented_object_rect"), StringComparison.Ordinal);
-        Assert.Contains("node.Sprite.texture.resource_path", inspection, StringComparison.Ordinal);
+        Assert.Contains("node.texture_scale", FunctionBody(script, "_documented_light_rect"), StringComparison.Ordinal);
+        Assert.Contains("node.Sprite", inspection, StringComparison.Ordinal);
+        Assert.Contains("node.texture", inspection, StringComparison.Ordinal);
+        Assert.Contains("var unsupported_kinds = [\"portal\", \"text\", \"material\", \"floor_shape\"]", inspection, StringComparison.Ordinal);
         Assert.Contains("unsupported_kinds", inspection, StringComparison.Ordinal);
         foreach (var forbidden in new[] { "get_property_list", "find_node", "get_node(", "get_tree(", "NodeLookup", ".Data", "Directory.new", "File.new", ".Save(" })
         {
@@ -413,7 +434,8 @@ public sealed class MapSnapshotContractTests
                          "DDAI_INSPECTION_BOUNDS_AND_CAP:True",
                          "DDAI_INSPECTION_CURSOR_VECTOR:True",
                           "DDAI_INSPECTION_MAP_IDENTITY:True",
-                          "DDAI_INSPECTION_OBJECT_CORRELATION:True",
+                         "DDAI_INSPECTION_OBJECT_CORRELATION:True",
+                         "DDAI_INSPECTION_LIGHT_CORRELATION:True",
                           "DDAI_INSPECTION_RELOADED_OBJECT_BOUNDS:True",
                           "DDAI_INSPECTION_NODE_ID_DIAGNOSTIC:True",
                           "DDAI_INSPECTION_READ_ONLY:True",

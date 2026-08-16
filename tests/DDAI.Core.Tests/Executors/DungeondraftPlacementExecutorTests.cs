@@ -76,17 +76,56 @@ public sealed class DungeondraftPlacementExecutorTests
     }
 
     [Fact]
+    public void LightPlacementUsesTheDocumentedPersistentContainerRoute()
+    {
+        var bridge = ReadBridge();
+        var body = FunctionBody(bridge, "_execute_light_placement");
+
+        Assert.Contains("level.Lights.CreateLight(false)", body, StringComparison.Ordinal);
+        Assert.Contains("light.set_meta(\"preview\", false)", body, StringComparison.Ordinal);
+        Assert.Contains("light.texture = texture", body, StringComparison.Ordinal);
+        Assert.Contains("light.position", body, StringComparison.Ordinal);
+        Assert.Contains("light.texture_scale", body, StringComparison.Ordinal);
+        Assert.Contains("float(operation.range) * 512.0 / float(texture.get_width())", body, StringComparison.Ordinal);
+        Assert.Contains("var texture_scale =", body, StringComparison.Ordinal);
+        Assert.Contains("_is_runtime_positive_single(texture_scale)", body, StringComparison.Ordinal);
+        Assert.Contains("_is_runtime_positive_single(operation.intensity)", body, StringComparison.Ordinal);
+        Assert.Contains("light.energy = float(operation.intensity)", body, StringComparison.Ordinal);
+        Assert.Contains("light.color = _rgba_color(operation.color_rgba)", body, StringComparison.Ordinal);
+        Assert.Contains("light.shadow_enabled = bool(operation.shadows)", body, StringComparison.Ordinal);
+        Assert.Contains("created_nodes.size() != 1", body, StringComparison.Ordinal);
+        Assert.Contains("_ensure_registered_node(", body, StringComparison.Ordinal);
+
+        foreach (var toolMutation in new[] { "CreatePreview", "ChangeColor", "SetShadows", ".Enable()", ".Disable()" })
+        {
+            Assert.DoesNotContain(toolMutation, body, StringComparison.Ordinal);
+        }
+
+        Assert.Contains(
+            "\"light_placement\": funcref(self, \"_execute_light_placement\")",
+            bridge,
+            StringComparison.Ordinal);
+        Assert.Contains("\"light_placement\": \"Lights\"", FunctionBody(bridge, "_surface_category"), StringComparison.Ordinal);
+        Assert.Contains("light_placement", FunctionBody(bridge, "_addressable_surface_nodes"), StringComparison.Ordinal);
+        Assert.Contains("light_placement", FunctionBody(bridge, "_reverse_operation"), StringComparison.Ordinal);
+        var reverse = FunctionBody(bridge, "_reverse_container_lights");
+        Assert.Contains("Global.World.DeleteNodeByID(int(node_id))", reverse, StringComparison.Ordinal);
+        Assert.DoesNotContain("level.Lights.remove_child(node)", reverse, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void OnlyLiveProvenOperationsArePublished()
     {
         var bridge = ReadBridge();
 
-        // object_placement was certified on 2026-08-16 against Dungeondraft 1.2.0.1:
-        // applied at the exact requested grid position, observed with its node id
-        // recorded, committed, then reversed with the map fingerprint returning to
-        // its pre-apply value. Everything else stays withheld until it has the same
-        // create, observe and reverse proof on a disposable map.
+        // object_placement and light_placement were certified on 2026-08-16 against
+        // Dungeondraft 1.2.0.1: each was applied at the exact requested grid
+        // position, observed with its node id recorded, persisted through save and
+        // reopen, then reversed with the map fingerprint returning to its exact
+        // pre-apply value. Everything else stays withheld until it has the same
+        // create, observe, persistence and reverse proof on a disposable map.
         Assert.Contains(
-            "var _runtime_certified_operation_types = [\"wall_polyline\", \"object_placement\"]",
+            "var _runtime_certified_operation_types = [\"wall_polyline\", \"object_placement\", \"light_placement\"]",
             bridge,
             StringComparison.Ordinal);
 
@@ -94,7 +133,7 @@ public sealed class DungeondraftPlacementExecutorTests
                  {
                      "terrain_stroke", "pattern_region", "colorable_pattern_region", "cave_region",
                      "roof_region", "material_stroke", "portal_placement", "path_polyline",
-                     "light_placement", "simple_tile_region", "smart_tile_region", "smart_tile_double_region",
+                     "simple_tile_region", "smart_tile_region", "smart_tile_double_region",
                  })
         {
             Assert.DoesNotContain(
